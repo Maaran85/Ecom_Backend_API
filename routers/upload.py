@@ -732,3 +732,27 @@ async def delete_image(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Image not found"
         )
+
+# ==================== SUPPORT TICKET IMAGES ====================
+
+@router.post("/support-tickets/upload-image")
+async def upload_ticket_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Upload support ticket attachment image"""
+    try:
+        file_path = await FileUploadService.upload_image(file, "tickets", optimize=True)
+        image_url = FileUploadService.get_image_url(file_path)
+        
+        return {
+            "message": "Image uploaded successfully",
+            "image_url": image_url,
+            "file_path": file_path
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload image: {str(e)}"
+        )

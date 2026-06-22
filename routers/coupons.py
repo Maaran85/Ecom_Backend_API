@@ -293,7 +293,7 @@ async def get_my_coupons(
 ):
     """Dealers: List all coupons owned by this dealer"""
     # Resolve dealer
-    res = await db.execute(select(Dealer).where(Dealer.user_id == current_user.id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == current_user.id))
     dealer = res.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=403, detail="Dealer access required")
@@ -310,7 +310,7 @@ async def dealer_create_coupon(
     db: AsyncSession = Depends(get_db)
 ):
     """Dealers: Create a discount coupon"""
-    res = await db.execute(select(Dealer).where(Dealer.user_id == current_user.id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == current_user.id))
     dealer = res.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=403, detail="Dealer access required")
@@ -338,7 +338,7 @@ async def dealer_delete_coupon(
     db: AsyncSession = Depends(get_db)
 ):
     """Dealers: Delete their own coupon"""
-    res = await db.execute(select(Dealer).where(Dealer.user_id == current_user.id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == current_user.id))
     dealer = res.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=403, detail="Dealer access required")

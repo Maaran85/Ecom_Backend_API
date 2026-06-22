@@ -26,6 +26,8 @@ class Address(Base):
     state = Column(String, nullable=False)
     pincode = Column(String, nullable=False)
     country = Column(String, default="India", nullable=False)
+    latitude = Column(String, nullable=True)
+    longitude = Column(String, nullable=True)
     
     # Address metadata
     address_type = Column(SQLEnum(AddressType), default=AddressType.HOME, nullable=False)

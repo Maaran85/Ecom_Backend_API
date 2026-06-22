@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, Any
 from datetime import datetime
 from models.user import UserRole
@@ -22,6 +22,8 @@ class UserInDBBase(UserBase):
     dealer_id: Optional[int] = None
     hub_id: Optional[int] = None
     logistics_partner_id: Optional[int] = None
+    partner_id: Optional[int] = None
+    supervisor_id: Optional[int] = None
     dob: Optional[str] = None
     address: Optional[str] = None
     aadhaar_number: Optional[str] = None
@@ -32,6 +34,20 @@ class UserInDBBase(UserBase):
     shift_type: Optional[str] = None
     created_at: datetime
     dealer: Optional[DealerSchema] = None
+
+    @field_validator('aadhaar_number', mode='before')
+    @classmethod
+    def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 12:
+            return f"********{str(v)[-4:]}"
+        return v
+        
+    @field_validator('phone', mode='before')
+    @classmethod
+    def mask_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 10:
+            return f"******{str(v)[-4:]}"
+        return v
 
     class Config:
         from_attributes = True
@@ -45,6 +61,8 @@ class AdminUserCreate(UserBase):
     dealer_id: Optional[int] = None
     hub_id: Optional[int] = None
     logistics_partner_id: Optional[int] = None
+    partner_id: Optional[int] = None
+    supervisor_id: Optional[int] = None
     employee_id: Optional[str] = None
     shift_type: Optional[str] = None
     dob: Optional[str] = None
@@ -62,6 +80,8 @@ class AdminUserUpdate(UserBase):
     dealer_id: Optional[int] = None
     hub_id: Optional[int] = None
     logistics_partner_id: Optional[int] = None
+    partner_id: Optional[int] = None
+    supervisor_id: Optional[int] = None
     employee_id: Optional[str] = None
     shift_type: Optional[str] = None
     dob: Optional[str] = None

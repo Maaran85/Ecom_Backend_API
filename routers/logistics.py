@@ -63,7 +63,7 @@ async def create_rider_full(
         rider_in.partner_id = current_user.logistics_partner_id
     try:
         # Check if email exists
-        check_user = await db.execute(select(User).where(User.email == rider_in.email))
+        check_user = await db.execute(select(User).where(User.email == rider_in.email, User.is_active == True))
         if check_user.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="Email already registered")
         
@@ -143,6 +143,13 @@ async def update_rider(
         
         if "phone_number" in update_data:
             val = update_data.get("phone_number")
+            if val and val != rider.user.phone:
+                check_phone = await db.execute(
+                    select(User).where(User.phone == val, User.id != rider.user.id)
+                )
+                if check_phone.scalar_one_or_none():
+                    raise HTTPException(status_code=400, detail="Phone number already registered to another user")
+
             rider.user.phone = val
             # Also update rider profile phone
             rider.phone_number = val
@@ -299,7 +306,7 @@ async def create_partner_user(
         user_in.logistics_partner_id = current_user.logistics_partner_id
         
     # Check if email exists
-    check = await db.execute(select(User).where(User.email == user_in.email))
+    check = await db.execute(select(User).where(User.email == user_in.email, User.is_active == True))
     if check.scalar_one_or_none():
          raise HTTPException(status_code=400, detail="Email already registered")
          
@@ -1073,7 +1080,6 @@ async def update_logistics_return_status(
     # GATED FLOW: Ensure return is already APPROVED before logistics acts on it
     if order_return.status == ReturnStatus.REQUESTED:
         raise HTTPException(status_code=400, detail="Return must be approved by admin before logistics processing")
-        
     try:
         new_status = ReturnStatus(status_str.upper())
     except ValueError:
@@ -1111,13 +1117,6 @@ async def update_logistics_return_status(
                 if payment_collected:
                     order_return.refund_initiated = True # Using this as a flag for payment recorded for now
                     order_return.admin_notes = (order_return.admin_notes or "") + f"\n[Payment] Extra amount ₹{order_return.extra_amount_to_collect} collected by rider."
-        elif new_status == ReturnStatus.IN_TRANSIT_TO_HUB:
-            order_item.status = "returning"
-            # Set hub_id on return so it appears in Hub's inventory
-            if order_item.hub_id:
-                order_return.hub_id = order_item.hub_id
-        elif new_status == ReturnStatus.IN_TRANSIT_TO_STORE:
-            order_item.status = "returning"
         elif new_status == ReturnStatus.EXCHANGE_COMPLETED:
              order_item.status = "exchanged"
              order_return.completed_at = datetime.now(timezone.utc)

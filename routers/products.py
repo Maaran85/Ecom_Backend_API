@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, and_, cast, String, text
 from sqlalchemy.orm import selectinload, aliased, joinedload
@@ -11,14 +11,14 @@ import json
 from core.database import get_db
 from schemas.product import (
     Product, ProductCreate, ProductUpdate, 
-    Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate,
-    ProductVariant, ProductVariantCreate
+    Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate
 )
 from models.product import Product as ProductModel, Category as CategoryModel, CategoryAttribute as CategoryAttributeModel
-from models.product_variant import ProductVariant as ProductVariantModel
 from models.search_history import SearchHistory as SearchHistoryModel
 from models.user import UserRole
 from models.dealer import Dealer as DealerModel
+from models.partner import Partner as PartnerModel
+from models.inventory import ProductInventory as ProductInventoryModel
 from schemas.search_history import SearchHistory
 from core.permissions import (
     require_admin, get_current_active_user, 
@@ -51,6 +51,7 @@ async def create_category(
             "name": db_category.name,
             "image_url": db_category.image_url,
             "parent_id": db_category.parent_id,
+            "is_active": db_category.is_active,
             "created_at": db_category.created_at,
             "attributes": []
         }
@@ -62,10 +63,21 @@ async def create_category(
 async def get_categories(
     skip: int = Query(0, ge=0),
     limit: int = Query(1000, ge=1, le=2000),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """Get all categories with pagination"""
-    result = await db.execute(select(CategoryModel).offset(skip).limit(limit).options(selectinload(CategoryModel.attributes)))
+    query = select(CategoryModel)
+    
+    # Check if we should filter out inactive categories
+    is_admin = False
+    if current_user and current_user.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+        is_admin = True
+        
+    if not is_admin:
+        query = query.where(CategoryModel.is_active == True)
+        
+    result = await db.execute(query.offset(skip).limit(limit).options(selectinload(CategoryModel.attributes)))
     categories = result.scalars().all()
     return categories
 
@@ -93,6 +105,7 @@ async def update_category(
         "name": db_category.name,
         "image_url": db_category.image_url,
         "parent_id": db_category.parent_id,
+        "is_active": db_category.is_active,
         "created_at": db_category.created_at,
         "attributes": [] # Attributes can be loaded if needed, but [] is safe for simple update
     }
@@ -136,11 +149,12 @@ async def get_category_products(
     db: AsyncSession = Depends(get_db)
 ):
     """Get products in a category with filters"""
-    query = select(ProductModel).join(DealerModel).where(
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
         ProductModel.category_id == category_id,
         DealerModel.access_status == 'active',
-        DealerModel.is_active == True,
-        ProductModel.is_approved == True
+        DealerModel.is_active == True, DealerModel.is_deleted == False,
+        ProductModel.is_approved == True,
+        or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
     )
     
     # Price filters
@@ -356,9 +370,7 @@ async def create_product(
         )
 
     # Remove read-only or extra fields that are not columns in the Product model
-    variants_data = product_in.variants or []
     product_data = product_in.model_dump()
-    product_data.pop("variants", None)
     product_data.pop("dealer_delivery_days", None)
     
     db_product = ProductModel(**product_data)
@@ -384,19 +396,43 @@ async def create_product(
     db.add(db_product)
     await db.flush() # Get product ID without committing
     
-    # Create variants if provided
-    total_stock = 0
-    if db_product.has_variants and variants_data:
-        for v_in in variants_data:
-            db_variant = ProductVariantModel(
-                **v_in.model_dump(),
-                product_id=db_product.id
-            )
-            db.add(db_variant)
-            total_stock += db_variant.stock
+    # --- Parent-Child Variant Auto-Generation ---
+    # If there are multiple sizes or colors, create child products for each combination
+    colors = []
+    for img in product_in.images:
+        if isinstance(img, dict) and "color" in img and img["color"] != "Default":
+            colors.append(img["color"])
+    
+    if not colors:
+        colors = ["Default"]
         
-        # Override product stock with sum of variant stocks
-        db_product.stock = total_stock
+    sizes = product_in.sizes if product_in.sizes else ["One Size"]
+    
+    # We only auto-generate children if there's more than 1 combination
+    if len(sizes) > 1 or len(colors) > 1 or (len(sizes) == 1 and len(colors) == 1 and colors[0] != "Default"):
+        for size in sizes:
+            for color in colors:
+                # Find images for this specific color
+                color_images = []
+                for img in product_in.images:
+                    if isinstance(img, dict) and img.get("color") == color:
+                        color_images = [img]
+                        break
+                
+                if not color_images and product_in.images:
+                    # Fallback to first image group if specific color not found
+                    color_images = [product_in.images[0]]
+
+                child_data = product_data.copy()
+                child_data["parent_product_id"] = db_product.id
+                child_data["sizes"] = [size]
+                child_data["color"] = color
+                child_data["images"] = color_images
+                child_data["name"] = f"{db_product.name} ({size}, {color})"
+                
+                db_child = ProductModel(**child_data)
+                db_child.dealer_id = db_product.dealer_id
+                db.add(db_child)
 
     await db.commit()
     await db.refresh(db_product)
@@ -408,7 +444,7 @@ async def create_product(
         .options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-            selectinload(ProductModel.variants)
+            selectinload(ProductModel.children)
         )
     )
     return result.scalar_one()
@@ -436,28 +472,9 @@ async def update_product(
         if not dealer.is_active:
             raise HTTPException(status_code=403, detail="Your dealer account is currently inactive. You cannot update products.")
     update_data = product_in.model_dump(exclude_unset=True)
-    variants_data = update_data.pop("variants", None)
-    
     for key, value in update_data.items():
         setattr(db_product, key, value)
-        
-    # Sync variants if provided
-    if variants_data is not None:
-        # Simple strategy: remove old variants and add new ones
-        await db.execute(text("DELETE FROM product_variants WHERE product_id = :pid").bindparams(pid=product_id))
-        
-        total_stock = 0
-        if db_product.has_variants:
-            for v_data in variants_data:
-                db_variant = ProductVariantModel(
-                    **v_data,
-                    product_id=db_product.id
-                )
-                db.add(db_variant)
-                total_stock += db_variant.stock
-            
-            # Sync cumulative stock
-            db_product.stock = total_stock
+
 
     await db.commit()
     await db.refresh(db_product)
@@ -469,7 +486,7 @@ async def update_product(
         .options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-            selectinload(ProductModel.variants)
+            selectinload(ProductModel.children)
         )
     )
     return result.scalar_one()
@@ -501,22 +518,26 @@ async def delete_product(
 
 @router.get("/products", response_model=List[Product], tags=["products"])
 async def get_products(
+    response: Response,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=5000),
     category_id: Optional[int] = None,
     dealer_id: Optional[int] = Query(None),
+    hub_id: Optional[int] = Query(None),
     search: Optional[str] = None,
+    is_approved: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """Get all products with pagination, search, and category filter"""
-    query = select(ProductModel).join(DealerModel)
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id)
     
     # If no specific dealer is requested, show only active/approved products (Public view)
     if not dealer_id:
         query = query.where(
             DealerModel.access_status == 'active',
-            DealerModel.is_active == True,
-            ProductModel.is_approved == True
+            DealerModel.is_active == True, DealerModel.is_deleted == False,
+            ProductModel.is_approved == True,
+            or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
         )
 
     
@@ -534,16 +555,43 @@ async def get_products(
 
     if search:
         query = query.where(ProductModel.name.ilike(f"%{search}%"))
+        
+    if is_approved is not None:
+        query = query.where(ProductModel.is_approved == is_approved)
+        
+    if hub_id:
+        query = query.join(ProductInventoryModel, and_(
+            ProductModel.id == ProductInventoryModel.product_id,
+            ProductInventoryModel.hub_id == hub_id
+        ))
+        
+    # Get total count before pagination
+    count_query = select(func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
+    total_count = total_result.scalar_one_or_none() or 0
+    response.headers["X-Total-Count"] = str(total_count)
     
     query = query.order_by(ProductModel.created_at.desc())
     
     query = query.offset(skip).limit(limit).options(
         joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
         joinedload(ProductModel.dealer),
-        selectinload(ProductModel.variants)
+        selectinload(ProductModel.children)
     )
     result = await db.execute(query)
     products = result.scalars().all()
+    
+    if hub_id and products:
+        product_ids = [p.id for p in products]
+        inv_result = await db.execute(
+            select(ProductInventoryModel.product_id, ProductInventoryModel.stock)
+            .where(ProductInventoryModel.hub_id == hub_id)
+            .where(ProductInventoryModel.product_id.in_(product_ids))
+        )
+        inv_map = {row.product_id: row.stock for row in inv_result.all()}
+        for p in products:
+            p.hub_stock = inv_map.get(p.id, 0)
+            
     return products
 
 @router.get("/products/search/history", response_model=List[SearchHistory], tags=["products"])
@@ -589,10 +637,11 @@ async def search_products(
         db.add(history_entry)
         await db.commit()  # Commit history even if search fails or returns nothing
     
-    query = select(ProductModel).join(DealerModel).where(
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
         DealerModel.access_status == 'active',
-        DealerModel.is_active == True,
-        ProductModel.is_approved == True
+        DealerModel.is_active == True, DealerModel.is_deleted == False,
+        ProductModel.is_approved == True,
+        or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
     )
     
     # Text search (name and description)
@@ -685,7 +734,7 @@ async def search_products(
     query = query.offset(skip).limit(limit).options(
         joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
         joinedload(ProductModel.dealer),
-        selectinload(ProductModel.variants)
+        selectinload(ProductModel.children)
     )
     
     result = await db.execute(query)
@@ -705,11 +754,13 @@ async def autocomplete_products(
     result = await db.execute(
         select(ProductModel.name, ProductModel.id, ProductModel.price, ProductModel.images)
         .join(DealerModel)
+        .outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id)
         .where(
             ProductModel.name.ilike(f"%{q}%"),
             DealerModel.access_status == 'active',
-            DealerModel.is_active == True,
-            ProductModel.is_approved == True
+            DealerModel.is_active == True, DealerModel.is_deleted == False,
+            ProductModel.is_approved == True,
+            or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
         )
         .limit(limit)
     )
@@ -732,7 +783,10 @@ async def autocomplete_products(
     # Get matching categories
     cat_result = await db.execute(
         select(CategoryModel.id, CategoryModel.name)
-        .where(CategoryModel.name.ilike(f"%{q}%"))
+        .where(
+            CategoryModel.name.ilike(f"%{q}%"),
+            CategoryModel.is_active == True
+        )
         .limit(5)
     )
     categories = cat_result.all()
@@ -757,10 +811,11 @@ async def get_filter_options(
 ):
     """Get available filter options for products"""
     
-    query = select(ProductModel).join(DealerModel).where(
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
         DealerModel.access_status == 'active',
-        DealerModel.is_active == True,
-        ProductModel.is_approved == True
+        DealerModel.is_active == True, DealerModel.is_deleted == False,
+        ProductModel.is_approved == True,
+        or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
     )
     if category_id:
         hierarchy = select(CategoryModel.id).where(CategoryModel.id == category_id).cte(name="hierarchy", recursive=True)
@@ -832,12 +887,13 @@ async def get_filter_counts(category_id: int, db: AsyncSession = Depends(get_db)
         query = select(
             ProductModel.attributes[key].astext.label('variant'),
             func.count(ProductModel.id).label('total')
-        ).join(DealerModel).where(
+        ).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
             ProductModel.category_id == category_id,
             ProductModel.attributes.has_key(key),
             DealerModel.access_status == 'active',
-            DealerModel.is_active == True,
-            ProductModel.is_approved == True
+            DealerModel.is_active == True, DealerModel.is_deleted == False,
+            ProductModel.is_approved == True,
+            or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
         ).group_by(ProductModel.attributes[key].astext)
         
         result = await db.execute(query)
@@ -854,8 +910,7 @@ async def get_product(
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """Get a single product by ID. Dealers and Admins can see pending products."""
-    # Start with basic query
-    query = select(ProductModel).join(DealerModel).where(ProductModel.id == product_id)
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(ProductModel.id == product_id)
     
     # Execute query first to check permissions afterwards if needed, 
     # OR build a smart query. BUILDING A SMART QUERY IS BETTER:
@@ -863,8 +918,9 @@ async def get_product(
     # Public restriction: must be active/approved
     public_condition = (
         DealerModel.access_status == 'active',
-        DealerModel.is_active == True,
-        ProductModel.is_approved == True
+        DealerModel.is_active == True, DealerModel.is_deleted == False,
+        ProductModel.is_approved == True,
+        or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
     )
     
     if current_user:
@@ -893,7 +949,7 @@ async def get_product(
         query.options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-            selectinload(ProductModel.variants)
+            selectinload(ProductModel.children)
         )
     )
     product = result.scalar_one_or_none()

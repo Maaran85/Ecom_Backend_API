@@ -11,7 +11,7 @@ from models import User, Dealer, UserRole, Order, OrderItem, Product, DeliveryRi
 from models.cart import OrderStatus
 from models.order_return import OrderReturn, ReturnStatus
 from models.payment import PaymentStatus
-from schemas.dealer import DealerCreate, DealerUpdate, DealerProfileComplete, Dealer as DealerSchema, DealerWithUser, DealerOrderResponse, OrderItemDealer
+from schemas.dealer import DealerCreate, DealerUpdate, DealerProfileComplete, Dealer as DealerSchema, DealerWithUser, DealerOrderResponse, OrderItemDealer, DealerStockUpdate
 from schemas.rider import Rider as RiderSchema
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, ConfigDict
@@ -25,7 +25,7 @@ from models.dealer_logistics import dealer_logistics_mapping
 router = APIRouter()
 
 from models.hub import DeliveryHub
-
+from models.inventory import ProductInventory, MovementType, StockMovement
 # Role Category Definitions (Values as strings for robustness)
 HUB_ROLES_STR = ["hub", "hub_manager", "hub_staff", "hub_dispatcher", "hub_returns"]
 DEALER_ROLES_STR = ["dealer", "dealer_manager", "dealer_inventory", "dealer_orders", "dealer_finance"]
@@ -176,28 +176,28 @@ class AuditLogResponse(BaseModel):
 
 async def get_current_dealer(user: User, db: AsyncSession) -> Dealer:
     # 1. Check if user IS the primary dealer user
-    res = await db.execute(select(Dealer).where(Dealer.user_id == user.id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == user.id))
     dealer = res.scalar_one_or_none()
     if dealer:
         return dealer
     
     # 2. Check if user is staff (has dealer_id)
     if user.dealer_id:
-        res = await db.execute(select(Dealer).where(Dealer.id == user.dealer_id))
+        res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == user.dealer_id))
         dealer = res.scalar_one_or_none()
         if dealer:
             return dealer
             
     # 3. Check if hub user (staff or manager)
     if user.hub_id:
-        res = await db.execute(select(Dealer).join(DeliveryHub).where(DeliveryHub.id == user.hub_id))
+        res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).join(DeliveryHub).where(DeliveryHub.id == user.hub_id))
         dealer = res.scalar_one_or_none()
         if dealer:
             return dealer
 
     # 4. Backwards compatibility check for old hub manager linkage (where hub.user_id was set)
     # This covers cases where a user is a hub manager but doesn't have user.hub_id directly set.
-    res = await db.execute(select(Dealer).join(DeliveryHub).where(DeliveryHub.user_id == user.id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).join(DeliveryHub).where(DeliveryHub.user_id == user.id))
     dealer = res.scalar_one_or_none()
     if dealer:
         return dealer
@@ -558,6 +558,11 @@ async def get_dealer_orders(
                     getattr(addr, 'pincode', getattr(addr, 'postal_code', ''))
                 ]
                 addr_str = ", ".join([p for p in parts if p])
+                customer_lat = getattr(addr, 'latitude', None)
+                customer_long = getattr(addr, 'longitude', None)
+            else:
+                customer_lat = None
+                customer_long = None
                 
             return_status = None
             return_reason = None
@@ -595,7 +600,9 @@ async def get_dealer_orders(
                 return_status=return_status,
                 return_reason=return_reason,
                 refund_amount=refund_amount,
-                cancellation_reason=order.cancellation_reason
+                cancellation_reason=order.cancellation_reason,
+                customer_lat=customer_lat,
+                customer_long=customer_long
             ))
     return {
         "items": response,
@@ -878,6 +885,8 @@ async def get_dealer_order_detail(
 
     # Address string
     addr_str = "No address"
+    customer_lat = None
+    customer_long = None
     if order.shipping_address:
         addr = order.shipping_address
         street = getattr(addr, 'address_line1', getattr(addr, 'street_address', ''))
@@ -887,6 +896,8 @@ async def get_dealer_order_detail(
         parts = [p for p in [street, city, state, zip_code] if p]
         if parts:
             addr_str = ", ".join(parts[:3]) + (f" - {zip_code}" if zip_code else "")
+        customer_lat = getattr(addr, 'latitude', None)
+        customer_long = getattr(addr, 'longitude', None)
 
     return DealerOrderResponse(
         id=order.id,
@@ -899,7 +910,9 @@ async def get_dealer_order_detail(
         customer_name=order.customer_name or (order.customer.full_name if order.customer else "Direct Customer"),
         customer_phone=order.customer_phone or (order.customer.phone if order.customer else ""),
         showroom_name=showroom_name,
-        items=dealer_items
+        items=dealer_items,
+        customer_lat=customer_lat,
+        customer_long=customer_long
     )
 
 @router.put("/orders/{order_id}/status", response_model=DealerOrderResponse)
@@ -975,6 +988,8 @@ async def update_dealer_order_status(
              ))
              
     addr_str = "No address"
+    customer_lat = None
+    customer_long = None
     if order.shipping_address:
         addr = order.shipping_address
         street = getattr(addr, 'address_line1', getattr(addr, 'street_address', ''))
@@ -984,6 +999,8 @@ async def update_dealer_order_status(
         parts = [p for p in [street, city, state, zip_code] if p]
         if parts:
             addr_str = ", ".join(parts[:3]) + (f" - {zip_code}" if zip_code else "")
+        customer_lat = getattr(addr, 'latitude', None)
+        customer_long = getattr(addr, 'longitude', None)
 
     response_data = DealerOrderResponse(
         id=order.id,
@@ -992,7 +1009,9 @@ async def update_dealer_order_status(
         status=order.status, # Overall Order Status
         payment_status=order.payment.status.value if order.payment else "pending",
         shipping_address=addr_str,
-        items=dealer_items
+        items=dealer_items,
+        customer_lat=customer_lat,
+        customer_long=customer_long
     )
 
     # TRIGGER NOTIFICATION
@@ -1153,8 +1172,8 @@ async def assign_rider_to_order_item(
         raise HTTPException(status_code=404, detail="Rider not found or not approved")
 
     item.rider_id = payload.rider_id
-    if item.status in ["pending", "order_placed", "confirmed", "packaging", "packed", "undelivered"]:
-        item.status = OrderStatus.OUT_FOR_DELIVERY.value
+    if item.status in ["pending", "order_placed", "confirmed", "packaging", "packed", "undelivered", "at_hub"]:
+        item.status = OrderStatus.SHIPPED.value
 
     # Also update the parent Order status so customer order list reflects correctly
     order_result = await db.execute(
@@ -1164,7 +1183,7 @@ async def assign_rider_to_order_item(
     if parent_order and parent_order.status not in [
         OrderStatus.DELIVERED, OrderStatus.CANCELLED, OrderStatus.REFUNDED
     ]:
-        parent_order.status = OrderStatus.OUT_FOR_DELIVERY
+        parent_order.status = OrderStatus.SHIPPED
 
     # TRIGGER NOTIFICATION
     try:
@@ -1365,11 +1384,24 @@ async def update_dealer_order_item(
     if not (is_admin or is_owner or is_assigned_hub or is_assigned_logistics):
         raise HTTPException(status_code=403, detail="Not authorized to update this item")
 
-    item.status = payload.status
     if payload.status.lower() == "confirmed":
+        from models.inventory import ProductInventory
+        from sqlalchemy import func
+        inventory_result = await db.execute(
+            select(func.coalesce(func.sum(ProductInventory.stock), 0))
+            .where(ProductInventory.product_id == item.product_id)
+        )
+        current_stock = inventory_result.scalar() or 0
+        if current_stock < item.quantity:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Insufficient stock to confirm this order. Required: {item.quantity}, Available: {current_stock}"
+            )
         item.accepted_at = datetime.now(timezone.utc)
     elif payload.status.lower() == "packaging":
         item.hub_arrived_at = datetime.now(timezone.utc)
+
+    item.status = payload.status
 
     if payload.status.lower() == "undelivered":
         item.delivery_attempts = getattr(item, 'delivery_attempts', 0) + 1
@@ -1398,22 +1430,14 @@ async def update_dealer_order_item(
 
     if payload.rider_id is not None:
         item.rider_id = payload.rider_id
-        if item.status.lower() in ["pending", "order_placed", "confirmed", "packaging", "packed"]:
-             item.status = OrderStatus.OUT_FOR_DELIVERY.value
+        if item.status.lower() in ["pending", "order_placed", "confirmed", "packaging", "packed", "at_hub"]:
+             item.status = OrderStatus.SHIPPED.value
              
     if payload.logistics_partner_id is not None:
         item.logistics_partner_id = payload.logistics_partner_id
-        # Automatically move to shipped/dispatched if logistics assigned
-        if item.status.lower() in ["pending", "order_placed", "confirmed", "packaging", "packed", "shipped", "at_hub"]:
-            # If item is associated with a hub, it's 'Dispatched' when handed to partner
-            # If item is direct from dealer/store, it's 'Shipped'
-            if item.hub_id is not None:
-                item.status = OrderStatus.DISPATCHED.value
-            else:
-                item.status = OrderStatus.SHIPPED.value
-        elif payload.status.lower() == "dispatched":
-             # Respect explicit dispatched status from frontend
-             item.status = OrderStatus.DISPATCHED.value
+        # Automatically move to shipped if logistics assigned
+        if item.status.lower() in ["pending", "order_placed", "confirmed", "packaging", "packed", "shipped", "at_hub", "dispatched"]:
+            item.status = OrderStatus.SHIPPED.value
             
     if payload.delivery_type is not None:
         item.delivery_type = payload.delivery_type
@@ -1634,6 +1658,7 @@ async def update_dealer_return_status(
             
         if payload.logistics_partner_id is not None and order_return.order_item:
             order_return.order_item.logistics_partner_id = payload.logistics_partner_id
+            order_return.logistics_partner_id = payload.logistics_partner_id
 
         if new_status == ReturnStatus.APPROVED:
             order_return.approved_at = datetime.now(timezone.utc)
@@ -1643,7 +1668,7 @@ async def update_dealer_return_status(
         elif new_status == ReturnStatus.REJECTED:
             if order_return.order_item:
                 order_return.order_item.status = "delivered" # Restore
-        elif new_status == ReturnStatus.COMPLETED or new_status == ReturnStatus.IN_TRANSIT_TO_HUB:
+        elif new_status == ReturnStatus.COMPLETED:
             order_return.completed_at = datetime.now(timezone.utc)
             
             # Initiate Refund Logic for Dealer's Products
@@ -1959,7 +1984,7 @@ async def delivery_preview(
 
     # Fetch dealer delivery settings
     dealers_res = await db.execute(
-        select(Dealer).where(Dealer.id.in_(list(dealer_subtotals.keys())))
+        select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id.in_(list(dealer_subtotals.keys())))
     )
     dealers = dealers_res.scalars().all()
 
@@ -2011,7 +2036,7 @@ async def register_as_dealer(
     """Register current user as a dealer (requires authentication)"""
     
     # Check if user is already a dealer
-    result = await db.execute(select(Dealer).where(Dealer.user_id == current_user.id))
+    result = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == current_user.id))
     existing_dealer = result.scalar_one_or_none()
     
     if existing_dealer:
@@ -2048,7 +2073,7 @@ async def list_dealers(
     db: AsyncSession = Depends(get_db)
 ):
     """List all dealers (admin only)"""
-    query = select(Dealer).offset(skip).limit(limit)
+    query = select(Dealer).where(Dealer.is_deleted == False).offset(skip).limit(limit)
     
     if approved_only:
         query = query.where(Dealer.is_approved == True)
@@ -2087,13 +2112,24 @@ async def complete_dealer_profile(
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer profile not found")
         
+    data_dict = profile_data.model_dump(exclude_unset=True)
+    
+    # Handle user name update if provided
+    if "owner_name" in data_dict:
+        owner_name = data_dict.pop("owner_name")
+        if owner_name:
+            current_user.full_name = owner_name
+            db.add(current_user)
+            
     # Apply all fields from DealerProfileComplete
-    for key, value in profile_data.model_dump(exclude_unset=True).items():
-        setattr(dealer, key, value)
+    for key, value in data_dict.items():
+        if hasattr(dealer, key):
+            setattr(dealer, key, value)
         
     # Mark profile as completed! 
     # Access status remains whatever it was (usually pending admin approval)
-    dealer.profile_status = "completed"
+    dealer.profile_status = "pending"
+    dealer.access_status = "pending"
     
     await db.commit()
     await db.refresh(dealer)
@@ -2167,6 +2203,7 @@ class HubResponse(BaseModel):
     is_showroom: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    stock_count: Optional[int] = None
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
     item_count: int = 0
@@ -2249,6 +2286,7 @@ async def get_my_hub_profile(
 @router.get("/hubs", response_model=List[HubResponse])
 async def get_dealer_hubs(
     active_only: bool = True,
+    product_id: Optional[int] = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2262,13 +2300,21 @@ async def get_dealer_hubs(
 
     if current_user.role in HUB_ROLES:
         # If a hub user, they can only see their own hub
-        query = select(DeliveryHub).where(DeliveryHub.user_id == current_user.id).options(__import__('sqlalchemy.orm').orm.selectinload(DeliveryHub.user))
+        query = select(DeliveryHub).options(__import__('sqlalchemy.orm').orm.selectinload(DeliveryHub.user))
+        
+        conditions = [DeliveryHub.user_id == current_user.id]
         if current_user.hub_id:
-            query = query.where(DeliveryHub.id == current_user.hub_id)
+            conditions.append(DeliveryHub.id == current_user.hub_id)
+            
+        from sqlalchemy import or_
+        query = query.where(or_(*conditions))
     else:
         query = select(DeliveryHub).where(DeliveryHub.dealer_id == dealer.id).options(__import__('sqlalchemy.orm').orm.selectinload(DeliveryHub.user))
     if active_only:
         query = query.where(DeliveryHub.is_active == True)
+    # Removed product_id filter from the main query so we always return ALL hubs, 
+    # even if they currently have 0 stock for the given product. 
+    # The stock_map will populate stock_count correctly later in the method.
     query = query.order_by(DeliveryHub.created_at.desc())
     result = await db.execute(query)
     hubs = result.scalars().all()
@@ -2290,6 +2336,20 @@ async def get_dealer_hubs(
                     count_map[row[0]] = row[1]
         except Exception as e:
             print(f"Error counting hub items: {e}")
+
+    stock_map = {}
+    if hubs and product_id:
+        try:
+            hub_ids = [h.id for h in hubs]
+            stock_query = select(ProductInventory.hub_id, ProductInventory.stock).where(
+                ProductInventory.hub_id.in_(hub_ids),
+                ProductInventory.product_id == product_id
+            )
+            stock_result = await db.execute(stock_query)
+            for row in stock_result.all():
+                stock_map[row[0]] = row[1]
+        except Exception as e:
+            print(f"Error fetching stock: {e}")
 
     response = []
     for hub in hubs:
@@ -2320,7 +2380,8 @@ async def get_dealer_hubs(
             "item_count": count_map.get(hub.id, 0),
             "user_id": hub.user_id,
             "email": hub.user.email if hub.user else None,
-            "is_showroom": hub.is_showroom
+            "is_showroom": hub.is_showroom,
+            "stock_count": stock_map.get(hub.id, 0) if product_id else None
         }
         response.append(data)
     return response
@@ -2334,7 +2395,7 @@ async def get_dealer_audit_logs(
 ):
     """Retrieve audit logs."""
     from models.audit import AuditLog
-    d_res = await db.execute(select(Dealer).where(Dealer.user_id == current_user.id))
+    d_res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == current_user.id))
     dealer = d_res.scalar_one_or_none()
     if not dealer: raise HTTPException(status_code=404, detail="Dealer profile not found")
     query = select(AuditLog).where(AuditLog.dealer_id == dealer.id).options(selectinload(AuditLog.user)).order_by(AuditLog.created_at.desc()).limit(limit)
@@ -2385,7 +2446,7 @@ async def create_dealer_hub(
     if payload.email and payload.password:
         from core.security import get_password_hash
         # Check if email already exists
-        check_user = await db.execute(select(User).where(User.email == payload.email))
+        check_user = await db.execute(select(User).where(User.email == payload.email, User.is_active == True))
         if check_user.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="Email already registered")
             
@@ -2597,9 +2658,13 @@ async def get_hub_items(
         )
         .where(OrderReturn.hub_id == hub_id)
         .where(OrderReturn.status.in_([
+            ReturnStatus.REQUESTED,
+            ReturnStatus.APPROVED,
+            ReturnStatus.OUT_FOR_PICKUP,
+            ReturnStatus.OUT_FOR_SWAP,
+            ReturnStatus.PICKUP_FAILED,
             ReturnStatus.PICKED_UP,
-            ReturnStatus.IN_TRANSIT_TO_HUB,
-            ReturnStatus.IN_TRANSIT_TO_STORE
+            ReturnStatus.COMPLETED
         ]))
     )
     returns = returns_result.scalars().all()
@@ -2729,14 +2794,7 @@ async def update_dealer_return_status(
 
     # --- MULTI-STAGE LOGISTICS LIFECYCLE ---
     if order_return.order_item:
-        if new_status == ReturnStatus.IN_TRANSIT_TO_HUB:
-            order_return.order_item.status = "returning"
-            # Set hub_id on return so it appears in Hub's inventory
-            if order_return.order_item.hub_id:
-                order_return.hub_id = order_return.order_item.hub_id
-        elif new_status == ReturnStatus.IN_TRANSIT_TO_STORE:
-            order_return.order_item.status = "returning"
-        elif new_status == ReturnStatus.COMPLETED:
+        if new_status == ReturnStatus.COMPLETED:
             order_return.order_item.status = "returned"
             if not order_return.completed_at:
                 order_return.completed_at = datetime.now(timezone.utc)
@@ -2782,6 +2840,8 @@ async def assign_items_to_hub(
         raise HTTPException(status_code=404, detail="Hub not found")
     updated = []
     now = datetime.now(timezone.utc)
+    from models.inventory import ProductInventory
+    
     for item_id in payload.order_item_ids:
         item_result = await db.execute(
             select(OrderItem)
@@ -2790,10 +2850,26 @@ async def assign_items_to_hub(
         )
         item = item_result.scalar_one_or_none()
         if item:
+            # Check hub-specific stock
+            inventory_result = await db.execute(
+                select(ProductInventory)
+                .where(ProductInventory.product_id == item.product_id, ProductInventory.hub_id == payload.hub_id)
+            )
+            inv = inventory_result.scalar_one_or_none()
+            
+            if not inv or inv.stock < item.quantity:
+                # Fetch product name for error
+                product_result = await db.execute(select(Product.name).where(Product.id == item.product_id))
+                prod_name = product_result.scalar_one_or_none() or f"Product ID {item.product_id}"
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Insufficient stock for '{prod_name}' at hub '{hub.name}'. Requested: {item.quantity}, Available: {inv.stock if inv else 0}"
+                )
+                
             item.hub_id = payload.hub_id
             item.dispatch_date = now
             if item.status in ["pending", "order_placed", "confirmed", "packaging", "packed", "processing"]:
-                item.status = "shipped"
+                item.status = "confirmed"
             updated.append(item_id)
             
     if updated:
@@ -2925,6 +3001,137 @@ async def list_dealer_users(
     return response
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Dealer: Manage Serviceable Pincodes
+# ──────────────────────────────────────────────────────────────────────────────
+
+from models.location import ServiceablePincode, PincodeMaster
+
+class AddPincodeRequest(BaseModel):
+    pincode: str
+
+@router.get("/serviceable-pincodes", tags=["dealers"])
+async def get_serviceable_pincodes(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=403, detail="Not authorized as dealer")
+
+    res = await db.execute(
+        select(ServiceablePincode)
+        .where(ServiceablePincode.dealer_id == dealer.id)
+        .order_by(ServiceablePincode.created_at.desc())
+    )
+    pincodes = res.scalars().all()
+    
+    if not pincodes:
+        return []
+        
+    pincode_strs = [p.pincode for p in pincodes]
+    loc_res = await db.execute(
+        select(PincodeMaster.pincode, PincodeMaster.office_name, PincodeMaster.state_name)
+        .where(PincodeMaster.pincode.in_(pincode_strs))
+    )
+    locations = loc_res.all()
+    
+    loc_map = {}
+    for loc in locations:
+        if loc.pincode not in loc_map:
+            office_name = loc.office_name or ""
+            for suffix in [" S.O", " B.O", " H.O"]:
+                if office_name.endswith(suffix):
+                    office_name = office_name[:-len(suffix)]
+            loc_map[loc.pincode] = {
+                "city": office_name,
+                "state": loc.state_name
+            }
+
+    result = []
+    for p in pincodes:
+        loc = loc_map.get(p.pincode, {})
+        result.append({
+            "id": p.id,
+            "pincode": p.pincode,
+            "city": loc.get("city", "Unknown"),
+            "state": loc.get("state", "Unknown"),
+            "is_active": p.is_active,
+            "created_at": p.created_at
+        })
+    return result
+
+@router.post("/serviceable-pincodes", tags=["dealers"])
+async def add_serviceable_pincode(
+    req: AddPincodeRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=403, detail="Not authorized as dealer")
+
+    pincode_clean = req.pincode.strip()
+    if not pincode_clean:
+        raise HTTPException(status_code=400, detail="Pincode cannot be empty")
+
+    # Validate against PincodeMaster
+    valid_pincode_res = await db.execute(
+        select(PincodeMaster).where(PincodeMaster.pincode == pincode_clean).limit(1)
+    )
+    if not valid_pincode_res.scalars().first():
+        raise HTTPException(status_code=400, detail="Invalid Pincode: Not found in location database")
+
+    res = await db.execute(
+        select(ServiceablePincode).where(
+            ServiceablePincode.pincode == pincode_clean,
+            ServiceablePincode.dealer_id == dealer.id
+        )
+    )
+    existing = res.scalar_one_or_none()
+    
+    if existing:
+        if not existing.is_active:
+            existing.is_active = True
+            await db.commit()
+            return existing
+        raise HTTPException(status_code=400, detail="Pincode already added")
+
+    new_pincode = ServiceablePincode(
+        pincode=pincode_clean,
+        dealer_id=dealer.id,
+        is_active=True
+    )
+    db.add(new_pincode)
+    await db.commit()
+    await db.refresh(new_pincode)
+    return new_pincode
+
+@router.delete("/serviceable-pincodes/{pincode}", tags=["dealers"])
+async def remove_serviceable_pincode(
+    pincode: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=403, detail="Not authorized as dealer")
+
+    res = await db.execute(
+        select(ServiceablePincode).where(
+            ServiceablePincode.pincode == pincode,
+            ServiceablePincode.dealer_id == dealer.id
+        )
+    )
+    existing = res.scalar_one_or_none()
+    
+    if not existing:
+        raise HTTPException(status_code=404, detail="Pincode not found in your list")
+
+    await db.delete(existing)
+    await db.commit()
+    return {"message": "Pincode removed successfully"}
+
 # Moved dealer_id routes to prevent shadowing
 @router.get("/{dealer_id}", response_model=DealerSchema)
 async def get_dealer(
@@ -2933,7 +3140,7 @@ async def get_dealer(
     db: AsyncSession = Depends(get_db)
 ):
     """Get dealer details"""
-    result = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    result = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = result.scalar_one_or_none()
     
     if not dealer:
@@ -2952,7 +3159,7 @@ async def update_dealer(
     db: AsyncSession = Depends(get_db)
 ):
     """Update dealer profile (dealer owner or admin)"""
-    result = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    result = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = result.scalar_one_or_none()
     
     if not dealer:
@@ -2994,7 +3201,7 @@ async def approve_dealer(
 ):
     """Approve dealer (admin only)"""
     result = await db.execute(
-        select(Dealer)
+        select(Dealer).where(Dealer.is_deleted == False)
         .options(selectinload(Dealer.user))
         .where(Dealer.id == dealer_id)
     )
@@ -3012,6 +3219,29 @@ async def approve_dealer(
     
     dealer.is_approved = True
     dealer.access_status = 'active'
+    dealer.profile_status = 'completed'
+    
+    # Auto-create Default Hub if none exists
+    from models.hub import DeliveryHub
+    hub_res = await db.execute(select(DeliveryHub).where(DeliveryHub.dealer_id == dealer.id))
+    existing_hub = hub_res.scalars().first()
+    if not existing_hub:
+        default_hub = DeliveryHub(
+            dealer_id=dealer.id,
+            name="Primary Warehouse",
+            address=dealer.business_address or "Head Office",
+            city=dealer.city,
+            state=dealer.state,
+            state_id=dealer.state_id,
+            country_id=dealer.country_id,
+            pincode=dealer.pincode,
+            lat_long=dealer.lat_long,
+            phone=dealer.business_phone,
+            is_active=True,
+            is_showroom=False,
+            hub_type="Warehouse"
+        )
+        db.add(default_hub)
     
     await db.commit()
     
@@ -3039,7 +3269,7 @@ async def reject_dealer(
 ):
     """Reject/unapprove dealer (admin only)"""
     result = await db.execute(
-        select(Dealer)
+        select(Dealer).where(Dealer.is_deleted == False)
         .options(selectinload(Dealer.user))
         .where(Dealer.id == dealer_id)
     )
@@ -3057,7 +3287,7 @@ async def reject_dealer(
     
     dealer.is_approved = False
     dealer.access_status = 'reject'
-    dealer.profile_status = 'reject'
+    dealer.profile_status = 'draft'
     dealer.reject_reason = payload.reason
     
     await db.commit()
@@ -3091,7 +3321,7 @@ async def create_dealer_user(
         raise HTTPException(status_code=400, detail="Invalid role.")
 
     # Check email
-    check = await db.execute(select(User).where(User.email == payload.email))
+    check = await db.execute(select(User).where(User.email == payload.email, User.is_active == True))
     if check.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered")
         
@@ -3405,3 +3635,69 @@ async def delete_dealer_user(
     target_user.is_active = False
     await db.commit()
     return {"status": "success", "message": "User deactivated"}
+
+@router.post("/products/{product_id}/stock", status_code=status.HTTP_200_OK)
+async def update_dealer_stock(
+    product_id: int,
+    payload: DealerStockUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update stock for a specific product (dealer only).
+    Handles both stock-in and stock-out and records the movement.
+    """
+    if payload.product_id != product_id:
+        raise HTTPException(status_code=400, detail="Product ID mismatch")
+
+    # Resolve dealer
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=403, detail="Not authorized. Dealer profile not found.")
+
+    # Fetch product
+    result = await db.execute(select(Product).where(Product.id == product_id, Product.dealer_id == dealer.id))
+    product = result.scalar_one_or_none()
+    
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found or not owned by you")
+
+    if payload.quantity <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be positive")
+
+    stock_before = product.stock
+    quantity_change = 0
+    movement_type = None
+    
+    if payload.update_type.lower() == 'in':
+        quantity_change = payload.quantity
+        product.stock += payload.quantity
+        movement_type = MovementType.RESTOCK
+    elif payload.update_type.lower() == 'out':
+        if product.stock < payload.quantity:
+            raise HTTPException(status_code=400, detail="Insufficient stock for adjustment")
+        quantity_change = -payload.quantity
+        product.stock -= payload.quantity
+        movement_type = MovementType.ADJUSTMENT
+    else:
+        raise HTTPException(status_code=400, detail="Invalid update type. Must be 'in' or 'out'")
+
+    # Create stock movement record
+    movement = StockMovement(
+        product_id=product.id,
+        movement_type=movement_type,
+        quantity=quantity_change,
+        stock_before=stock_before,
+        stock_after=product.stock,
+        user_id=current_user.id,
+        notes=payload.notes or (payload.reason if payload.update_type.lower() == 'out' else "Dealer stock update")
+    )
+    db.add(movement)
+    await db.commit()
+    await db.refresh(product)
+    
+    return {
+        "status": "success",
+        "message": f"Stock {'added' if quantity_change > 0 else 'removed'} successfully",
+        "current_stock": product.stock
+    }

@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from core.database import get_db
-from core.permissions import require_admin
-from models.user import User
+from core.permissions import get_current_active_user
+from models.user import User, UserRole
 from models.dealer import Dealer
 from services.file_upload import FileUploadService
 
@@ -27,7 +27,7 @@ async def upload_dealer_document(
     dealer_id: int,
     doc_type: str,
     file: UploadFile = File(...),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Specialized API for uploading dealer documents"""
@@ -35,10 +35,14 @@ async def upload_dealer_document(
     if doc_type not in DOC_TYPE_MAPPING:
         raise HTTPException(status_code=400, detail=f"Invalid document type. Allowed: {list(DOC_TYPE_MAPPING.keys())}")
         
-    res = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer not found")
+
+    if current_user.role not in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+        if current_user.role != UserRole.DEALER or dealer.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to modify this dealer's documents")
         
     try:
         print(f"DEBUG: Processing upload for {doc_type}...")
@@ -82,17 +86,21 @@ async def upload_dealer_document(
 async def delete_dealer_document(
     dealer_id: int,
     doc_type: str,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a dealer document and the associated file"""
     if doc_type not in DOC_TYPE_MAPPING:
         raise HTTPException(status_code=400, detail=f"Invalid document type")
 
-    res = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer not found")
+
+    if current_user.role not in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+        if current_user.role != UserRole.DEALER or dealer.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to delete this dealer's documents")
         
     doc_field = DOC_TYPE_MAPPING[doc_type]
     image_url = getattr(dealer, doc_field)

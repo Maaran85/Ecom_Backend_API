@@ -548,8 +548,6 @@ async def update_return_pickup_status(
             "swap_completed": ReturnStatus.SWAP_COMPLETED,
             "swap-completed": ReturnStatus.SWAP_COMPLETED,
             "swap completed": ReturnStatus.SWAP_COMPLETED,
-            "in_transit_to_hub": ReturnStatus.IN_TRANSIT_TO_HUB,
-            "send_to_hub": ReturnStatus.IN_TRANSIT_TO_HUB,
             "pickup_failed": "pickup_failed", # Special marker
             "pickup-failed": "pickup_failed",
             "pickup failed": "pickup_failed",
@@ -593,14 +591,6 @@ async def update_return_pickup_status(
                     else:
                         # Should have been collected but wasn't? Maybe throw error or just log
                         order_return.admin_notes = (order_return.admin_notes or "") + f"\n[Payment] Extra amount ₹{order_return.extra_amount_to_collect} NOT confirmed by rider."
-            elif new_status == ReturnStatus.IN_TRANSIT_TO_HUB:
-                order_return.order_item.status = "returning"
-                if order_return.order_item.product and old_status != ReturnStatus.IN_TRANSIT_TO_HUB:
-                    order_return.order_item.product.stock += order_return.order_item.quantity
-                if not order_return.hub_id and order_return.order_item:
-                    order_return.hub_id = order_return.order_item.hub_id
-        
-        # Note: completed_at and refund_amount are now handled by Admin/Hub routers, not riders.
 
         # Extract IDs before objects expire
         order_id = order_return.order_id

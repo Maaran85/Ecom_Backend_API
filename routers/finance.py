@@ -409,7 +409,7 @@ async def get_tds_payout_report(
             and_(
                 Order.created_at >= start_date,
                 Order.created_at < end_date,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -517,7 +517,7 @@ async def get_gst_returns_report(
             and_(
                 Order.created_at >= start_date,
                 Order.created_at < end_date,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -1075,7 +1075,7 @@ async def export_remittances(
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
         
-    res = await db.execute(select(User).where(User.email == email))
+    res = await db.execute(select(User).where(User.email == email).order_by(User.is_active.desc()).limit(1))
     user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid user")
@@ -1225,7 +1225,7 @@ async def export_dealer_tax_reports(
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
         
-    res = await db.execute(select(User).where(User.email == email))
+    res = await db.execute(select(User).where(User.email == email).order_by(User.is_active.desc()).limit(1))
     user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid user")

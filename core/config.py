@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     SQLALCHEMY_DATABASE_URI: Optional[str] = None
     SECRET_KEY: str = "supersecretkey1234567890"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ENCRYPTION_KEY: str = "thisisaverysecretencryptionkey32" # 32 bytes for AES
     
     # SMTP Settings (optional)
     SMTP_SERVER: Optional[str] = None

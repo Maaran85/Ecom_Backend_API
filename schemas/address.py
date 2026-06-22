@@ -13,6 +13,8 @@ class AddressBase(BaseModel):
     state: str
     pincode: str
     country: str = "India"
+    latitude: Optional[str] = None
+    longitude: Optional[str] = None
     address_type: AddressType = AddressType.HOME
 
 class AddressCreate(AddressBase):
@@ -27,6 +29,8 @@ class AddressUpdate(BaseModel):
     state: Optional[str] = None
     pincode: Optional[str] = None
     country: Optional[str] = None
+    latitude: Optional[str] = None
+    longitude: Optional[str] = None
     address_type: Optional[AddressType] = None
     is_default: Optional[bool] = None
 

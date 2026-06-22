@@ -28,7 +28,7 @@ class ProductVariant(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
-    product = relationship("Product", back_populates="variants")
+    product = relationship("Product")
     
     # Ensure unique combination of product + size + color
     __table_args__ = (

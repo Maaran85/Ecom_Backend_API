@@ -57,10 +57,11 @@ async def get_current_user(
         )
         user = result.scalar_one_or_none()
     else:
+        from sqlalchemy.orm import selectinload
         result = await db.execute(
-            select(User).where(
-                (User.email == identifier) | (User.phone == identifier)
-            )
+            select(User)
+            .options(selectinload(User.dealer))
+            .where((User.email == identifier) | (User.phone == identifier))
         )
         user = result.scalar_one_or_none()
     
@@ -95,10 +96,11 @@ async def get_current_user_optional(
             )
         )
     else:
+        from sqlalchemy.orm import selectinload
         result = await db.execute(
-            select(User).where(
-                (User.email == identifier) | (User.phone == identifier)
-            )
+            select(User)
+            .options(selectinload(User.dealer))
+            .where((User.email == identifier) | (User.phone == identifier))
         )
     
     user = result.scalar_one_or_none()

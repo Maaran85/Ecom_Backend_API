@@ -20,6 +20,7 @@ class DeliveryHub(Base):
     country_id = Column(Integer, ForeignKey("countries.id"), nullable=True)
     pincode = Column(String, nullable=True)
     lat_long = Column(String, nullable=True)
+    max_delivery_radius = Column(Float, nullable=True)  # Max radius in km for local delivery
 
     # Contact
     contact_person = Column(String, nullable=True)

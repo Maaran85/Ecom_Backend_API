@@ -32,6 +32,9 @@ class StockMovement(Base):
     reference_id = Column(Integer, nullable=True)  # Order ID, Return ID, etc.
     reference_type = Column(String, nullable=True)  # "order", "return", etc.
     
+    # Location
+    hub_id = Column(Integer, ForeignKey("delivery_hubs.id", ondelete="SET NULL"), nullable=True)
+    
     # Who made the change
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     notes = Column(String, nullable=True)
@@ -41,6 +44,19 @@ class StockMovement(Base):
     # Relationships
     product = relationship("Product", backref="stock_movements")
     user = relationship("User", backref="stock_movements")
+    hub = relationship("DeliveryHub", backref="stock_movements")
+
+class ProductInventory(Base):
+    __tablename__ = "product_inventories"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    hub_id = Column(Integer, ForeignKey("delivery_hubs.id", ondelete="CASCADE"), nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    stock = Column(Integer, default=0, nullable=False)
+    
+    # Relationships
+    hub = relationship("DeliveryHub", backref="inventory")
+    product = relationship("Product", backref="product_inventory")
 
 class StockReservation(Base):
     """Reserve stock when items are added to cart"""

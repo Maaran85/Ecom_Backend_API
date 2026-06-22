@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, List
 from datetime import datetime
 
@@ -80,6 +80,36 @@ class Rider(RiderBase):
     total_earnings: float = 0.0
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
+
+    @field_validator('aadhaar_number', mode='before')
+    @classmethod
+    def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 12:
+            return f"********{str(v)[-4:]}"
+        return v
+        
+    @field_validator('license_number', mode='before')
+    @classmethod
+    def mask_license(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 6:
+            return f"******{str(v)[-4:]}"
+        return v
+
+    @field_validator('account_number', mode='before')
+    @classmethod
+    def mask_account(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 4:
+            return f"******{str(v)[-4:]}"
+        return v
+
+    @field_validator('upi_id', mode='before')
+    @classmethod
+    def mask_upi(cls, v: Optional[str]) -> Optional[str]:
+        if v and '@' in str(v):
+            parts = str(v).split('@')
+            if len(parts[0]) > 2:
+                return f"{parts[0][:2]}***@{parts[1]}"
+        return v
 
     class Config:
         from_attributes = True

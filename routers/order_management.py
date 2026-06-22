@@ -196,10 +196,11 @@ async def request_return(
         )
 
     # Verify item belongs to this order
-    item_check = await db.execute(
+    item_result = await db.execute(
         select(OrderItem).where(OrderItem.id == return_data.order_item_id, OrderItem.order_id == order_id)
     )
-    if not item_check.scalar_one_or_none():
+    order_item = item_result.scalar_one_or_none()
+    if not order_item:
         raise HTTPException(status_code=400, detail="Specified item does not belong to this order")
     
     # Check return window (e.g., 7 days from delivery)
@@ -227,7 +228,9 @@ async def request_return(
         is_exchange=return_data.is_exchange,
         exchange_variant_id=actual_variant_id,
         pickup_date=return_data.pickup_date,
-        status=ReturnStatus.REQUESTED
+        status=ReturnStatus.REQUESTED,
+        hub_id=order_item.hub_id,
+        logistics_partner_id=order_item.logistics_partner_id
     )
     
     db.add(order_return)
@@ -605,8 +608,6 @@ async def process_return_refund(
     
     allowed_statuses = [
         ReturnStatus.APPROVED, ReturnStatus.PICKED_UP,
-        ReturnStatus.IN_TRANSIT_TO_HUB, ReturnStatus.AT_HUB,
-        ReturnStatus.IN_TRANSIT_TO_STORE, 
         ReturnStatus.RETURN_PICKUP_COMPLETED,
         ReturnStatus.COMPLETED
     ]

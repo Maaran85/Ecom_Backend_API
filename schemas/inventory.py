@@ -59,3 +59,7 @@ class BulkStockUpdateResponse(BaseModel):
     success_count: int
     failed_count: int
     results: List[dict]
+
+class HubStockAdd(BaseModel):
+    product_id: int
+    quantity: int = Field(..., description="Quantity of stock to add")

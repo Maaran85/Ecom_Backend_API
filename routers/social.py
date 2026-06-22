@@ -28,7 +28,7 @@ async def follow_dealer(
     """Follow a dealer"""
     
     # Check if dealer exists
-    dealer_result = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    dealer_result = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = dealer_result.scalar_one_or_none()
     
     if not dealer:

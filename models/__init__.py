@@ -7,12 +7,13 @@ from .product_variant import ProductVariant
 from .address import Address, AddressType
 from .review import Review, ReviewVote
 from .wishlist import WishlistItem
+from .consent import ConsentLog
 from .coupon import Coupon, CouponUsage, DiscountType
 from .flash_sale import FlashSale
 from .bulk_discount import BulkDiscount
 from .payment import Payment, PaymentWebhook, PaymentMethod, PaymentStatus
 from .order_return import OrderReturn, ReturnStatus
-from .inventory import StockMovement, StockReservation, StockAlert, MovementType
+from .inventory import StockMovement, StockReservation, StockAlert, MovementType, ProductInventory
 from .notification import Notification, NotificationPreference, CustomerNotificationPreference, NotificationType, NotificationChannel
 from .social import DealerFollow
 from .search_history import SearchHistory
@@ -22,8 +23,7 @@ from .logistics_partner import LogisticsPartner
 from .rider_review import RiderReview
 from .rider_earning import RiderEarning
 from .hub import DeliveryHub
-from .location import Country, State
-from .location_inventory import LocationInventory
+from .location import Country, State, PincodeMaster
 from .dealer_logistics import dealer_logistics_mapping
 from .audit import AuditLog
 from .payment_settings import PlatformPaymentSettings
@@ -32,6 +32,7 @@ from .logistics_remittance import LogisticsRemittance
 from .dealer_remittance import DealerRemittance
 from .recharge import RechargeTransaction, RechargeStatus
 from .reward import SpinConfig, SpinToken, SpinResult, RewardPrize, MonthlyLeaderboard, SpinSource, RewardSession, RewardSessionStatus
+from .partner import Partner
 
 __all__ = [
     "User", "UserRole", "CustomerUser",
@@ -41,13 +42,13 @@ __all__ = [
     "ProductVariant",
     "Address", "AddressType",
     "Review", "ReviewVote",
-    "WishlistItem",
+    "WishlistItem", "ConsentLog",
     "Coupon", "CouponUsage", "DiscountType",
     "FlashSale",
     "BulkDiscount",
     "Payment", "PaymentWebhook", "PaymentMethod", "PaymentStatus",
     "OrderReturn", "ReturnStatus",
-    "StockMovement", "StockReservation", "StockAlert", "MovementType",
+    "StockMovement", "StockReservation", "StockAlert", "MovementType", "ProductInventory",
     "Notification", "NotificationPreference", "CustomerNotificationPreference", "NotificationType", "NotificationChannel",
     "DealerFollow",
     "SearchHistory",
@@ -55,8 +56,7 @@ __all__ = [
     "DeliveryRider", "RiderReview", "RiderEarning",
     "LogisticsPartner",
     "DeliveryHub",
-    "Country", "State",
-    "LocationInventory",
+    "Country", "State", "PincodeMaster",
     "AuditLog",
     "PlatformPaymentSettings",
     "dealer_logistics_mapping",
@@ -64,5 +64,20 @@ __all__ = [
     "LogisticsRemittance",
     "DealerRemittance",
     "RechargeTransaction", "RechargeStatus",
-    "SpinConfig", "SpinToken", "SpinResult", "RewardPrize", "MonthlyLeaderboard", "SpinSource", "RewardSession", "RewardSessionStatus"
+    "SpinConfig", "SpinToken", "SpinResult", "RewardPrize", "MonthlyLeaderboard", "SpinSource", "RewardSession", "RewardSessionStatus",
+    "Partner"
 ]
+
+# Dynamically calculate stock from ProductInventory to avoid circular imports and premature mapper initialization
+from sqlalchemy.orm import aliased, column_property
+from sqlalchemy import select, func
+
+ChildProduct = aliased(Product)
+Product.stock = column_property(
+    select(func.coalesce(func.sum(ProductInventory.stock), 0)).where(
+        (ProductInventory.product_id == Product.id) | 
+        ProductInventory.product_id.in_(
+            select(ChildProduct.id).where(ChildProduct.parent_product_id == Product.id).correlate(Product)
+        )
+    ).correlate(Product).scalar_subquery()
+)

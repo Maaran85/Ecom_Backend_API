@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Union, Any
 from datetime import datetime
 from pydantic import BaseModel, field_validator
 
@@ -23,6 +23,7 @@ class CategoryBase(BaseModel):
     name: str
     image_url: Optional[str] = None
     parent_id: Optional[int] = None
+    is_active: bool = True
 
 class CategoryCreate(CategoryBase):
     pass
@@ -31,6 +32,7 @@ class CategoryUpdate(BaseModel):
     name: Optional[str] = None
     image_url: Optional[str] = None
     parent_id: Optional[int] = None
+    is_active: Optional[bool] = None
 
 class CategoryAttributeUpdate(BaseModel):
     name: Optional[str] = None
@@ -41,33 +43,18 @@ class CategoryAttributeUpdate(BaseModel):
 class Category(CategoryBase):
     id: int
     created_at: datetime
+    is_active: bool
     attributes: Optional[List[CategoryAttribute]] = None
 
     class Config:
         from_attributes = True
 
-# Product Variant Schemas
-class ProductVariantBase(BaseModel):
-    sku: str
-    size: Optional[str] = None
-    color: Optional[str] = None
-    material: Optional[str] = None
-    price_adjustment: float = 0.0
-    stock: int = 0
-    images: Optional[List[str]] = None
-    is_active: bool = True
 
-class ProductVariantCreate(ProductVariantBase):
-    pass
 
-class ProductVariant(ProductVariantBase):
-    id: int
-    product_id: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
+class ColorImage(BaseModel):
+    color: str
+    is_available: bool = True
+    image_urls: List[str]
 
 # Product Schemas
 class ProductBase(BaseModel):
@@ -78,7 +65,7 @@ class ProductBase(BaseModel):
     stock: int = 0
     category_id: int
     dealer_id: Optional[int] = None
-    images: List[str]
+    images: List[Union[ColorImage, str]]
     subcategory: str
     gender: str
     brand: str
@@ -88,10 +75,10 @@ class ProductBase(BaseModel):
     discount_percentage: Optional[int] = None
     average_rating: Optional[float] = None
     attributes: Optional[dict] = None
+    color: Optional[str] = None
+    parent_product_id: Optional[int] = None
     
-    # Inventory Type
-    has_variants: bool = False
-    variants: Optional[List[ProductVariantCreate]] = None
+    # Return & Exchange Policy
     # Return & Exchange Policy
     is_returnable: bool = True
     return_window_days: int = 14
@@ -103,7 +90,7 @@ class ProductBase(BaseModel):
 
     @field_validator('images')
     @classmethod
-    def images_must_not_be_empty(cls, v: List[str]) -> List[str]:
+    def images_must_not_be_empty(cls, v: List[Any]) -> List[Any]:
         if not v or len(v) == 0:
             raise ValueError('At least one product image is required')
         return v
@@ -123,7 +110,7 @@ class ProductUpdate(BaseModel):
     brand: Optional[str] = None
     color: Optional[str] = None
     gender: Optional[str] = None
-    images: Optional[List[str]] = None
+    images: Optional[List[Union[ColorImage, str]]] = None
     attributes: Optional[dict] = None
     is_returnable: Optional[bool] = None
     return_window_days: Optional[int] = None
@@ -131,14 +118,14 @@ class ProductUpdate(BaseModel):
     return_policy_note: Optional[str] = None
     hsn_code: Optional[str] = None
     tax_rule_id: Optional[int] = None
-    has_variants: Optional[bool] = None
-    variants: Optional[List[ProductVariantCreate]] = None # Simplification: use same create schema for updates
+    parent_product_id: Optional[int] = None
 class Product(ProductBase):
     id: int
     is_approved: bool
     created_at: datetime
     category: Optional[Category] = None
-    variants: Optional[List[ProductVariant]] = []
+    children: Optional[List['Product']] = []
+    hub_stock: Optional[int] = None
 
     class Config:
         from_attributes = True

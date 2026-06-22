@@ -23,12 +23,12 @@ class ShowroomUpdate(BaseModel):
     contact_person: Optional[str] = None
     is_active: Optional[bool] = None
 
-class LocationInventoryBase(BaseModel):
+class ProductInventoryBase(BaseModel):
     product_id: int
     hub_id: int
     quantity: int
 
-class LocationInventoryResponse(LocationInventoryBase):
+class ProductInventoryResponse(ProductInventoryBase):
     id: int
     product_name: Optional[str] = None
     product_price: Optional[float] = None
@@ -42,10 +42,8 @@ class LocationInventoryResponse(LocationInventoryBase):
     class Config:
         from_attributes = True
 
-class StockTransferRequest(BaseModel):
+class StockAddRequest(BaseModel):
     product_id: int
-    from_hub_id: Optional[int] = None  # None means Dealer Main Pool
-    to_hub_id: int
     quantity: int
     notes: Optional[str] = None
 

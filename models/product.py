@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, JSON, DateTime, Boolean
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from sqlalchemy.sql import func
 from core.database import Base
 
@@ -10,6 +10,7 @@ class Category(Base):
     name = Column(String, nullable=False)
     image_url = Column(String, nullable=True)
     parent_id = Column(Integer, ForeignKey("categories.id"), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
@@ -37,13 +38,15 @@ class Product(Base):
     price = Column(Float, nullable=False)
     discount_price = Column(Float, nullable=True)
     discount_percentage = Column(Integer, nullable=True)  # For filter: 10%, 20%, 30%, etc.
-    stock = Column(Integer, default=0, nullable=False)
+    # stock column removed, replaced by dynamic column_property at the bottom
     average_rating = Column(Float, nullable=True, default=0.0)  # Calculated from reviews
     category_id = Column(Integer, ForeignKey("categories.id"), nullable=False)
     subcategory = Column(String, nullable=False, index=True)  # Topwear, Bottomwear, Footwear, etc.
     dealer_id = Column(Integer, ForeignKey("dealers.id"), nullable=False, index=True)  # All products must belong to a dealer
     is_approved = Column(Boolean, default=False, nullable=False)
-    has_variants = Column(Boolean, default=False, nullable=False)
+    
+    # Variant Support (Parent-Child)
+    parent_product_id = Column(Integer, ForeignKey("products.id"), nullable=True, index=True)
     images = Column(JSON, nullable=False, default=[])  # Store as JSON array of image URLs
     
     # Filter fields
@@ -75,5 +78,7 @@ class Product(Base):
     # Relationships
     category = relationship("Category", back_populates="products")
     dealer = relationship("Dealer", back_populates="products")
-    variants = relationship("ProductVariant", back_populates="product", cascade="all, delete-orphan")
+    children = relationship("Product", backref=backref('parent', remote_side=[id]))
     reviews = relationship("Review", back_populates="product", cascade="all, delete-orphan")
+
+

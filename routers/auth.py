@@ -31,7 +31,7 @@ async def register(request: Request, user_in: UserCreate, db: AsyncSession = Dep
         
     # Check existing email
     if user_in.email:
-        result = await db.execute(select(UserModel).where(UserModel.email == user_in.email))
+        result = await db.execute(select(UserModel).where(UserModel.email == user_in.email, UserModel.is_active == True))
         if result.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="Email already registered")
             
@@ -57,10 +57,14 @@ async def register(request: Request, user_in: UserCreate, db: AsyncSession = Dep
 async def login(request: Request, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     """Staff Login"""
     from sqlalchemy.orm import selectinload
+    from models.partner import Partner as PartnerModel
     result = await db.execute(
         select(UserModel)
-        .options(selectinload(UserModel.dealer))
-        .where(or_(UserModel.email == login_data.identifier, UserModel.phone == login_data.identifier))
+        .options(
+            selectinload(UserModel.dealer).selectinload(DealerModel.partner),
+            selectinload(UserModel.partner)
+        )
+        .where(or_(UserModel.email == login_data.identifier, UserModel.phone == login_data.identifier)).order_by(UserModel.is_active.desc()).limit(1)
     )
     user = result.scalar_one_or_none()
     if not user or not verify_password(login_data.password, user.password_hash):
@@ -69,6 +73,18 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
          raise HTTPException(status_code=403, detail="Customers must use OTP login")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="account_deactivated")
+        
+    if user.partner:
+        if not getattr(user.partner, 'is_active', True):
+            raise HTTPException(status_code=403, detail="Partner account is inactive")
+            
+    if user.dealer:
+        if getattr(user.dealer, 'is_deleted', False):
+            raise HTTPException(status_code=403, detail="Dealer account has been deleted")
+        if not getattr(user.dealer, 'is_active', True):
+            raise HTTPException(status_code=403, detail="Dealer account is temporarily locked")
+        if user.dealer.partner and not getattr(user.dealer.partner, 'is_active', True):
+            raise HTTPException(status_code=403, detail="Associated partner account is inactive")
     
     access_token = create_access_token(data={"sub": user.email or user.phone, "role": user.role.value, "is_customer": False})
     return {"access_token": access_token, "token_type": "bearer", "user": user}
@@ -278,7 +294,7 @@ async def send_otp(data: CustomerLoginRequest, db: AsyncSession = Depends(get_db
     otp = str(random.randint(100000, 999999))
     
     # Check if a user with this email/phone already exists
-    result = await db.execute(select(UserModel).where(or_(UserModel.email == identifier, UserModel.phone == identifier)))
+    result = await db.execute(select(UserModel).where(or_(UserModel.email == identifier, UserModel.phone == identifier)).order_by(UserModel.is_active.desc()).limit(1))
     user = result.scalar_one_or_none()
     
     if user:
@@ -323,7 +339,7 @@ async def verify_otp(data: CustomerOTPVerify, db: AsyncSession = Depends(get_db)
 async def dealer_register(data: DealerSelfRegistration, db: AsyncSession = Depends(get_db)):
     """Register a new dealer after OTP verification"""
     # Check if user exists and OTP was verified
-    result = await db.execute(select(UserModel).where(UserModel.email == data.email_id))
+    result = await db.execute(select(UserModel).where(UserModel.email == data.email_id).order_by(UserModel.is_active.desc()).limit(1))
     user = result.scalar_one_or_none()
     
     if not user:
@@ -355,13 +371,27 @@ async def dealer_register(data: DealerSelfRegistration, db: AsyncSession = Depen
         gst_number=data.gst_number,
         pan_number=data.pan_number,
         is_active=False,
-        profile_status='pending',
+        profile_status='draft',
         access_status='pending'
     )
     db.add(dealer)
     await db.flush()
     
     user.dealer_id = dealer.id
+
+    # Auto-create Default Hub for the new dealer
+    from models.hub import DeliveryHub
+    default_hub = DeliveryHub(
+        dealer_id=dealer.id,
+        name="Primary Warehouse",
+        address=data.business_address or "Head Office",
+        phone=data.phone,
+        is_active=True,
+        is_showroom=False,
+        hub_type="Warehouse"
+    )
+    db.add(default_hub)
+
     await db.commit()
     await db.refresh(dealer)
     
@@ -374,7 +404,7 @@ class SetDealerPasswordRequest(BaseModel):
 @router.post("/set-dealer-password")
 async def set_dealer_password(data: SetDealerPasswordRequest, db: AsyncSession = Depends(get_db)):
     """Set/reset dealer password"""
-    result = await db.execute(select(UserModel).where(UserModel.email == data.email))
+    result = await db.execute(select(UserModel).where(UserModel.email == data.email).order_by(UserModel.is_active.desc()).limit(1))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

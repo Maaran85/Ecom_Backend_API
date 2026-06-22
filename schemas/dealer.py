@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from datetime import datetime
 from models.cart import OrderStatus
@@ -9,6 +9,8 @@ class HubBase(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     pincode: Optional[str] = None
+    lat_long: Optional[str] = None
+    max_delivery_radius: Optional[float] = None
     state_id: Optional[int] = None
     country_id: Optional[int] = None
     phone: Optional[str] = None
@@ -32,6 +34,7 @@ class DealerBase(BaseModel):
     business_name: str
     business_address: Optional[str] = None
     gst_number: Optional[str] = None
+    partner_id: Optional[int] = None
 
 class DealerCreate(DealerBase):
     pass
@@ -45,9 +48,14 @@ class DealerSelfRegistration(DealerBase):
 
 class DealerProfileComplete(BaseModel):
     # Company Details
+    business_name: Optional[str] = None
+    business_address: Optional[str] = None
+    owner_name: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
     pincode: Optional[str] = None
+    country_id: Optional[int] = None
+    state_id: Optional[int] = None
     lat_long: Optional[str] = None
     business_phone: Optional[str] = None
     
@@ -55,11 +63,14 @@ class DealerProfileComplete(BaseModel):
     company_photo_url: Optional[str] = None
     gst_certificate_url: Optional[str] = None
     incorporation_certificate_url: Optional[str] = None
+    gst_number: Optional[str] = None
     pan_number: str
     pan_photo_url: Optional[str] = None
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
+    aadhaar_number: Optional[str] = None
+    aadhaar_photo_url: Optional[str] = None
     
     # Bank Details
     bank_name: str
@@ -69,6 +80,27 @@ class DealerProfileComplete(BaseModel):
     account_holder_name: str
     account_number: str
 
+    @field_validator('aadhaar_number', mode='before')
+    @classmethod
+    def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 12:
+            return f"********{str(v)[-4:]}"
+        return v
+        
+    @field_validator('pan_number', mode='before')
+    @classmethod
+    def mask_pan(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 10:
+            return f"******{str(v)[-4:]}"
+        return v
+
+    @field_validator('account_number', mode='before')
+    @classmethod
+    def mask_account(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 4:
+            return f"******{str(v)[-4:]}"
+        return v
+
 class DealerUpdate(BaseModel):
     business_name: Optional[str] = None
     business_address: Optional[str] = None
@@ -76,6 +108,7 @@ class DealerUpdate(BaseModel):
     delivery_charge: Optional[float] = None
     free_delivery_above: Optional[float] = None
     estimated_delivery_days: Optional[int] = None
+    partner_id: Optional[int] = None
 
 class Dealer(DealerBase):
     id: int
@@ -89,6 +122,53 @@ class Dealer(DealerBase):
     estimated_delivery_days: int
     platform_fee_percent: float
     created_at: datetime
+    
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    country_id: Optional[int] = None
+    state_id: Optional[int] = None
+    lat_long: Optional[str] = None
+    business_phone: Optional[str] = None
+    
+    company_photo_url: Optional[str] = None
+    gst_certificate_url: Optional[str] = None
+    incorporation_certificate_url: Optional[str] = None
+    pan_number: Optional[str] = None
+    pan_photo_url: Optional[str] = None
+    cin_number: Optional[str] = None
+    cin_certificate_url: Optional[str] = None
+    company_logo_url: Optional[str] = None
+    aadhaar_number: Optional[str] = None
+    aadhaar_photo_url: Optional[str] = None
+    
+    bank_name: Optional[str] = None
+    bank_address: Optional[str] = None
+    bank_branch: Optional[str] = None
+    ifsc_code: Optional[str] = None
+    account_holder_name: Optional[str] = None
+    account_number: Optional[str] = None
+
+    @field_validator('aadhaar_number', mode='before')
+    @classmethod
+    def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 12:
+            return f"********{str(v)[-4:]}"
+        return v
+        
+    @field_validator('pan_number', mode='before')
+    @classmethod
+    def mask_pan(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 10:
+            return f"******{str(v)[-4:]}"
+        return v
+
+    @field_validator('account_number', mode='before')
+    @classmethod
+    def mask_account(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(str(v)) >= 4:
+            return f"******{str(v)[-4:]}"
+        return v
 
     class Config:
         from_attributes = True
@@ -164,6 +244,8 @@ class DealerOrderResponse(BaseModel):
     return_reason: Optional[str] = None
     refund_amount: Optional[float] = None
     cancellation_reason: Optional[str] = None
+    customer_lat: Optional[str] = None
+    customer_long: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -187,4 +269,15 @@ class DealerRefundItem(BaseModel):
     is_exchange: Optional[bool] = False
     exchange_variant_id: Optional[int] = None
 
-
+class DealerStockUpdate(BaseModel):
+    product_id: int
+    quantity: int
+    update_type: str  # 'in' or 'out'
+    notes: Optional[str] = None
+    reason: Optional[str] = None
+    return_status: str
+    refund_initiated: bool
+    requested_at: datetime
+    customer_name: str
+    is_exchange: Optional[bool] = False
+    exchange_variant_id: Optional[int] = None

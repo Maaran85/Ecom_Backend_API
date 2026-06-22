@@ -11,3 +11,5 @@ email-validator
 Pillow
 slowapi
 fastapi-mail
+sqlalchemy-utils
+cryptography

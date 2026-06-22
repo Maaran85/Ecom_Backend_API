@@ -2,6 +2,9 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean, Float, Foreig
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from core.database import Base
+from core.config import settings
+from sqlalchemy_utils import EncryptedType
+from sqlalchemy_utils.types.encrypted.encrypted_type import AesEngine
 
 class Dealer(Base):
     __tablename__ = "dealers"
@@ -12,11 +15,13 @@ class Dealer(Base):
     business_address = Column(String, nullable=True)
     gst_number = Column(String, nullable=True)
     is_approved = Column(Boolean, default=False, nullable=False)
+    partner_id = Column(Integer, ForeignKey('partners.id'), nullable=True)
     
     # Statuses
-    profile_status = Column(String, default="pending", nullable=False) # pending, completed
+    profile_status = Column(String, default="draft", nullable=False) # draft, pending, completed
     access_status = Column(String, default="pending", nullable=False)  # pending, active, reject
     is_active = Column(Boolean, default=True, nullable=False)
+    is_deleted = Column(Boolean, default=False, nullable=False)
     reject_reason = Column(String, nullable=True)
     
     # Company Details Extension
@@ -33,9 +38,9 @@ class Dealer(Base):
     company_photo_url = Column(String, nullable=True)
     gst_certificate_url = Column(String, nullable=True)
     incorporation_certificate_url = Column(String, nullable=True)
-    pan_number = Column(String, nullable=True)
+    pan_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     pan_photo_url = Column(String, nullable=True)
-    aadhaar_number = Column(String, nullable=True)
+    aadhaar_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     aadhaar_photo_url = Column(String, nullable=True)
     cin_number = Column(String, nullable=True)
     cin_certificate_url = Column(String, nullable=True)
@@ -45,9 +50,9 @@ class Dealer(Base):
     bank_name = Column(String, nullable=True)
     bank_address = Column(String, nullable=True)
     bank_branch = Column(String, nullable=True)
-    ifsc_code = Column(String, nullable=True)
+    ifsc_code = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     account_holder_name = Column(String, nullable=True)
-    account_number = Column(String, nullable=True)
+    account_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
 
     # Delivery Settings
     delivery_charge = Column(Float, default=0.0, nullable=False)        # flat fee per order from this dealer
@@ -63,6 +68,7 @@ class Dealer(Base):
     
     # Relationships
     user = relationship("User", backref="dealer_profile", foreign_keys=[user_id])
+    partner = relationship("Partner", backref="dealers")
     products = relationship("Product", back_populates="dealer")
     country = relationship("Country", foreign_keys=[country_id])
     state_rel = relationship("State", foreign_keys=[state_id])

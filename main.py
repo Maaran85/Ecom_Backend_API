@@ -20,7 +20,8 @@ from routers import (
     analytics_router, upload_router, social_router, support_tickets_router,
     riders_router, rider_reviews_router, locations_router,
     showroom_router, dealer_docs_router, payment_settings_router,
-    finance_router, logistics_router, recharge_router, rewards_router
+    finance_router, logistics_router, recharge_router, rewards_router,
+    partners_router
 )
 
 app = FastAPI(title=settings.PROJECT_NAME)
@@ -63,6 +64,7 @@ app.add_middleware(
     allow_credentials=False,      # Token is in Authorization header, not cookies
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],
 )
 
 # Mount static files
@@ -99,6 +101,7 @@ app.include_router(finance_router, prefix="/api/v1", tags=["finance"])
 app.include_router(logistics_router, prefix="/api/v1/logistics", tags=["logistics"])
 app.include_router(recharge_router, prefix="/api/v1/recharge", tags=["recharge"])
 app.include_router(rewards_router, prefix="/api/v1/rewards", tags=["rewards"])
+app.include_router(partners_router, prefix="/api/v1/superadmin/partners", tags=["superadmin-partners"])
 
 @app.get("/")
 def read_root():
@@ -108,3 +111,11 @@ def read_root():
 @limiter.limit("100/minute")
 def health_check(request: Request):
     return {"status": "ok", "app": settings.PROJECT_NAME}
+
+import asyncio
+from core.support_escalation import start_support_escalation_loop
+
+@app.on_event("startup")
+async def startup_event():
+    # Start the support escalation background loop
+    asyncio.create_task(start_support_escalation_loop())

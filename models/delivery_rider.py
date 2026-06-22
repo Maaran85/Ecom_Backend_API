@@ -2,6 +2,9 @@ from sqlalchemy import Column, Integer, String, Boolean, Float, ForeignKey, Date
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from core.database import Base
+from core.config import settings
+from sqlalchemy_utils import EncryptedType
+from sqlalchemy_utils.types.encrypted.encrypted_type import AesEngine
 
 class DeliveryRider(Base):
     __tablename__ = "delivery_riders"
@@ -23,8 +26,8 @@ class DeliveryRider(Base):
     dob = Column(String, nullable=True)
     
     phone_number = Column("phone_number", String, nullable=True)
-    license_number = Column(String, nullable=True)
-    aadhaar_number = Column(String, nullable=True)
+    license_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    aadhaar_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     emergency_contact = Column(String, nullable=True)
     address = Column(String, nullable=True)
     photo_url = Column(String, nullable=True)
@@ -35,9 +38,9 @@ class DeliveryRider(Base):
     
     # Bank Details (For payouts)
     bank_name = Column(String, nullable=True)
-    account_number = Column(String, nullable=True)
-    ifsc_code = Column(String, nullable=True)
-    upi_id = Column(String, nullable=True)
+    account_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    ifsc_code = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    upi_id = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     
     # Hub Mapping
     hub_id = Column(Integer, ForeignKey("delivery_hubs.id", ondelete="SET NULL"), nullable=True)

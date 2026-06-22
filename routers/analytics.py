@@ -35,7 +35,7 @@ async def get_analytics_overview(
     # Total revenue (completed orders)
     revenue_result = await db.execute(
         select(func.sum(Order.total_amount)).where(
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+            Order.status.in_([OrderStatus.DELIVERED])
         )
     )
     total_revenue = revenue_result.scalar() or 0.0
@@ -62,7 +62,7 @@ async def get_analytics_overview(
         select(func.sum(Order.total_amount)).where(
             and_(
                 Order.created_at >= thirty_days_ago,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -73,7 +73,7 @@ async def get_analytics_overview(
             and_(
                 Order.created_at >= sixty_days_ago,
                 Order.created_at < thirty_days_ago,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -108,7 +108,7 @@ async def get_analytics_overview(
         )
         .join(OrderItem, OrderItem.product_id == Product.id)
         .join(Order, Order.id == OrderItem.order_id)
-        .where(Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED]))
+        .where(Order.status.in_([OrderStatus.DELIVERED]))
         .group_by(Product.id, Product.name)
         .order_by(desc('total_sold'))
         .limit(5)
@@ -162,7 +162,7 @@ async def get_dealer_analytics_overview(
     if not dealer_id:
         # Check if they are the primary owner
         from models.dealer import Dealer
-        res = await db.execute(select(Dealer).where(Dealer.user_id == current_user.id))
+        res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == current_user.id))
         dealer = res.scalar_one_or_none()
         if dealer:
             dealer_id = dealer.id
@@ -186,7 +186,7 @@ async def get_dealer_analytics_overview(
         .where(
             and_(
                 Product.dealer_id == dealer_id,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -247,7 +247,7 @@ async def get_dealer_analytics_overview(
             and_(
                 Product.dealer_id == dealer_id,
                 Order.created_at >= thirty_days_ago,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -262,7 +262,7 @@ async def get_dealer_analytics_overview(
                 Product.dealer_id == dealer_id,
                 Order.created_at >= sixty_days_ago,
                 Order.created_at < thirty_days_ago,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -312,7 +312,7 @@ async def get_dealer_analytics_overview(
         .where(
             and_(
                 Product.dealer_id == dealer_id,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
         .group_by(Product.id, Product.name)
@@ -436,7 +436,7 @@ async def get_sales_analytics(
             and_(
                 Order.created_at >= from_date,
                 Order.created_at <= to_date,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -470,7 +470,7 @@ async def get_sales_analytics(
                 and_(
                     Order.created_at >= from_date,
                     Order.created_at <= to_date,
-                    Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                    Order.status.in_([OrderStatus.DELIVERED])
                 )
             )
             .group_by(func.date(Order.created_at))
@@ -498,7 +498,7 @@ async def get_sales_analytics(
             and_(
                 Order.created_at >= from_date,
                 Order.created_at <= to_date,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
         .group_by(Category.name)
@@ -563,7 +563,7 @@ async def get_revenue_analytics(
         select(func.sum(Order.total_amount)).where(
             and_(
                 Order.created_at >= current_start,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -591,7 +591,7 @@ async def get_revenue_analytics(
             and_(
                 Order.created_at >= previous_start,
                 Order.created_at < previous_end,
-                Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+                Order.status.in_([OrderStatus.DELIVERED])
             )
         )
     )
@@ -681,7 +681,7 @@ async def get_product_analytics(
     ).outerjoin(OrderItem, OrderItem.product_id == Product.id)\
      .outerjoin(Order, Order.id == OrderItem.order_id)\
      .where(
-         (Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])) | (Order.id.is_(None))
+         (Order.status.in_([OrderStatus.DELIVERED])) | (Order.id.is_(None))
      )\
      .group_by(Product.id, Product.name, Product.stock)
     
@@ -777,7 +777,7 @@ async def get_customer_analytics(
     # Customer lifetime value
     total_revenue_result = await db.execute(
         select(func.sum(Order.total_amount)).where(
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED])
+            Order.status.in_([OrderStatus.DELIVERED])
         )
     )
     total_revenue = total_revenue_result.scalar() or 0.0
@@ -794,7 +794,7 @@ async def get_customer_analytics(
             func.max(Order.created_at).label('last_order')
         )
         .join(Order, Order.user_id == User.id)
-        .where(Order.status.in_([OrderStatus.DELIVERED, OrderStatus.COMPLETED]))
+        .where(Order.status.in_([OrderStatus.DELIVERED]))
         .group_by(User.id, User.full_name, User.email)
         .order_by(desc('total_spent'))
         .limit(10)

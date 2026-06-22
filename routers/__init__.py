@@ -28,6 +28,7 @@ from .finance import router as finance_router
 from .logistics import router as logistics_router
 from .recharge import router as recharge_router
 from .rewards import router as rewards_router
+from .partners import router as partners_router
 
 __all__ = [
     "auth_router", "products_router", "cart_router",
@@ -40,5 +41,5 @@ __all__ = [
     "riders_router", "rider_reviews_router", "locations_router",
     "showroom_router", "dealer_docs_router", "payment_settings_router",
     "finance_router", "logistics_router",
-    "rewards_router"
+    "rewards_router", "partners_router"
 ]

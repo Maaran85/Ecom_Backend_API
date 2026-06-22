@@ -29,10 +29,12 @@ class DealerAdminCreate(BaseModel):
     aadhaar_number: Optional[str] = None
     country_id: Optional[int] = None
     state_id: Optional[int] = None
+    partner_id: Optional[int] = None
     # Location details
     city: Optional[str] = None
     state: Optional[str] = None
     pincode: Optional[str] = None
+    lat_long: Optional[str] = None
     # Bank Details
     bank_name: Optional[str] = None
     account_number: Optional[str] = None
@@ -58,8 +60,10 @@ class DealerAdminUpdate(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     pincode: Optional[str] = None
+    lat_long: Optional[str] = None
     country_id: Optional[int] = None
     state_id: Optional[int] = None
+    partner_id: Optional[int] = None
     bank_name: Optional[str] = None
     account_number: Optional[str] = None
     ifsc_code: Optional[str] = None
@@ -146,8 +150,12 @@ async def get_pending_approvals(
 ):
     """Get pending dealer and product approvals (admin only)"""
     pending_dealers_result = await db.execute(
-        select(Dealer)
-        .options(selectinload(Dealer.user))
+        select(Dealer).where(Dealer.is_deleted == False)
+        .options(
+            selectinload(Dealer.user),
+            selectinload(Dealer.country),
+            selectinload(Dealer.state_rel)
+        )
         .where(Dealer.is_approved == False)
     )
     pending_dealers = pending_dealers_result.scalars().all()
@@ -156,17 +164,27 @@ async def get_pending_approvals(
     return {
         "pending_dealers": [
             {
-                "id": d.id, 
-                "business_name": d.business_name, 
-                "user_id": d.user_id, 
-                "owner_name": d.user.full_name if d.user else "N/A",
-                "email": d.user.email if d.user else "N/A",
-                "phone": d.user.phone if d.user else "N/A",
-                "business_address": d.business_address,
-                "created_at": d.created_at,
-                "gst_number": d.gst_number,
-                "pan_number": d.pan_number,
-                "status": d.access_status
+                "id": d.id, "business_name": d.business_name, "business_address": d.business_address,
+                "tax_id": d.gst_number, "user_id": d.user_id,
+                "user_email": d.user.email if d.user else None,
+                "full_name": d.user.full_name if d.user else None,
+                "is_approved": d.is_approved, "profile_status": d.profile_status,
+                "access_status": d.access_status, "created_at": d.created_at,
+                "business_phone": d.business_phone,
+                "city": d.city, "state": d.state, "pincode": d.pincode,
+                "country_id": d.country_id, "country_name": d.country.name if d.country else None,
+                "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
+                "partner_id": d.partner_id,
+                "pan_number": d.pan_number, "bank_name": d.bank_name,
+                "account_number": d.account_number, "ifsc_code": d.ifsc_code,
+                "reject_reason": d.reject_reason, "is_active": d.is_active,
+                "company_photo_url": d.company_photo_url, "gst_certificate_url": d.gst_certificate_url,
+                "incorporation_certificate_url": d.incorporation_certificate_url,
+                "pan_photo_url": d.pan_photo_url, "aadhaar_number": d.aadhaar_number,
+                "aadhaar_photo_url": d.aadhaar_photo_url,
+                "cin_number": d.cin_number,
+                "cin_certificate_url": d.cin_certificate_url,
+                "company_logo_url": d.company_logo_url
             }
             for d in pending_dealers
         ],
@@ -189,7 +207,12 @@ async def list_all_users(
     """List all users with optional role, dealer and logistics partner filter (admin only)"""
     print(f"DEBUG: list_all_users called with role={role}, dealer_id={dealer_id}, logistics_partner_id={logistics_partner_id}")
     from sqlalchemy.orm import selectinload
-    query = select(User).options(selectinload(User.dealer), selectinload(User.logistics_partner)).offset(skip).limit(limit)
+    query = select(User).options(
+        selectinload(User.dealer), 
+        selectinload(User.logistics_partner),
+        selectinload(User.partner),
+        selectinload(User.supervisor)
+    ).offset(skip).limit(limit)
     if role and role != 'null':
         r = role.lower()
         if r == 'logistics':
@@ -205,6 +228,23 @@ async def list_all_users(
         elif r == 'admin':
             admin_roles = [UserRole.ADMIN, UserRole.SUPER_ADMIN]
             query = query.where(User.role.in_(admin_roles))
+        elif r == 'helpdesk':
+            helpdesk_roles = [
+                UserRole.PARTNER_HELPDESK_OPERATOR,
+                UserRole.PARTNER_HELPDESK_SUPERVISOR,
+                UserRole.PARTNER_HELPDESK_MANAGER
+            ]
+            query = query.where(User.role.in_(helpdesk_roles))
+        elif r == 'backoffice':
+            backoffice_roles = [
+                UserRole.PARTNER_BACKOFFICE,
+                UserRole.PARTNER_LOGISTICS_SPECIALIST,
+                UserRole.PARTNER_FINANCE_SPECIALIST,
+                UserRole.PARTNER_CATALOG_MANAGER,
+                UserRole.PARTNER_TECH_SUPPORT,
+                UserRole.PARTNER_SUPPORT_MANAGER
+            ]
+            query = query.where(User.role.in_(backoffice_roles))
         else:
             query = query.where(User.role == role)
     if dealer_id:
@@ -224,7 +264,11 @@ async def list_all_users(
             "aadhaar_number": u.aadhaar_number, "emergency_contact": u.emergency_contact,
             "photo_url": u.photo_url, "aadhaar_image": u.aadhaar_image, "shift_type": u.shift_type,
             "logistics_partner_id": u.logistics_partner_id,
-            "logistics_partner_name": u.logistics_partner.name if u.logistics_partner else None
+            "logistics_partner_name": u.logistics_partner.name if u.logistics_partner else None,
+            "partner_id": u.partner_id,
+            "partner_name": u.partner.partner_name if getattr(u, 'partner', None) else None,
+            "supervisor_id": u.supervisor_id,
+            "supervisor_name": u.supervisor.full_name if u.supervisor else None
         }
         for u in users
     ]
@@ -238,7 +282,7 @@ async def list_all_dealers(
 ):
     """List all dealers (admin only)"""
     from sqlalchemy.orm import selectinload
-    query = select(Dealer).options(
+    query = select(Dealer).where(Dealer.is_deleted == False).options(
         selectinload(Dealer.user),
         selectinload(Dealer.country),
         selectinload(Dealer.state_rel)
@@ -257,6 +301,7 @@ async def list_all_dealers(
             "city": d.city, "state": d.state, "pincode": d.pincode,
             "country_id": d.country_id, "country_name": d.country.name if d.country else None,
             "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
+            "partner_id": d.partner_id,
             "pan_number": d.pan_number, "bank_name": d.bank_name,
             "account_number": d.account_number, "ifsc_code": d.ifsc_code,
             "reject_reason": d.reject_reason, "is_active": d.is_active,
@@ -266,7 +311,8 @@ async def list_all_dealers(
             "aadhaar_photo_url": d.aadhaar_photo_url,
             "cin_number": d.cin_number,
             "cin_certificate_url": d.cin_certificate_url,
-            "company_logo_url": d.company_logo_url
+            "company_logo_url": d.company_logo_url,
+            "lat_long": d.lat_long
         }
         for d in dealers
     ]
@@ -286,6 +332,25 @@ async def list_all_partners(
         {
             "id": p.id, "name": p.name, "contact_person": p.contact_person,
             "is_active": p.is_active
+        }
+        for p in partners
+    ]
+
+@router.get("/platform-partners")
+async def list_platform_partners(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """List platform partners for dealer assignment (admin)"""
+    from models.partner import Partner
+    result = await db.execute(select(Partner))
+    partners = result.scalars().all()
+    return [
+        {
+            "id": p.id,
+            "partner_name": p.partner_name,
+            "city": p.city,
+            "state": p.state
         }
         for p in partners
     ]
@@ -374,7 +439,7 @@ async def list_dealer_logistics(
 ):
     """List logistics partners mapped to a specific dealer"""
     from sqlalchemy.orm import selectinload
-    res = await db.execute(select(Dealer).options(selectinload(Dealer.logistics_partners)).where(Dealer.id == dealer_id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).options(selectinload(Dealer.logistics_partners)).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer not found")
@@ -397,7 +462,7 @@ async def map_logistics_to_dealer(
     """Map a logistics partner to a dealer"""
     from sqlalchemy.orm import selectinload
     # check dealer
-    res_d = await db.execute(select(Dealer).options(selectinload(Dealer.logistics_partners)).where(Dealer.id == dealer_id))
+    res_d = await db.execute(select(Dealer).where(Dealer.is_deleted == False).options(selectinload(Dealer.logistics_partners)).where(Dealer.id == dealer_id))
     dealer = res_d.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer not found")
@@ -423,7 +488,7 @@ async def unmap_logistics_from_dealer(
 ):
     """Remove mapping between a logistics partner and a dealer"""
     from sqlalchemy.orm import selectinload
-    res_d = await db.execute(select(Dealer).options(selectinload(Dealer.logistics_partners)).where(Dealer.id == dealer_id))
+    res_d = await db.execute(select(Dealer).where(Dealer.is_deleted == False).options(selectinload(Dealer.logistics_partners)).where(Dealer.id == dealer_id))
     dealer = res_d.scalar_one_or_none()
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer not found")
@@ -445,13 +510,32 @@ async def toggle_dealer_active(
     db: AsyncSession = Depends(get_db)
 ):
     """Toggle dealer active status (admin only)"""
-    res = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer: raise HTTPException(status_code=404, detail="Dealer not found")
     dealer.is_active = not dealer.is_active
     await db.commit()
     await db.refresh(dealer)
     return {"message": f"Dealer is now {'active' if dealer.is_active else 'inactive'}", "is_active": dealer.is_active}
+@router.get("/helpdesk-supervisors")
+async def list_helpdesk_supervisors(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get list of helpdesk supervisors"""
+    res = await db.execute(select(User).where(User.role == UserRole.PARTNER_HELPDESK_SUPERVISOR, User.is_active == True))
+    users = res.scalars().all()
+    return [{"id": u.id, "full_name": u.full_name or u.email} for u in users]
+
+@router.get("/helpdesk-managers")
+async def list_helpdesk_managers(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get list of helpdesk managers"""
+    res = await db.execute(select(User).where(User.role == UserRole.PARTNER_HELPDESK_MANAGER, User.is_active == True))
+    users = res.scalars().all()
+    return [{"id": u.id, "full_name": u.full_name or u.email} for u in users]
 
 @router.post("/users", status_code=status.HTTP_201_CREATED)
 async def create_user(
@@ -460,7 +544,7 @@ async def create_user(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new user (Admin only)"""
-    res = await db.execute(select(User).where(User.email == user_in.email))
+    res = await db.execute(select(User).where(User.email == user_in.email, User.is_active == True))
     if res.scalar_one_or_none(): raise HTTPException(status_code=400, detail="Email already registered")
     user_data = user_in.model_dump()
     password = user_data.pop("password")
@@ -485,6 +569,15 @@ async def update_user(
     if "password" in update_data and update_data["password"]:
         update_data["password_hash"] = get_password_hash(update_data["password"])
         del update_data["password"]
+        
+    # Prevent unique constraint violations for empty strings
+    if "employee_id" in update_data and update_data["employee_id"] == "":
+        update_data["employee_id"] = None
+    if "phone" in update_data and update_data["phone"] == "":
+        update_data["phone"] = None
+    if "email" in update_data and update_data["email"] == "":
+        update_data["email"] = None
+        
     for field, value in update_data.items(): setattr(user, field, value)
     await db.commit()
     await db.refresh(user)
@@ -533,7 +626,7 @@ async def approve_dealer(
 ):
     """Approve dealer (admin only)"""
     res = await db.execute(
-        select(Dealer)
+        select(Dealer).where(Dealer.is_deleted == False)
         .options(selectinload(Dealer.user))
         .where(Dealer.id == dealer_id)
     )
@@ -546,6 +639,30 @@ async def approve_dealer(
     
     dealer.is_approved = True
     dealer.access_status = 'active'
+    dealer.profile_status = 'completed'
+
+    # Auto-create Default Hub if none exists
+    from models.hub import DeliveryHub
+    hub_res = await db.execute(select(DeliveryHub).where(DeliveryHub.dealer_id == dealer.id))
+    existing_hub = hub_res.scalars().first()
+    if not existing_hub:
+        default_hub = DeliveryHub(
+            dealer_id=dealer.id,
+            name="Primary Warehouse",
+            address=dealer.business_address or "Head Office",
+            city=dealer.city,
+            state=dealer.state,
+            state_id=dealer.state_id,
+            country_id=dealer.country_id,
+            pincode=dealer.pincode,
+            lat_long=dealer.lat_long,
+            phone=dealer.business_phone,
+            is_active=True,
+            is_showroom=False,
+            hub_type="Warehouse"
+        )
+        db.add(default_hub)
+
     await db.commit()
     
     # Send email notification
@@ -570,7 +687,7 @@ async def reject_dealer(
 ):
     """Reject dealer (admin only)"""
     res = await db.execute(
-        select(Dealer)
+        select(Dealer).where(Dealer.is_deleted == False)
         .options(selectinload(Dealer.user))
         .where(Dealer.id == dealer_id)
     )
@@ -581,9 +698,19 @@ async def reject_dealer(
     dealer_email = dealer.user.email if (dealer.user and dealer.user.email) else None
     business_name = dealer.business_name
     
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_reason = f"[{timestamp}] {payload.reason}"
+    
     dealer.is_approved = False
     dealer.access_status = 'reject'
-    dealer.reject_reason = payload.reason
+    dealer.profile_status = 'draft'
+    
+    if dealer.reject_reason:
+        dealer.reject_reason = f"{dealer.reject_reason}\n{new_reason}"
+    else:
+        dealer.reject_reason = new_reason
+        
     await db.commit()
     
     # Send email notification
@@ -681,7 +808,7 @@ async def create_dealer(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new dealer (Admin only)"""
-    res = await db.execute(select(User).where(User.email == dealer_in.email))
+    res = await db.execute(select(User).where(User.email == dealer_in.email, User.is_active == True))
     if res.scalar_one_or_none(): raise HTTPException(status_code=400, detail="User email already exists")
     
     if dealer_in.business_phone:
@@ -708,9 +835,11 @@ async def create_dealer(
             aadhaar_number=dealer_in.aadhaar_number,
             country_id=dealer_in.country_id,
             state_id=dealer_in.state_id,
+            partner_id=dealer_in.partner_id,
             city=dealer_in.city,
             state=dealer_in.state,
             pincode=dealer_in.pincode,
+            lat_long=dealer_in.lat_long,
             bank_name=dealer_in.bank_name,
             account_number=dealer_in.account_number,
             ifsc_code=dealer_in.ifsc_code,
@@ -729,6 +858,25 @@ async def create_dealer(
         await db.flush()
         dealer_id = db_dealer.id
         db_user.dealer_id = dealer_id
+
+        # Auto-create Default Hub for the new dealer
+        from models.hub import DeliveryHub
+        default_hub = DeliveryHub(
+            dealer_id=dealer_id,
+            name="Primary Warehouse",
+            address=dealer_in.business_address or "Head Office",
+            city=dealer_in.city,
+            state=dealer_in.state,
+            state_id=dealer_in.state_id,
+            country_id=dealer_in.country_id,
+            pincode=dealer_in.pincode,
+            phone=dealer_in.business_phone,
+            is_active=True,
+            is_showroom=False,
+            hub_type="Warehouse"
+        )
+        db.add(default_hub)
+
         await db.commit()
         return {"message": "Dealer created successfully", "id": dealer_id}
     except Exception as e:
@@ -742,7 +890,7 @@ async def update_dealer_profile(
     db: AsyncSession = Depends(get_db)
 ):
     """Update dealer profile (Admin only)"""
-    res = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer: raise HTTPException(status_code=404, detail="Dealer profile not found")
     update_data = dealer_in.model_dump(exclude_unset=True)
@@ -767,32 +915,34 @@ async def delete_dealer(
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a dealer if no products are created (Admin only)"""
-    res = await db.execute(select(Dealer).where(Dealer.id == dealer_id))
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer: raise HTTPException(status_code=404, detail="Dealer not found")
     
     # Check if dealer has created any products
     product_count = await db.execute(select(func.count(Product.id)).where(Product.dealer_id == dealer_id))
     if product_count.scalar() > 0:
-        raise HTTPException(status_code=400, detail="Cannot delete dealer. Dealer has created products.")
+        dealer.is_deleted = True
+        from sqlalchemy import update
+        await db.execute(update(User).where(User.dealer_id == dealer_id).values(is_active=False))
+        await db.commit()
+        return {"message": "Dealer soft-deleted successfully because they have products. All related users have been deactivated."}
         
-    # Break the circular foreign key dependency
-    user_id = dealer.user_id
-    user = None
-    if user_id:
-        user_res = await db.execute(select(User).where(User.id == user_id))
-        user = user_res.scalar_one_or_none()
-        if user:
-            user.dealer_id = None
-            await db.flush()
+    # Break the circular foreign key dependency for all associated users
+    users_res = await db.execute(select(User).where(User.dealer_id == dealer_id))
+    associated_users = users_res.scalars().all()
+    
+    for u in associated_users:
+        u.dealer_id = None
+    await db.flush()
             
     # Delete the dealer now that no user references it via dealer_id
     await db.delete(dealer)
     await db.flush()
     
-    # Delete the user itself
-    if user:
-        await db.delete(user)
+    # Delete all associated users
+    for u in associated_users:
+        await db.delete(u)
         
     await db.commit()
             

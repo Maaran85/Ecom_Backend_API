@@ -95,7 +95,7 @@ async def add_to_cart(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.variants)
+                selectinload(ProductModel.children)
             )
         )
 
@@ -112,7 +112,7 @@ async def add_to_cart(
                 joinedload(CartItemModel.product).options(
                     joinedload(ProductModel.dealer),
                     joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                    selectinload(ProductModel.variants)
+                    selectinload(ProductModel.children)
                 )
             )
 
@@ -135,7 +135,7 @@ async def get_cart(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.variants)
+                selectinload(ProductModel.children)
             )
         )
 
@@ -178,7 +178,7 @@ async def update_cart_item(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.variants)
+                selectinload(ProductModel.children)
             )
         )
 
@@ -226,13 +226,13 @@ async def create_order(
         .where(
             CartItemModel.customer_id == customer_id,
             DealerModel.access_status == 'active',
-            DealerModel.is_active == True,
+            DealerModel.is_active == True, DealerModel.is_deleted == False,
             ProductModel.is_approved == True
         )
         .options(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
-                selectinload(ProductModel.variants)
+                selectinload(ProductModel.children)
             )
         )
 
@@ -267,17 +267,17 @@ async def create_order(
 
         # Check stock - if variant is selected, check variant stock
         if cart_item.variant_id:
-            variant = next((v for v in (product.variants or []) if v.id == cart_item.variant_id), None)
+            variant = next((v for v in (product.children or []) if v.id == cart_item.variant_id), None)
             if not variant:
                 # If variant not loaded, fetch it
-                res = await db.execute(select(ProductVariantModel).where(ProductVariantModel.id == cart_item.variant_id))
+                res = await db.execute(select(ProductModel).where(ProductModel.id == cart_item.variant_id))
                 variant = res.scalar_one_or_none()
             
             if not variant:
                  raise HTTPException(status_code=404, detail=f"Variant {cart_item.variant_id} not found")
             
             if variant.stock < cart_item.quantity:
-                raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name} (Size: {variant.size})")
+                raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name} (Size: {variant.sizes[0] if variant.sizes else 'Unknown'})")
         else:
             # Check main stock for simple product
             if product.stock < cart_item.quantity:
@@ -361,20 +361,18 @@ async def create_order(
         v_id = update_data["variant_id"]
         qty = update_data["quantity"]
         
-        # Deduct from main product
-        await db.execute(
-            update(ProductModel)
-            .where(ProductModel.id == p_id)
-            .values(stock=ProductModel.stock - qty)
-            .execution_options(synchronize_session=False)
-        )
+        target_id = v_id if v_id else p_id
         
-        # If variant, deduct from variant too
-        if v_id:
+        # Deduct from ProductInventory
+        from models.inventory import ProductInventory
+        # Naive deduction from the hub with the most stock
+        inv_result = await db.execute(select(ProductInventory).where(ProductInventory.product_id == target_id).order_by(ProductInventory.stock.desc()))
+        inv = inv_result.scalars().first()
+        if inv:
             await db.execute(
-                update(ProductVariantModel)
-                .where(ProductVariantModel.id == v_id)
-                .values(stock=ProductVariantModel.stock - qty)
+                update(ProductInventory)
+                .where(ProductInventory.id == inv.id)
+                .values(stock=ProductInventory.stock - qty)
                 .execution_options(synchronize_session=False)
             )
     
@@ -551,7 +549,7 @@ async def create_order(
             selectinload(OrderModel.items).joinedload(OrderItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.variants)
+                selectinload(ProductModel.children)
             ),
 
             selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
@@ -571,7 +569,7 @@ async def get_orders(
         select(OrderModel)
         .where(OrderModel.customer_id == current_user.id)
         .options(
-            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.variants),
+            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.children),
             selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.dealer),
             selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
             selectinload(OrderModel.items).selectinload(OrderItemModel.hub),

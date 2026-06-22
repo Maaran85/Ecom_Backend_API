@@ -26,3 +26,19 @@ class Country(CountryBase):
 
 class CountryWithStates(Country):
     states: List[State] = []
+
+class PincodeResponse(BaseModel):
+    pincode: str
+    city: Optional[str] = None
+    state: Optional[str] = None
+    latitude: Optional[str] = None
+    longitude: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class ServiceabilityCheckResponse(BaseModel):
+    is_serviceable: bool
+    delivery_type: Optional[str] = None # "local_hub" or "courier"
+    message: str
+    estimated_days: Optional[int] = None

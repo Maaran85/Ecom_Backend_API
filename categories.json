@@ -1,0 +1,1477 @@
+[
+  {
+    "id": 1,
+    "name": "Men",
+    "parent_id": null
+  },
+  {
+    "id": 2,
+    "name": "Women",
+    "parent_id": null
+  },
+  {
+    "id": 3,
+    "name": "Kids",
+    "parent_id": null
+  },
+  {
+    "id": 4,
+    "name": "Electronics",
+    "parent_id": null
+  },
+  {
+    "id": 5,
+    "name": "Home & Living",
+    "parent_id": null
+  },
+  {
+    "id": 6,
+    "name": "Topwear",
+    "parent_id": 1
+  },
+  {
+    "id": 7,
+    "name": "T-Shirts",
+    "parent_id": 6
+  },
+  {
+    "id": 8,
+    "name": "Casual Shirts",
+    "parent_id": 6
+  },
+  {
+    "id": 9,
+    "name": "Formal Shirts",
+    "parent_id": 6
+  },
+  {
+    "id": 10,
+    "name": "Sweatshirts",
+    "parent_id": 6
+  },
+  {
+    "id": 11,
+    "name": "Sweaters",
+    "parent_id": 6
+  },
+  {
+    "id": 12,
+    "name": "Jackets",
+    "parent_id": 6
+  },
+  {
+    "id": 13,
+    "name": "Blazers & Coats",
+    "parent_id": 6
+  },
+  {
+    "id": 14,
+    "name": "Suits",
+    "parent_id": 6
+  },
+  {
+    "id": 15,
+    "name": "Rain Jackets",
+    "parent_id": 6
+  },
+  {
+    "id": 16,
+    "name": "Indian & Festive Wear",
+    "parent_id": 1
+  },
+  {
+    "id": 17,
+    "name": "Kurtas & Kurta Sets",
+    "parent_id": 16
+  },
+  {
+    "id": 18,
+    "name": "Sherwanis",
+    "parent_id": 16
+  },
+  {
+    "id": 19,
+    "name": "Nehru Jackets",
+    "parent_id": 16
+  },
+  {
+    "id": 20,
+    "name": "Dhotis",
+    "parent_id": 16
+  },
+  {
+    "id": 21,
+    "name": "Bottomwear",
+    "parent_id": 1
+  },
+  {
+    "id": 22,
+    "name": "Jeans",
+    "parent_id": 21
+  },
+  {
+    "id": 23,
+    "name": "Casual Trousers",
+    "parent_id": 21
+  },
+  {
+    "id": 24,
+    "name": "Formal Trousers",
+    "parent_id": 21
+  },
+  {
+    "id": 25,
+    "name": "Shorts",
+    "parent_id": 21
+  },
+  {
+    "id": 26,
+    "name": "Track Pants & Joggers",
+    "parent_id": 21
+  },
+  {
+    "id": 27,
+    "name": "Innerwear & Sleepwear",
+    "parent_id": 1
+  },
+  {
+    "id": 28,
+    "name": "Briefs & Trunks",
+    "parent_id": 27
+  },
+  {
+    "id": 29,
+    "name": "Boxers",
+    "parent_id": 27
+  },
+  {
+    "id": 30,
+    "name": "Vests",
+    "parent_id": 27
+  },
+  {
+    "id": 31,
+    "name": "Sleepwear & Loungewear",
+    "parent_id": 27
+  },
+  {
+    "id": 32,
+    "name": "Thermals",
+    "parent_id": 27
+  },
+  {
+    "id": 33,
+    "name": "Plus Size",
+    "parent_id": 1
+  },
+  {
+    "id": 34,
+    "name": "T-Shirts",
+    "parent_id": 33
+  },
+  {
+    "id": 35,
+    "name": "Shirts",
+    "parent_id": 33
+  },
+  {
+    "id": 36,
+    "name": "Jeans",
+    "parent_id": 33
+  },
+  {
+    "id": 37,
+    "name": "Trousers",
+    "parent_id": 33
+  },
+  {
+    "id": 38,
+    "name": "Jackets",
+    "parent_id": 33
+  },
+  {
+    "id": 39,
+    "name": "Sweatshirts",
+    "parent_id": 33
+  },
+  {
+    "id": 40,
+    "name": "Footwear",
+    "parent_id": 1
+  },
+  {
+    "id": 41,
+    "name": "Casual Shoes",
+    "parent_id": 40
+  },
+  {
+    "id": 42,
+    "name": "Sports Shoes",
+    "parent_id": 40
+  },
+  {
+    "id": 43,
+    "name": "Formal Shoes",
+    "parent_id": 40
+  },
+  {
+    "id": 44,
+    "name": "Sneakers",
+    "parent_id": 40
+  },
+  {
+    "id": 45,
+    "name": "Sandals & Floaters",
+    "parent_id": 40
+  },
+  {
+    "id": 46,
+    "name": "Flip Flops",
+    "parent_id": 40
+  },
+  {
+    "id": 47,
+    "name": "Socks",
+    "parent_id": 40
+  },
+  {
+    "id": 48,
+    "name": "Personal Care & Grooming",
+    "parent_id": 1
+  },
+  {
+    "id": 49,
+    "name": "Fragrances",
+    "parent_id": 48
+  },
+  {
+    "id": 50,
+    "name": "Men's Grooming",
+    "parent_id": 48
+  },
+  {
+    "id": 51,
+    "name": "Sunglasses & Frames",
+    "parent_id": 48
+  },
+  {
+    "id": 52,
+    "name": "Watches",
+    "parent_id": 48
+  },
+  {
+    "id": 53,
+    "name": "Headphones",
+    "parent_id": 48
+  },
+  {
+    "id": 54,
+    "name": "Fashion Accessories",
+    "parent_id": 1
+  },
+  {
+    "id": 55,
+    "name": "Wallets",
+    "parent_id": 54
+  },
+  {
+    "id": 56,
+    "name": "Belts",
+    "parent_id": 54
+  },
+  {
+    "id": 57,
+    "name": "Perfumes",
+    "parent_id": 54
+  },
+  {
+    "id": 58,
+    "name": "Trimmers",
+    "parent_id": 54
+  },
+  {
+    "id": 59,
+    "name": "Deodorants",
+    "parent_id": 54
+  },
+  {
+    "id": 60,
+    "name": "Ties, Cufflinks & Pocket Squares",
+    "parent_id": 54
+  },
+  {
+    "id": 61,
+    "name": "Caps & Hats",
+    "parent_id": 54
+  },
+  {
+    "id": 62,
+    "name": "Mufflers, Scarves & Gloves",
+    "parent_id": 54
+  },
+  {
+    "id": 63,
+    "name": "Phone Cases",
+    "parent_id": 54
+  },
+  {
+    "id": 64,
+    "name": "Rings & Wristwear",
+    "parent_id": 54
+  },
+  {
+    "id": 65,
+    "name": "Helmets",
+    "parent_id": 54
+  },
+  {
+    "id": 66,
+    "name": "Indian & Fusion Wear",
+    "parent_id": 2
+  },
+  {
+    "id": 67,
+    "name": "Kurtas & Suits",
+    "parent_id": 66
+  },
+  {
+    "id": 68,
+    "name": "Kurtis, Tunics & Tops",
+    "parent_id": 66
+  },
+  {
+    "id": 69,
+    "name": "Sarees",
+    "parent_id": 66
+  },
+  {
+    "id": 70,
+    "name": "Ethnic Wear",
+    "parent_id": 66
+  },
+  {
+    "id": 71,
+    "name": "Leggings, Salwars & Churidars",
+    "parent_id": 66
+  },
+  {
+    "id": 72,
+    "name": "Skirts & Palazzos",
+    "parent_id": 66
+  },
+  {
+    "id": 73,
+    "name": "Dress Materials",
+    "parent_id": 66
+  },
+  {
+    "id": 74,
+    "name": "Lehenga Cholis",
+    "parent_id": 66
+  },
+  {
+    "id": 75,
+    "name": "Dupattas & Shawls",
+    "parent_id": 66
+  },
+  {
+    "id": 76,
+    "name": "Jackets",
+    "parent_id": 66
+  },
+  {
+    "id": 77,
+    "name": "Belts, Scarves & More",
+    "parent_id": 2
+  },
+  {
+    "id": 78,
+    "name": "Watches & Wearables",
+    "parent_id": 2
+  },
+  {
+    "id": 79,
+    "name": "Western Wear",
+    "parent_id": 2
+  },
+  {
+    "id": 80,
+    "name": "Dresses",
+    "parent_id": 79
+  },
+  {
+    "id": 81,
+    "name": "Tops",
+    "parent_id": 79
+  },
+  {
+    "id": 82,
+    "name": "Tshirts",
+    "parent_id": 79
+  },
+  {
+    "id": 83,
+    "name": "Jeans",
+    "parent_id": 79
+  },
+  {
+    "id": 84,
+    "name": "Trousers & Capris",
+    "parent_id": 79
+  },
+  {
+    "id": 85,
+    "name": "Shorts & Skirts",
+    "parent_id": 79
+  },
+  {
+    "id": 86,
+    "name": "Co-ords",
+    "parent_id": 79
+  },
+  {
+    "id": 87,
+    "name": "Playsuits",
+    "parent_id": 79
+  },
+  {
+    "id": 88,
+    "name": "Jumpsuits",
+    "parent_id": 79
+  },
+  {
+    "id": 89,
+    "name": "Shrugs",
+    "parent_id": 79
+  },
+  {
+    "id": 90,
+    "name": "Sweaters & Sweatshirts",
+    "parent_id": 79
+  },
+  {
+    "id": 91,
+    "name": "Jackets & Coats",
+    "parent_id": 79
+  },
+  {
+    "id": 92,
+    "name": "Blazers & Waistcoats",
+    "parent_id": 79
+  },
+  {
+    "id": 93,
+    "name": "Plus Size",
+    "parent_id": 2
+  },
+  {
+    "id": 94,
+    "name": "Maternity",
+    "parent_id": 2
+  },
+  {
+    "id": 95,
+    "name": "Sunglasses & Frames",
+    "parent_id": 2
+  },
+  {
+    "id": 96,
+    "name": "Footwear",
+    "parent_id": 2
+  },
+  {
+    "id": 97,
+    "name": "Flats",
+    "parent_id": 96
+  },
+  {
+    "id": 98,
+    "name": "Casual Shoes",
+    "parent_id": 96
+  },
+  {
+    "id": 99,
+    "name": "Heels",
+    "parent_id": 96
+  },
+  {
+    "id": 100,
+    "name": "Boots",
+    "parent_id": 96
+  },
+  {
+    "id": 101,
+    "name": "Sports Shoes & Floaters",
+    "parent_id": 96
+  },
+  {
+    "id": 102,
+    "name": "Sports & Active Wear",
+    "parent_id": 2
+  },
+  {
+    "id": 103,
+    "name": "Clothing",
+    "parent_id": 102
+  },
+  {
+    "id": 104,
+    "name": "Footwear",
+    "parent_id": 102
+  },
+  {
+    "id": 105,
+    "name": "Sports Accessories",
+    "parent_id": 102
+  },
+  {
+    "id": 106,
+    "name": "Sports Equipment",
+    "parent_id": 102
+  },
+  {
+    "id": 107,
+    "name": "Lingerie & Sleepwear",
+    "parent_id": 2
+  },
+  {
+    "id": 108,
+    "name": "Bra",
+    "parent_id": 107
+  },
+  {
+    "id": 109,
+    "name": "Briefs",
+    "parent_id": 107
+  },
+  {
+    "id": 110,
+    "name": "Shapewear",
+    "parent_id": 107
+  },
+  {
+    "id": 111,
+    "name": "Sleepwear & Loungewear",
+    "parent_id": 107
+  },
+  {
+    "id": 112,
+    "name": "Swimwear",
+    "parent_id": 107
+  },
+  {
+    "id": 113,
+    "name": "Camisoles & Thermals",
+    "parent_id": 107
+  },
+  {
+    "id": 114,
+    "name": "Beauty & Personal Care",
+    "parent_id": 2
+  },
+  {
+    "id": 115,
+    "name": "Makeup",
+    "parent_id": 114
+  },
+  {
+    "id": 116,
+    "name": "Skincare",
+    "parent_id": 114
+  },
+  {
+    "id": 117,
+    "name": "Premium Beauty",
+    "parent_id": 114
+  },
+  {
+    "id": 118,
+    "name": "Lipsticks",
+    "parent_id": 114
+  },
+  {
+    "id": 119,
+    "name": "Fragrances",
+    "parent_id": 114
+  },
+  {
+    "id": 120,
+    "name": "Gadgets",
+    "parent_id": 2
+  },
+  {
+    "id": 121,
+    "name": "Smart Wearables",
+    "parent_id": 120
+  },
+  {
+    "id": 122,
+    "name": "Fitness Gadgets",
+    "parent_id": 120
+  },
+  {
+    "id": 123,
+    "name": "Headphones",
+    "parent_id": 120
+  },
+  {
+    "id": 124,
+    "name": "Speakers",
+    "parent_id": 120
+  },
+  {
+    "id": 125,
+    "name": "Jewellery",
+    "parent_id": 2
+  },
+  {
+    "id": 126,
+    "name": "Fashion Jewellery",
+    "parent_id": 125
+  },
+  {
+    "id": 127,
+    "name": "Fine Jewellery",
+    "parent_id": 125
+  },
+  {
+    "id": 128,
+    "name": "Earrings",
+    "parent_id": 125
+  },
+  {
+    "id": 129,
+    "name": "Backpacks",
+    "parent_id": 2
+  },
+  {
+    "id": 130,
+    "name": "Handbags, Bags & Wallets",
+    "parent_id": 2
+  },
+  {
+    "id": 131,
+    "name": "Luggages & Trolleys",
+    "parent_id": 2
+  },
+  {
+    "id": 132,
+    "name": "Boys Clothing",
+    "parent_id": 3
+  },
+  {
+    "id": 133,
+    "name": "T-Shirts",
+    "parent_id": 132
+  },
+  {
+    "id": 134,
+    "name": "Shirts",
+    "parent_id": 132
+  },
+  {
+    "id": 135,
+    "name": "Shorts",
+    "parent_id": 132
+  },
+  {
+    "id": 136,
+    "name": "Jeans",
+    "parent_id": 132
+  },
+  {
+    "id": 137,
+    "name": "Trousers",
+    "parent_id": 132
+  },
+  {
+    "id": 138,
+    "name": "Clothing Sets",
+    "parent_id": 132
+  },
+  {
+    "id": 139,
+    "name": "Ethnic Wear",
+    "parent_id": 132
+  },
+  {
+    "id": 140,
+    "name": "Track Pants & Pyjamas",
+    "parent_id": 132
+  },
+  {
+    "id": 141,
+    "name": "Jacket, Sweater & Sweatshirts",
+    "parent_id": 132
+  },
+  {
+    "id": 142,
+    "name": "Party Wear",
+    "parent_id": 132
+  },
+  {
+    "id": 143,
+    "name": "Innerwear & Thermals",
+    "parent_id": 132
+  },
+  {
+    "id": 144,
+    "name": "Nightwear & Loungewear",
+    "parent_id": 132
+  },
+  {
+    "id": 145,
+    "name": "Value Packs",
+    "parent_id": 132
+  },
+  {
+    "id": 146,
+    "name": "Girls Clothing",
+    "parent_id": 3
+  },
+  {
+    "id": 147,
+    "name": "Dresses",
+    "parent_id": 146
+  },
+  {
+    "id": 148,
+    "name": "Tops",
+    "parent_id": 146
+  },
+  {
+    "id": 149,
+    "name": "Tshirts",
+    "parent_id": 146
+  },
+  {
+    "id": 150,
+    "name": "Clothing Sets",
+    "parent_id": 146
+  },
+  {
+    "id": 151,
+    "name": "Lehenga choli",
+    "parent_id": 146
+  },
+  {
+    "id": 152,
+    "name": "Kurta Sets",
+    "parent_id": 146
+  },
+  {
+    "id": 153,
+    "name": "Party wear",
+    "parent_id": 146
+  },
+  {
+    "id": 154,
+    "name": "Dungarees & Jumpsuits",
+    "parent_id": 146
+  },
+  {
+    "id": 155,
+    "name": "Skirts & shorts",
+    "parent_id": 146
+  },
+  {
+    "id": 156,
+    "name": "Tights & Leggings",
+    "parent_id": 146
+  },
+  {
+    "id": 157,
+    "name": "Jeans, Trousers & Capris",
+    "parent_id": 146
+  },
+  {
+    "id": 158,
+    "name": "Jacket, Sweater & Sweatshirts",
+    "parent_id": 146
+  },
+  {
+    "id": 159,
+    "name": "Innerwear & Thermals",
+    "parent_id": 146
+  },
+  {
+    "id": 160,
+    "name": "Nightwear & Loungewear",
+    "parent_id": 146
+  },
+  {
+    "id": 161,
+    "name": "Footwear",
+    "parent_id": 3
+  },
+  {
+    "id": 162,
+    "name": "Casual Shoes",
+    "parent_id": 161
+  },
+  {
+    "id": 163,
+    "name": "Flipflops",
+    "parent_id": 161
+  },
+  {
+    "id": 164,
+    "name": "Sports Shoes",
+    "parent_id": 161
+  },
+  {
+    "id": 165,
+    "name": "Flats",
+    "parent_id": 161
+  },
+  {
+    "id": 166,
+    "name": "Sandals",
+    "parent_id": 161
+  },
+  {
+    "id": 167,
+    "name": "Heels",
+    "parent_id": 161
+  },
+  {
+    "id": 168,
+    "name": "School Shoes",
+    "parent_id": 161
+  },
+  {
+    "id": 169,
+    "name": "Socks",
+    "parent_id": 161
+  },
+  {
+    "id": 170,
+    "name": "Toys & Games",
+    "parent_id": 3
+  },
+  {
+    "id": 171,
+    "name": "Learning & Development",
+    "parent_id": 170
+  },
+  {
+    "id": 172,
+    "name": "Activity Toys",
+    "parent_id": 170
+  },
+  {
+    "id": 173,
+    "name": "Soft Toys",
+    "parent_id": 170
+  },
+  {
+    "id": 174,
+    "name": "Action Figure / Play set",
+    "parent_id": 170
+  },
+  {
+    "id": 175,
+    "name": "Infants",
+    "parent_id": 3
+  },
+  {
+    "id": 176,
+    "name": "Bodysuits",
+    "parent_id": 175
+  },
+  {
+    "id": 177,
+    "name": "Rompers & Sleepsuits",
+    "parent_id": 175
+  },
+  {
+    "id": 178,
+    "name": "Clothing Sets",
+    "parent_id": 175
+  },
+  {
+    "id": 179,
+    "name": "Tshirts & Tops",
+    "parent_id": 175
+  },
+  {
+    "id": 180,
+    "name": "Dresses",
+    "parent_id": 175
+  },
+  {
+    "id": 181,
+    "name": "Bottom wear",
+    "parent_id": 175
+  },
+  {
+    "id": 182,
+    "name": "Winter Wear",
+    "parent_id": 175
+  },
+  {
+    "id": 183,
+    "name": "Innerwear & Sleepwear",
+    "parent_id": 175
+  },
+  {
+    "id": 184,
+    "name": "Infant Care",
+    "parent_id": 175
+  },
+  {
+    "id": 185,
+    "name": "Home & Bath",
+    "parent_id": 3
+  },
+  {
+    "id": 186,
+    "name": "Personal Care",
+    "parent_id": 3
+  },
+  {
+    "id": 187,
+    "name": "Kids Accessories",
+    "parent_id": 3
+  },
+  {
+    "id": 188,
+    "name": "Bags & Backpacks",
+    "parent_id": 187
+  },
+  {
+    "id": 189,
+    "name": "Watches",
+    "parent_id": 187
+  },
+  {
+    "id": 190,
+    "name": "Jewellery & Hair accessory",
+    "parent_id": 187
+  },
+  {
+    "id": 191,
+    "name": "Sunglasses",
+    "parent_id": 187
+  },
+  {
+    "id": 192,
+    "name": "Masks & Protective Gears",
+    "parent_id": 187
+  },
+  {
+    "id": 193,
+    "name": "Caps & Hats",
+    "parent_id": 187
+  },
+  {
+    "id": 194,
+    "name": "Brands",
+    "parent_id": 3
+  },
+  {
+    "id": 195,
+    "name": "H&M",
+    "parent_id": 194
+  },
+  {
+    "id": 196,
+    "name": "Max Kids",
+    "parent_id": 194
+  },
+  {
+    "id": 197,
+    "name": "Pantaloons",
+    "parent_id": 194
+  },
+  {
+    "id": 198,
+    "name": "United Colors Of Benetton",
+    "parent_id": 194
+  },
+  {
+    "id": 199,
+    "name": "Kids",
+    "parent_id": 194
+  },
+  {
+    "id": 200,
+    "name": "YK",
+    "parent_id": 194
+  },
+  {
+    "id": 201,
+    "name": "U.S. Polo Assn. Kids",
+    "parent_id": 194
+  },
+  {
+    "id": 202,
+    "name": "Mothercare",
+    "parent_id": 194
+  },
+  {
+    "id": 203,
+    "name": "HRX",
+    "parent_id": 194
+  },
+  {
+    "id": 204,
+    "name": "Mobiles",
+    "parent_id": null
+  },
+  {
+    "id": 205,
+    "name": "Smartphones",
+    "parent_id": 204
+  },
+  {
+    "id": 206,
+    "name": "Android",
+    "parent_id": 205
+  },
+  {
+    "id": 207,
+    "name": "iOS",
+    "parent_id": 205
+  },
+  {
+    "id": 208,
+    "name": "Feature Phones",
+    "parent_id": 204
+  },
+  {
+    "id": 209,
+    "name": "Mobile Accessories",
+    "parent_id": 204
+  },
+  {
+    "id": 210,
+    "name": "Cases & Covers",
+    "parent_id": 209
+  },
+  {
+    "id": 211,
+    "name": "Screen Guards",
+    "parent_id": 209
+  },
+  {
+    "id": 212,
+    "name": "Power Banks",
+    "parent_id": 209
+  },
+  {
+    "id": 213,
+    "name": "Cables & Chargers",
+    "parent_id": 209
+  },
+  {
+    "id": 214,
+    "name": "Laptops",
+    "parent_id": 4
+  },
+  {
+    "id": 215,
+    "name": "Gaming Laptops",
+    "parent_id": 214
+  },
+  {
+    "id": 216,
+    "name": "Thin & Light Laptops",
+    "parent_id": 214
+  },
+  {
+    "id": 217,
+    "name": "Business Laptops",
+    "parent_id": 214
+  },
+  {
+    "id": 218,
+    "name": "Smart Wearables",
+    "parent_id": 4
+  },
+  {
+    "id": 219,
+    "name": "Smart Watches",
+    "parent_id": 218
+  },
+  {
+    "id": 220,
+    "name": "Fitness Bands",
+    "parent_id": 218
+  },
+  {
+    "id": 221,
+    "name": "Audio",
+    "parent_id": 4
+  },
+  {
+    "id": 222,
+    "name": "Headphones",
+    "parent_id": 221
+  },
+  {
+    "id": 223,
+    "name": "Earbuds",
+    "parent_id": 221
+  },
+  {
+    "id": 224,
+    "name": "Bluetooth Speakers",
+    "parent_id": 221
+  },
+  {
+    "id": 225,
+    "name": "Cameras & Accessories",
+    "parent_id": 4
+  },
+  {
+    "id": 226,
+    "name": "DSLR",
+    "parent_id": 225
+  },
+  {
+    "id": 227,
+    "name": "Mirrorless",
+    "parent_id": 225
+  },
+  {
+    "id": 228,
+    "name": "Action Cameras",
+    "parent_id": 225
+  },
+  {
+    "id": 229,
+    "name": "Fashion",
+    "parent_id": null
+  },
+  {
+    "id": 230,
+    "name": "Men's Clothing",
+    "parent_id": 229
+  },
+  {
+    "id": 231,
+    "name": "T-Shirts",
+    "parent_id": 230
+  },
+  {
+    "id": 232,
+    "name": "Casual Shirts",
+    "parent_id": 230
+  },
+  {
+    "id": 233,
+    "name": "Jeans",
+    "parent_id": 230
+  },
+  {
+    "id": 234,
+    "name": "Trousers",
+    "parent_id": 230
+  },
+  {
+    "id": 235,
+    "name": "Activewear",
+    "parent_id": 230
+  },
+  {
+    "id": 236,
+    "name": "Women's Clothing",
+    "parent_id": 229
+  },
+  {
+    "id": 237,
+    "name": "Kurtas & Ethnic",
+    "parent_id": 236
+  },
+  {
+    "id": 238,
+    "name": "Dresses",
+    "parent_id": 236
+  },
+  {
+    "id": 239,
+    "name": "Tops",
+    "parent_id": 236
+  },
+  {
+    "id": 240,
+    "name": "Jeans & Jeggings",
+    "parent_id": 236
+  },
+  {
+    "id": 241,
+    "name": "Footwear",
+    "parent_id": 229
+  },
+  {
+    "id": 242,
+    "name": "Sports Shoes",
+    "parent_id": 241
+  },
+  {
+    "id": 243,
+    "name": "Casual Shoes",
+    "parent_id": 241
+  },
+  {
+    "id": 244,
+    "name": "Formal Shoes",
+    "parent_id": 241
+  },
+  {
+    "id": 245,
+    "name": "Sandals & Floaters",
+    "parent_id": 241
+  },
+  {
+    "id": 246,
+    "name": "Accessories",
+    "parent_id": 229
+  },
+  {
+    "id": 247,
+    "name": "Watches",
+    "parent_id": 246
+  },
+  {
+    "id": 248,
+    "name": "Sunglasses",
+    "parent_id": 246
+  },
+  {
+    "id": 249,
+    "name": "Belts",
+    "parent_id": 246
+  },
+  {
+    "id": 250,
+    "name": "Wallets",
+    "parent_id": 246
+  },
+  {
+    "id": 251,
+    "name": "Appliances",
+    "parent_id": null
+  },
+  {
+    "id": 252,
+    "name": "Televisions",
+    "parent_id": 251
+  },
+  {
+    "id": 253,
+    "name": "Smart TVs",
+    "parent_id": 252
+  },
+  {
+    "id": 254,
+    "name": "4K TVs",
+    "parent_id": 252
+  },
+  {
+    "id": 255,
+    "name": "OLED & QLED TVs",
+    "parent_id": 252
+  },
+  {
+    "id": 256,
+    "name": "Washing Machines",
+    "parent_id": 251
+  },
+  {
+    "id": 257,
+    "name": "Fully Automatic Front Load",
+    "parent_id": 256
+  },
+  {
+    "id": 258,
+    "name": "Fully Automatic Top Load",
+    "parent_id": 256
+  },
+  {
+    "id": 259,
+    "name": "Semi Automatic",
+    "parent_id": 256
+  },
+  {
+    "id": 260,
+    "name": "Refrigerators",
+    "parent_id": 251
+  },
+  {
+    "id": 261,
+    "name": "Single Door",
+    "parent_id": 260
+  },
+  {
+    "id": 262,
+    "name": "Double Door",
+    "parent_id": 260
+  },
+  {
+    "id": 263,
+    "name": "Side by Side",
+    "parent_id": 260
+  },
+  {
+    "id": 264,
+    "name": "Air Conditioners",
+    "parent_id": 251
+  },
+  {
+    "id": 265,
+    "name": "Split ACs",
+    "parent_id": 264
+  },
+  {
+    "id": 266,
+    "name": "Window ACs",
+    "parent_id": 264
+  },
+  {
+    "id": 267,
+    "name": "Home & Furniture",
+    "parent_id": null
+  },
+  {
+    "id": 268,
+    "name": "Kitchen & Dining",
+    "parent_id": 267
+  },
+  {
+    "id": 269,
+    "name": "Cookware",
+    "parent_id": 268
+  },
+  {
+    "id": 270,
+    "name": "Kitchen Appliances",
+    "parent_id": 268
+  },
+  {
+    "id": 271,
+    "name": "Tableware",
+    "parent_id": 268
+  },
+  {
+    "id": 272,
+    "name": "Home Decor",
+    "parent_id": 267
+  },
+  {
+    "id": 273,
+    "name": "Wall Art",
+    "parent_id": 272
+  },
+  {
+    "id": 274,
+    "name": "Clocks",
+    "parent_id": 272
+  },
+  {
+    "id": 275,
+    "name": "Showpieces",
+    "parent_id": 272
+  },
+  {
+    "id": 276,
+    "name": "Furniture",
+    "parent_id": 267
+  },
+  {
+    "id": 277,
+    "name": "Beds",
+    "parent_id": 276
+  },
+  {
+    "id": 278,
+    "name": "Sofas",
+    "parent_id": 276
+  },
+  {
+    "id": 279,
+    "name": "Dining Tables",
+    "parent_id": 276
+  },
+  {
+    "id": 280,
+    "name": "Office Chairs",
+    "parent_id": 276
+  },
+  {
+    "id": 281,
+    "name": "Beauty & Toys",
+    "parent_id": null
+  },
+  {
+    "id": 282,
+    "name": "Beauty & Personal Care",
+    "parent_id": 281
+  },
+  {
+    "id": 283,
+    "name": "Makeup",
+    "parent_id": 282
+  },
+  {
+    "id": 284,
+    "name": "Skin Care",
+    "parent_id": 282
+  },
+  {
+    "id": 285,
+    "name": "Hair Care",
+    "parent_id": 282
+  },
+  {
+    "id": 286,
+    "name": "Fragrances",
+    "parent_id": 282
+  },
+  {
+    "id": 287,
+    "name": "Toys & School Supplies",
+    "parent_id": 281
+  },
+  {
+    "id": 288,
+    "name": "Action Figures",
+    "parent_id": 287
+  },
+  {
+    "id": 289,
+    "name": "Board Games",
+    "parent_id": 287
+  },
+  {
+    "id": 290,
+    "name": "Soft Toys",
+    "parent_id": 287
+  },
+  {
+    "id": 291,
+    "name": "School Bags",
+    "parent_id": 287
+  },
+  {
+    "id": 292,
+    "name": "Sports & Fitness",
+    "parent_id": 281
+  },
+  {
+    "id": 293,
+    "name": "Cricket",
+    "parent_id": 292
+  },
+  {
+    "id": 294,
+    "name": "Football",
+    "parent_id": 292
+  },
+  {
+    "id": 295,
+    "name": "Fitness Equipment",
+    "parent_id": 292
+  }
+]

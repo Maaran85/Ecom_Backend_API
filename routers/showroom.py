@@ -9,10 +9,10 @@ import string
 
 from core.database import get_db
 from core.permissions import get_current_active_user
-from models import User, DeliveryHub, Product, LocationInventory, UserRole, Order, OrderItem, OrderStatus, StockMovement, MovementType, Category
+from models import User, DeliveryHub, Product, ProductInventory, UserRole, Order, OrderItem, OrderStatus, StockMovement, MovementType, Category
 from schemas.showroom import (
-    ShowroomCreate, ShowroomUpdate, LocationInventoryResponse, 
-    StockTransferRequest, ShowroomSaleRequest, ShowroomSaleHistory,
+    ShowroomCreate, ShowroomUpdate, ProductInventoryResponse, 
+    StockAddRequest, ShowroomSaleRequest, ShowroomSaleHistory,
     ShowroomSalesResponse
 )
 from schemas.dealer import Hub as HubSchema
@@ -185,21 +185,21 @@ async def get_showroom_details(
         raise HTTPException(status_code=404, detail="Showroom not found")
     return showroom
 
-@router.post("/{showroom_id}/transfer", status_code=status.HTTP_200_OK)
-async def transfer_stock(
+@router.post("/{showroom_id}/add-stock", status_code=status.HTTP_200_OK)
+async def add_stock(
     showroom_id: int,
-    transfer_data: StockTransferRequest,
+    add_data: StockAddRequest,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Transfer stock from dealer main pool or another hub to a showroom"""
+    """Directly add stock inventory to a showroom"""
     dealer = await get_current_dealer(current_user, db)
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer profile not found")
     
     # 1. Verify product exists and belongs to dealer
     product_result = await db.execute(
-        select(Product).where(and_(Product.id == transfer_data.product_id, Product.dealer_id == dealer.id))
+        select(Product).where(and_(Product.id == add_data.product_id, Product.dealer_id == dealer.id))
     )
     product = product_result.scalar_one_or_none()
     if not product:
@@ -213,54 +213,45 @@ async def transfer_stock(
     if not showroom:
         raise HTTPException(status_code=404, detail="Showroom not found")
     
-    # 3. Deduct from source (Main pool or Source Hub)
-    if transfer_data.from_hub_id is None:
-        if product.stock < transfer_data.quantity:
-            raise HTTPException(status_code=400, detail="Insufficient stock in main pool")
-        product.stock -= transfer_data.quantity
-        
-        # Log movement for main pool
-        movement = StockMovement(
-            product_id=product.id,
-            movement_type=MovementType.ADJUSTMENT,
-            quantity=-transfer_data.quantity,
-            stock_before=product.stock + transfer_data.quantity,
-            stock_after=product.stock,
-            user_id=current_user.id,
-            notes=f"Transfer to showroom {showroom.name}. {transfer_data.notes or ''}"
-        )
-        db.add(movement)
-    else:
-        # Transfer from another hub/showroom
-        source_inv_result = await db.execute(
-            select(LocationInventory).where(
-                and_(LocationInventory.product_id == product.id, LocationInventory.hub_id == transfer_data.from_hub_id)
-            )
-        )
-        source_inv = source_inv_result.scalar_one_or_none()
-        if not source_inv or source_inv.quantity < transfer_data.quantity:
-            raise HTTPException(status_code=400, detail="Insufficient stock in source hub")
-        source_inv.quantity -= transfer_data.quantity
-    
-    # 4. Add to target showroom
+    # 3. Add to target showroom inventory
     target_inv_result = await db.execute(
-        select(LocationInventory).where(
-            and_(LocationInventory.product_id == product.id, LocationInventory.hub_id == showroom_id)
+        select(ProductInventory).where(
+            and_(ProductInventory.product_id == product.id, ProductInventory.hub_id == showroom_id)
         )
     )
     target_inv = target_inv_result.scalar_one_or_none()
+    
+    stock_before = target_inv.stock if target_inv else 0
+    stock_after = stock_before + add_data.quantity
+
+    if stock_after < 0:
+        raise HTTPException(status_code=400, detail="Insufficient stock for adjustment")
+
     if target_inv:
-        target_inv.quantity += transfer_data.quantity
+        target_inv.stock = stock_after
     else:
-        target_inv = LocationInventory(
+        target_inv = ProductInventory(
             product_id=product.id,
             hub_id=showroom_id,
-            quantity=transfer_data.quantity
+            stock=stock_after
         )
         db.add(target_inv)
+
+    # 4. Log movement
+    movement = StockMovement(
+        product_id=product.id,
+        movement_type=MovementType.RESTOCK if add_data.quantity > 0 else MovementType.ADJUSTMENT,
+        quantity=add_data.quantity,
+        stock_before=stock_before,
+        stock_after=stock_after,
+        user_id=current_user.id,
+        hub_id=showroom_id,
+        notes=f"Direct inventory add by dealer. {add_data.notes or ''}"
+    )
+    db.add(movement)
     
     await db.commit()
-    return {"message": "Stock transferred successfully"}
+    return {"message": "Stock added successfully"}
 
 @router.post("/{showroom_id}/sales", status_code=status.HTTP_201_CREATED)
 async def record_showroom_sale(
@@ -297,16 +288,18 @@ async def record_showroom_sale(
         
         # Check showroom inventory
         inv_result = await db.execute(
-            select(LocationInventory).where(
-                and_(LocationInventory.product_id == item.product_id, LocationInventory.hub_id == showroom_id)
+            select(ProductInventory).where(
+                and_(ProductInventory.product_id == item.product_id, ProductInventory.hub_id == showroom_id)
             )
         )
         inv = inv_result.scalar_one_or_none()
-        if not inv or inv.quantity < item.quantity:
+        if not inv or inv.stock < item.quantity:
             raise HTTPException(status_code=400, detail=f"Insufficient inventory for product {product.name} at this showroom")
         
-        # Deduct inventory
-        inv.quantity -= item.quantity
+        # Deduct inventory from Hub
+        inv.stock -= item.quantity
+        if inv.stock <= 0:
+            await db.delete(inv)
         
         # Prepare order item
         total_amount += item.price * item.quantity
@@ -388,7 +381,7 @@ async def record_showroom_sale(
         "order_number": new_order.order_number
     }
 
-@router.get("/{showroom_id}/inventory", response_model=List[LocationInventoryResponse])
+@router.get("/{showroom_id}/inventory", response_model=List[ProductInventoryResponse])
 async def get_showroom_inventory(
     showroom_id: int,
     current_user: User = Depends(get_current_active_user),
@@ -409,12 +402,12 @@ async def get_showroom_inventory(
     parent_cat = aliased(Category)
     query = (
         select(
-            LocationInventory.id,
-            LocationInventory.product_id,
-            LocationInventory.hub_id,
-            LocationInventory.quantity,
-            LocationInventory.created_at,
-            LocationInventory.updated_at,
+            ProductInventory.id,
+            ProductInventory.product_id,
+            ProductInventory.hub_id,
+            ProductInventory.stock.label("quantity"),
+            Product.created_at,
+            func.now().label("updated_at"),
             Product.name.label("product_name"),
             Product.price.label("product_price"),
             Product.images.label("product_image"),
@@ -422,10 +415,10 @@ async def get_showroom_inventory(
             Category.name.label("category_name"),
             func.coalesce(parent_cat.name, Category.name).label("main_category_name")
         )
-        .join(Product, LocationInventory.product_id == Product.id, isouter=True)
+        .join(Product, ProductInventory.product_id == Product.id, isouter=True)
         .join(Category, Product.category_id == Category.id, isouter=True)
         .join(parent_cat, Category.parent_id == parent_cat.id, isouter=True)
-        .where(LocationInventory.hub_id == showroom_id)
+        .where(ProductInventory.hub_id == showroom_id)
     )
     result = await db.execute(query)
     return result.mappings().all()
@@ -638,11 +631,11 @@ async def get_showroom_dashboard_stats(
     
     inv_query = (
         select(
-            func.sum(LocationInventory.quantity),
-            func.sum(case((and_(LocationInventory.quantity <= 5, LocationInventory.quantity > 0), 1), else_=0)),
-            func.sum(case((LocationInventory.quantity == 0, 1), else_=0))
+            func.sum(ProductInventory.stock),
+            func.sum(case((and_(ProductInventory.stock <= 5, ProductInventory.stock > 0), 1), else_=0)),
+            func.sum(case((ProductInventory.stock == 0, 1), else_=0))
         )
-        .where(LocationInventory.hub_id == showroom_id)
+        .where(ProductInventory.hub_id == showroom_id)
     )
     inv_res = await db.execute(inv_query)
     total_stock, low_stock, out_of_stock = inv_res.one()

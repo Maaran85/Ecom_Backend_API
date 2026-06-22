@@ -27,6 +27,7 @@ from .notification import (
     NotificationResponse, NotificationCreate, BroadcastNotificationRequest,
     NotificationPreferenceUpdate, NotificationPreference, NotificationStats
 )
+from .partner import PartnerBase, PartnerCreate, PartnerUpdate, PartnerResponse
 
 __all__ = [
     "User", "UserCreate", "UserUpdate",
@@ -54,4 +55,5 @@ __all__ = [
     "BulkStockUpdateItem", "BulkStockUpdateRequest", "BulkStockUpdateResponse",
     "NotificationResponse", "NotificationCreate", "BroadcastNotificationRequest",
     "NotificationPreferenceUpdate", "NotificationPreference", "NotificationStats",
+    "PartnerBase", "PartnerCreate", "PartnerUpdate", "PartnerResponse"
 ]

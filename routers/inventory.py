@@ -17,6 +17,10 @@ from schemas.inventory import (
 from services.notification import EmailService
 from fastapi import BackgroundTasks
 
+from models.hub import DeliveryHub
+from models.inventory import ProductInventory
+from schemas.inventory import HubStockAdd
+
 router = APIRouter()
 
 # ==================== STOCK ALERTS ====================
@@ -269,9 +273,14 @@ async def bulk_stock_update(
             )
             db.add(movement)
             
-            # Update product stock
-            product.stock = item.quantity
-            
+            # Find an inventory record or create one for hub 1 (default hub)
+            hub_inv = await db.execute(select(ProductInventory).where(ProductInventory.product_id == product.id).limit(1))
+            inv = hub_inv.scalar_one_or_none()
+            if inv:
+                inv.stock += quantity_change
+            else:
+                new_inv = ProductInventory(hub_id=1, product_id=product.id, stock=stock_after)
+                db.add(new_inv)
             success_count += 1
             results.append({
                 "product_id": item.product_id,
@@ -297,6 +306,56 @@ async def bulk_stock_update(
         failed_count=failed_count,
         results=results
     )
+
+@router.post("/inventory/hub/add-stock", status_code=status.HTTP_200_OK)
+async def add_hub_stock(
+    data: HubStockAdd,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Hub User adding stock to their hub"""
+    
+    # Verify current user is a hub manager
+    hub_res = await db.execute(select(DeliveryHub).where(DeliveryHub.user_id == current_user.id))
+    hub = hub_res.scalar_one_or_none()
+    if not hub:
+        raise HTTPException(status_code=403, detail="Not authorized as Hub User")
+
+    # Verify product exists
+    prod_res = await db.execute(select(Product).where(Product.id == data.product_id))
+    product = prod_res.scalar_one_or_none()
+    if not product:
+         raise HTTPException(status_code=404, detail="Product not found")
+
+    # Update or create ProductInventory
+    inv_res = await db.execute(
+        select(ProductInventory).where(ProductInventory.hub_id == hub.id, ProductInventory.product_id == data.product_id)
+    )
+    hub_inv = inv_res.scalar_one_or_none()
+
+    stock_before = hub_inv.stock if hub_inv else 0
+    stock_after = stock_before + data.quantity
+
+    if not hub_inv:
+        hub_inv = ProductInventory(hub_id=hub.id, product_id=data.product_id, stock=stock_after)
+        db.add(hub_inv)
+    else:
+        hub_inv.stock = stock_after
+
+    # Log movement
+    movement = StockMovement(
+        product_id=data.product_id,
+        movement_type=MovementType.RESTOCK,
+        quantity=data.quantity,
+        stock_before=stock_before,
+        stock_after=stock_after,
+        hub_id=hub.id,
+        user_id=current_user.id,
+        notes="Hub User added inventory"
+    )
+    db.add(movement)
+    await db.commit()
+    return {"message": "Stock added successfully", "new_stock": stock_after}
 
 @router.post("/inventory/run-checks", status_code=status.HTTP_200_OK)
 async def run_inventory_checks(
