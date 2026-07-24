@@ -4,6 +4,7 @@ Address management router
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from core.database import get_db
 from core.permissions import get_current_active_user
 from models import User, Address, CustomerUser
@@ -37,8 +38,18 @@ async def create_address(
     )
     
     db.add(address)
+    await db.flush()
+    new_address_id = address.id
     await db.commit()
-    await db.refresh(address)
+    
+    # Reload with relationship
+    result = await db.execute(
+        select(Address).options(selectinload(Address.state_rel)).where(Address.id == new_address_id)
+    )
+    address = result.scalar_one()
+    if address.state_rel:
+        address.state_name = address.state_rel.name
+        address.state_code = address.state_rel.state_code
     
     return address
 
@@ -49,10 +60,15 @@ async def list_addresses(
 ):
     """Get all user addresses"""
     result = await db.execute(
-        select(Address).where(Address.customer_id == current_user.id)
+        select(Address).options(selectinload(Address.state_rel)).where(Address.customer_id == current_user.id)
     )
     addresses = result.scalars().all()
     
+    for addr in addresses:
+        if addr.state_rel:
+            addr.state_name = addr.state_rel.name
+            addr.state_code = addr.state_rel.state_code
+            
     return addresses
 
 @router.get("/{address_id}", response_model=AddressSchema)
@@ -63,7 +79,7 @@ async def get_address(
 ):
     """Get specific address"""
     result = await db.execute(
-        select(Address).where(
+        select(Address).options(selectinload(Address.state_rel)).where(
             Address.id == address_id,
             Address.customer_id == current_user.id
         )
@@ -75,6 +91,10 @@ async def get_address(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Address not found"
         )
+        
+    if address.state_rel:
+        address.state_name = address.state_rel.name
+        address.state_code = address.state_rel.state_code
     
     return address
 
@@ -87,7 +107,7 @@ async def update_address(
 ):
     """Update address"""
     result = await db.execute(
-        select(Address).where(
+        select(Address).options(selectinload(Address.state_rel)).where(
             Address.id == address_id,
             Address.customer_id == current_user.id
         )
@@ -118,7 +138,15 @@ async def update_address(
         setattr(address, field, value)
     
     await db.commit()
-    await db.refresh(address)
+    
+    # Reload with relationship to ensure correct state data
+    result = await db.execute(
+        select(Address).options(selectinload(Address.state_rel)).where(Address.id == address_id)
+    )
+    address = result.scalar_one()
+    if address.state_rel:
+        address.state_name = address.state_rel.name
+        address.state_code = address.state_rel.state_code
     
     return address
 
@@ -156,7 +184,7 @@ async def set_default_address(
 ):
     """Set address as default"""
     result = await db.execute(
-        select(Address).where(
+        select(Address).options(selectinload(Address.state_rel)).where(
             Address.id == address_id,
             Address.customer_id == current_user.id
         )
@@ -182,6 +210,9 @@ async def set_default_address(
     
     address.is_default = True
     await db.commit()
-    await db.refresh(address)
+    
+    if address.state_rel:
+        address.state_name = address.state_rel.name
+        address.state_code = address.state_rel.state_code
     
     return address

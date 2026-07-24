@@ -13,7 +13,7 @@ from core.rate_limiter import limiter
 from routers import (
     auth_router, products_router, cart_router,
     dealers_router, admin_router,
-    wishlist_router, addresses_router, reviews_router, variants_router,
+    wishlist_router, addresses_router, reviews_router,
     coupons_router, flash_sales_router, bulk_discounts_router,
     payments_router, order_management_router,
     inventory_router, notifications_router,
@@ -21,8 +21,10 @@ from routers import (
     riders_router, rider_reviews_router, locations_router,
     showroom_router, dealer_docs_router, payment_settings_router,
     finance_router, logistics_router, recharge_router, rewards_router,
-    partners_router
+    partners_router, referrals_router
 )
+from auction.routers import auction_router
+from b2b_auction.routers import router as b2b_auction_router, product_router as b2b_products_router, order_router as b2b_orders_router
 
 app = FastAPI(title=settings.PROJECT_NAME)
 app.state.limiter = limiter
@@ -79,7 +81,6 @@ app.include_router(admin_router, prefix="/api/v1/admin", tags=["admin"])
 app.include_router(wishlist_router, prefix="/api/v1/wishlist", tags=["wishlist"])
 app.include_router(addresses_router, prefix="/api/v1/addresses", tags=["addresses"])
 app.include_router(reviews_router, prefix="/api/v1/reviews", tags=["reviews"])
-app.include_router(variants_router, prefix="/api/v1/variants", tags=["variants"])
 app.include_router(coupons_router, prefix="/api/v1/coupons", tags=["coupons"])
 app.include_router(flash_sales_router, prefix="/api/v1/flash-sales", tags=["flash-sales"])
 app.include_router(bulk_discounts_router, prefix="/api/v1/bulk-discounts", tags=["bulk-discounts"])
@@ -102,6 +103,11 @@ app.include_router(logistics_router, prefix="/api/v1/logistics", tags=["logistic
 app.include_router(recharge_router, prefix="/api/v1/recharge", tags=["recharge"])
 app.include_router(rewards_router, prefix="/api/v1/rewards", tags=["rewards"])
 app.include_router(partners_router, prefix="/api/v1/superadmin/partners", tags=["superadmin-partners"])
+app.include_router(auction_router, prefix="/api/v1", tags=["auction"])
+app.include_router(referrals_router, prefix="/api/v1")
+app.include_router(b2b_products_router, prefix="/api/v1", tags=["B2B Products"])
+app.include_router(b2b_auction_router, prefix="/api/v1", tags=["B2B Auctions"])
+app.include_router(b2b_orders_router, prefix="/api/v1", tags=["B2B Orders"])
 
 @app.get("/")
 def read_root():
@@ -117,5 +123,18 @@ from core.support_escalation import start_support_escalation_loop
 
 @app.on_event("startup")
 async def startup_event():
+    # Automatically sync schema and create missing tables / columns
+    try:
+        from core.database import engine, Base
+        from sqlalchemy import text
+        import models.referral  # ensure referral models are registered with Base.metadata
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE categories ADD COLUMN IF NOT EXISTS referral_commission_rate DOUBLE PRECISION;"))
+            await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet_amount_used DOUBLE PRECISION DEFAULT 0.0;"))
+            await conn.run_sync(Base.metadata.create_all)
+        print("INFO: Successfully verified/created referral tables, wallet_transactions, and orders.wallet_amount_used column.")
+    except Exception as e:
+        print(f"WARNING: Schema auto-migration on startup encountered: {e}")
+
     # Start the support escalation background loop
     asyncio.create_task(start_support_escalation_loop())

@@ -1,3 +1,5 @@
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Date, func, Text
 from sqlalchemy.orm import relationship
 from core.database import Base
@@ -6,7 +8,7 @@ class DealerRemittance(Base):
     __tablename__ = "dealer_remittances"
 
     id = Column(Integer, primary_key=True, index=True)
-    dealer_id = Column(Integer, ForeignKey("dealers.id", ondelete="CASCADE"), nullable=False)
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey("dealers.id", ondelete="CASCADE"), nullable=False)
     
     amount = Column(Float, nullable=False)
     status = Column(String(50), default="pending")  # pending, completed, rejected

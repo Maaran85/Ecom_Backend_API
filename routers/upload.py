@@ -1,6 +1,7 @@
 """
 Image Upload Router - Product images, Review images, Return images
 """
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -18,7 +19,7 @@ router = APIRouter()
 
 @router.post("/products/{product_id}/upload-image")
 async def upload_product_image(
-    product_id: int,
+    product_id: UUID,
     file: UploadFile = File(...),
     is_primary: bool = False,
     current_user: User = Depends(get_current_active_user),
@@ -75,7 +76,7 @@ async def upload_product_image(
 
 @router.delete("/products/{product_id}/image")
 async def delete_product_image(
-    product_id: int,
+    product_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):

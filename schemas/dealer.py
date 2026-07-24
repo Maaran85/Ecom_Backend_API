@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from datetime import datetime
@@ -23,7 +24,7 @@ class HubCreate(HubBase):
 
 class Hub(HubBase):
     id: int
-    dealer_id: int
+    dealer_id: UUID
     created_at: datetime
     is_showroom: bool
     
@@ -52,7 +53,6 @@ class DealerProfileComplete(BaseModel):
     business_address: Optional[str] = None
     owner_name: Optional[str] = None
     city: Optional[str] = None
-    state: Optional[str] = None
     pincode: Optional[str] = None
     country_id: Optional[int] = None
     state_id: Optional[int] = None
@@ -109,22 +109,24 @@ class DealerUpdate(BaseModel):
     free_delivery_above: Optional[float] = None
     estimated_delivery_days: Optional[int] = None
     partner_id: Optional[int] = None
+    state_id: Optional[int] = None
+    signature_image_url: Optional[str] = None
 
 class Dealer(DealerBase):
-    id: int
+    id: UUID
     user_id: int
     is_approved: bool
+    is_auction_enabled: bool = False
     profile_status: str
     access_status: str
     reject_reason: Optional[str] = None
     delivery_charge: float
     free_delivery_above: float
     estimated_delivery_days: int
-    platform_fee_percent: float
+    platform_fee_amount: float
     created_at: datetime
     
     city: Optional[str] = None
-    state: Optional[str] = None
     pincode: Optional[str] = None
     country_id: Optional[int] = None
     state_id: Optional[int] = None
@@ -139,6 +141,9 @@ class Dealer(DealerBase):
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
+    signature_image_url: Optional[str] = None
+    state_name: Optional[str] = None
+    state_code: Optional[str] = None
     aadhaar_number: Optional[str] = None
     aadhaar_photo_url: Optional[str] = None
     
@@ -184,11 +189,12 @@ class DealerWithUser(Dealer):
 class OrderItemDealer(BaseModel):
     id: int
     item_order_id: Optional[str] = None
-    product_id: int
+    product_id: UUID
     product_name: str
     quantity: int
     price: float
-    size: Optional[str] = None
+    mrp: Optional[float] = None
+    variant_attributes: Optional[dict] = None
     product_image: Optional[str] = None
     status: str
     reject_reason: Optional[str] = None
@@ -208,7 +214,7 @@ class OrderItemDealer(BaseModel):
     rider_phone: Optional[str] = None
     delivery_attempts: Optional[int] = 0
     is_exchange: bool = False
-    exchange_variant_id: Optional[int] = None
+    exchange_variant_id: Optional[UUID] = None
     exchange_variant: Optional[dict] = None
     hub_id: Optional[int] = None
     hub: Optional[Hub] = None
@@ -231,6 +237,9 @@ class DealerOrderResponse(BaseModel):
     created_at: datetime
     subtotal: Optional[float] = None          # Pre-discount total
     discount_amount: Optional[float] = None   # Discount applied
+    delivery_charge: Optional[float] = 0.0
+    platform_fee_amount: Optional[float] = 0.0
+    coupon_code: Optional[str] = None
     total_amount: float                       # Final amount paid
     status: OrderStatus
     payment_method: str = "COD"
@@ -267,10 +276,10 @@ class DealerRefundItem(BaseModel):
     requested_at: datetime
     customer_name: str
     is_exchange: Optional[bool] = False
-    exchange_variant_id: Optional[int] = None
+    exchange_variant_id: Optional[UUID] = None
 
 class DealerStockUpdate(BaseModel):
-    product_id: int
+    product_id: UUID
     quantity: int
     update_type: str  # 'in' or 'out'
     notes: Optional[str] = None
@@ -280,4 +289,4 @@ class DealerStockUpdate(BaseModel):
     requested_at: datetime
     customer_name: str
     is_exchange: Optional[bool] = False
-    exchange_variant_id: Optional[int] = None
+    exchange_variant_id: Optional[UUID] = None

@@ -1,3 +1,5 @@
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, ForeignKey, Boolean, DateTime
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -21,6 +23,8 @@ class State(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     country_id = Column(Integer, ForeignKey("countries.id"), nullable=False)
+    state_code = Column(String(2), unique=True, index=True, nullable=True) # GST State Code
+    type = Column(String(50), nullable=True) # State or UT
     is_active = Column(Boolean, default=True)
 
     # Relationships
@@ -48,7 +52,7 @@ class ServiceablePincode(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     pincode = Column(String, index=True, nullable=False)
-    dealer_id = Column(Integer, ForeignKey("dealers.id", ondelete="CASCADE"), nullable=True) # If null, applies to global/platform logistics
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey("dealers.id", ondelete="CASCADE"), nullable=True) # If null, applies to global/platform logistics
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

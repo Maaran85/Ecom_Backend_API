@@ -23,7 +23,7 @@ class Address(Base):
     address_line1 = Column(String, nullable=False)
     address_line2 = Column(String, nullable=True)
     city = Column(String, nullable=False)
-    state = Column(String, nullable=False)
+    state_id = Column(Integer, ForeignKey("states.id"), nullable=False)
     pincode = Column(String, nullable=False)
     country = Column(String, default="India", nullable=False)
     latitude = Column(String, nullable=True)
@@ -38,3 +38,4 @@ class Address(Base):
     
     # Relationships
     customer = relationship("CustomerUser", backref="addresses")
+    state_rel = relationship("State")

@@ -1,6 +1,7 @@
 """
 Product reviews and ratings router
 """
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -77,7 +78,7 @@ async def create_review(
 
 @router.get("/product/{product_id}", response_model=list[ReviewWithUser])
 async def get_product_reviews(
-    product_id: int,
+    product_id: UUID,
     skip: int = 0,
     limit: int = 20,
     db: AsyncSession = Depends(get_db)

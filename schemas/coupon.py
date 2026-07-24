@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -9,7 +10,7 @@ class CouponBase(BaseModel):
     description: Optional[str] = None
     discount_type: DiscountType
     discount_value: float = Field(..., gt=0)
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
     min_order_value: float = 0.0
     max_discount_amount: Optional[float] = None
     usage_limit: Optional[int] = None

@@ -1,3 +1,4 @@
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, and_, cast, String, text
@@ -10,16 +11,17 @@ import json
 
 from core.database import get_db
 from schemas.product import (
-    Product, ProductCreate, ProductUpdate, 
+    Product, ProductCreate, ProductUpdate, Brand, BrandCreate, BrandUpdate,
     Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate
 )
-from models.product import Product as ProductModel, Category as CategoryModel, CategoryAttribute as CategoryAttributeModel
+from models.product import Product as ProductModel, Category as CategoryModel, CategoryAttribute as CategoryAttributeModel, Brand as BrandModel, SubcategoryBrand
 from models.search_history import SearchHistory as SearchHistoryModel
 from models.user import UserRole
 from models.dealer import Dealer as DealerModel
 from models.partner import Partner as PartnerModel
 from models.inventory import ProductInventory as ProductInventoryModel
 from schemas.search_history import SearchHistory
+from models.cart import OrderItem as OrderItemModel
 from core.permissions import (
     require_admin, get_current_active_user, 
     get_current_user_optional, require_dealer_or_admin
@@ -42,19 +44,16 @@ async def create_category(
     try:
         db_category = CategoryModel(**category_in.model_dump())
         db.add(db_category)
+        await db.flush()  # To get the assigned ID without expiring the object
+        category_id = db_category.id
         await db.commit()
-        await db.refresh(db_category)
         
-        # Manually construct response to avoid lazy-loading issues in async
-        return {
-            "id": db_category.id,
-            "name": db_category.name,
-            "image_url": db_category.image_url,
-            "parent_id": db_category.parent_id,
-            "is_active": db_category.is_active,
-            "created_at": db_category.created_at,
-            "attributes": []
-        }
+        result = await db.execute(
+            select(CategoryModel)
+            .options(selectinload(CategoryModel.attributes))
+            .where(CategoryModel.id == category_id)
+        )
+        return result.scalar_one()
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -67,7 +66,7 @@ async def get_categories(
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """Get all categories with pagination"""
-    query = select(CategoryModel)
+    query = select(CategoryModel).where(CategoryModel.is_deleted == False)
     
     # Check if we should filter out inactive categories
     is_admin = False
@@ -89,7 +88,7 @@ async def update_category(
     current_user: User = Depends(require_admin)
 ):
     """Update a category (admin only)"""
-    result = await db.execute(select(CategoryModel).where(CategoryModel.id == category_id))
+    result = await db.execute(select(CategoryModel).options(selectinload(CategoryModel.attributes)).where(CategoryModel.id == category_id))
     db_category = result.scalar_one_or_none()
     if not db_category:
         raise HTTPException(status_code=404, detail="Category not found")
@@ -99,16 +98,14 @@ async def update_category(
         setattr(db_category, key, value)
     
     await db.commit()
-    await db.refresh(db_category)
-    return {
-        "id": db_category.id,
-        "name": db_category.name,
-        "image_url": db_category.image_url,
-        "parent_id": db_category.parent_id,
-        "is_active": db_category.is_active,
-        "created_at": db_category.created_at,
-        "attributes": [] # Attributes can be loaded if needed, but [] is safe for simple update
-    }
+    
+    # Re-fetch to ensure attributes are eagerly loaded for Pydantic
+    fresh_result = await db.execute(
+        select(CategoryModel)
+        .options(selectinload(CategoryModel.attributes))
+        .where(CategoryModel.id == category_id)
+    )
+    return fresh_result.scalar_one()
 
 @router.delete("/categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["categories"])
 async def delete_category(
@@ -123,17 +120,48 @@ async def delete_category(
     if not db_category:
         raise HTTPException(status_code=404, detail="Category not found")
     
-    # Check if category has products
-    products_count = await db.execute(select(func.count(ProductModel.id)).where(ProductModel.category_id == category_id))
-    if products_count.scalar() > 0:
-        raise HTTPException(status_code=400, detail="Cannot delete category with associated products")
-    
-    # Check if category has subcategories
-    subdirs_count = await db.execute(select(func.count(CategoryModel.id)).where(CategoryModel.parent_id == category_id))
-    if subdirs_count.scalar() > 0:
-        raise HTTPException(status_code=400, detail="Cannot delete category with subcategories")
+    # Helper function to get all subcategories recursively
+    async def get_all_subcategories(db_session, cat_id):
+        sub_res = await db_session.execute(select(CategoryModel.id).where(CategoryModel.parent_id == cat_id))
+        sub_ids = sub_res.scalars().all()
+        all_ids = list(sub_ids)
+        for sid in sub_ids:
+            all_ids.extend(await get_all_subcategories(db_session, sid))
+        return all_ids
 
-    await db.delete(db_category)
+    category_ids_to_delete = [category_id] + await get_all_subcategories(db, category_id)
+
+    # Check if there are any products in these categories
+    prod_res = await db.execute(
+        select(ProductModel.id).where(ProductModel.category_id.in_(category_ids_to_delete))
+    )
+    product_ids_to_delete = prod_res.scalars().all()
+
+    if not product_ids_to_delete:
+        # 1. Hard delete Categories (no products exist)
+        from sqlalchemy import delete
+        
+        # Delete attributes first to avoid foreign key constraints
+        await db.execute(delete(CategoryAttributeModel).where(CategoryAttributeModel.category_id.in_(category_ids_to_delete)))
+        
+        # Then delete categories
+        await db.execute(delete(CategoryModel).where(CategoryModel.id.in_(category_ids_to_delete)))
+    else:
+        # 1. Soft delete Categories
+        from sqlalchemy import update
+        await db.execute(
+            update(CategoryModel)
+            .where(CategoryModel.id.in_(category_ids_to_delete))
+            .values(is_deleted=True, is_active=False)
+        )
+
+        # 2. Soft delete Products
+        await db.execute(
+            update(ProductModel)
+            .where(ProductModel.id.in_(product_ids_to_delete))
+            .values(is_deleted=True, is_approved=False)
+        )
+
     await db.commit()
     return None
 
@@ -151,6 +179,7 @@ async def get_category_products(
     """Get products in a category with filters"""
     query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
         ProductModel.category_id == category_id,
+        ProductModel.is_deleted == False,
         DealerModel.access_status == 'active',
         DealerModel.is_active == True, DealerModel.is_deleted == False,
         ProductModel.is_approved == True,
@@ -159,13 +188,13 @@ async def get_category_products(
     
     # Price filters
     if min_price is not None:
-        query = query.where(ProductModel.price >= min_price)
+        query = query.where(ProductModel.selling_price >= min_price)
     if max_price is not None:
-        query = query.where(ProductModel.price <= max_price)
+        query = query.where(ProductModel.selling_price <= max_price)
     
     # Sorting
     if sort_by == "price":
-        query = query.order_by(ProductModel.price.asc() if sort_order == "asc" else ProductModel.price.desc())
+        query = query.order_by(ProductModel.selling_price.asc() if sort_order == "asc" else ProductModel.selling_price.desc())
     elif sort_by == "rating":
         query = query.order_by(ProductModel.average_rating.desc())
     elif sort_by == "newest":
@@ -175,7 +204,11 @@ async def get_category_products(
     
     query = query.offset(skip).limit(limit).options(
         joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-        joinedload(ProductModel.dealer)
+        joinedload(ProductModel.dealer),
+        joinedload(ProductModel.brand),
+        selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+        selectinload(ProductModel.children).selectinload(ProductModel.children),
+        selectinload(ProductModel.children).joinedload(ProductModel.brand)
     )
     result = await db.execute(query)
     products = result.scalars().all()
@@ -204,8 +237,12 @@ async def create_category_attribute(
         "category_id": db_attribute.category_id,
         "name": db_attribute.name,
         "is_mandatory": db_attribute.is_mandatory,
+        "is_variant_key": db_attribute.is_variant_key,
         "datatype": db_attribute.datatype,
-        "allowed_values": db_attribute.allowed_values
+        "allowed_values": db_attribute.allowed_values,
+        "unit": db_attribute.unit,
+        "description": db_attribute.description,
+        "is_filter": db_attribute.is_filter
     }
 
 @router.put("/categories/{category_id}/attributes/{attribute_id}", response_model=CategoryAttribute, tags=["categories"])
@@ -236,8 +273,12 @@ async def update_category_attribute(
         "category_id": db_attribute.category_id,
         "name": db_attribute.name,
         "is_mandatory": db_attribute.is_mandatory,
+        "is_variant_key": db_attribute.is_variant_key,
         "datatype": db_attribute.datatype,
-        "allowed_values": db_attribute.allowed_values
+        "allowed_values": db_attribute.allowed_values,
+        "unit": db_attribute.unit,
+        "description": db_attribute.description,
+        "is_filter": db_attribute.is_filter
     }
 
 @router.delete("/categories/{category_id}/attributes/{attribute_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["categories"])
@@ -265,23 +306,29 @@ async def get_category_attributes(category_id: int, db: AsyncSession = Depends(g
     """Get all required and optional attributes for a specific category (including inherited from parents and defined in children)"""
     
     # Fast, safe memory-level mapping
-    res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id))
+    res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id, CategoryModel.is_spec_group))
     all_cats = res.all()
     
     # Adjacency maps
     children_map = {}
     parent_map = {}
-    for cid, pid in all_cats:
+    spec_group_map = {}
+    for cid, pid, is_sg in all_cats:
         if pid not in children_map:
             children_map[pid] = []
         children_map[pid].append(cid)
         parent_map[cid] = pid
+        spec_group_map[cid] = is_sg
         
     # Upward (parents)
     related_ids = set()
     curr = category_id
     while curr is not None:
         related_ids.add(curr)
+        # Add any spec groups attached to this parent
+        for child_id in children_map.get(curr, []):
+            if spec_group_map.get(child_id):
+                related_ids.add(child_id)
         curr = parent_map.get(curr)
 
     # Downward (children)
@@ -315,8 +362,11 @@ async def get_category_attributes(category_id: int, db: AsyncSession = Depends(g
                 category_id=attr.category_id,
                 name=attr.name,
                 is_mandatory=attr.is_mandatory,
+                is_variant_key=attr.is_variant_key,
                 datatype=attr.datatype,
-                allowed_values=list(attr.allowed_values) if attr.allowed_values else []
+                allowed_values=list(attr.allowed_values) if attr.allowed_values else [],
+                unit=attr.unit,
+                description=attr.description
             )
         else:
             if attr.allowed_values:
@@ -327,6 +377,104 @@ async def get_category_attributes(category_id: int, db: AsyncSession = Depends(g
                 merged[attr.name].allowed_values = existing
 
     return list(merged.values())
+
+
+@router.get("/categories/{category_id}/spec-groups", tags=["categories"])
+async def get_category_spec_groups(category_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Return attributes grouped by spec group.
+    Returns a list of { group_name: str, attributes: [...] }.
+    Attributes with no spec group fall under a 'General' group.
+    """
+    # Build adjacency maps
+    res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id, CategoryModel.is_spec_group, CategoryModel.name))
+    all_cats = res.all()
+
+    children_map: dict = {}
+    parent_map: dict = {}
+    spec_group_map: dict = {}
+    name_map: dict = {}
+    for cid, pid, is_sg, cname in all_cats:
+        children_map.setdefault(pid, []).append(cid)
+        parent_map[cid] = pid
+        spec_group_map[cid] = is_sg
+        name_map[cid] = cname
+
+    # Collect all relevant category IDs (same logic as existing endpoint)
+    related_ids: set = set()
+    curr = category_id
+    while curr is not None:
+        related_ids.add(curr)
+        for child_id in children_map.get(curr, []):
+            if spec_group_map.get(child_id):
+                related_ids.add(child_id)
+        curr = parent_map.get(curr)
+
+    stack = [category_id]
+    visited: set = set()
+    while stack:
+        curr = stack.pop()
+        if curr in visited:
+            continue
+        visited.add(curr)
+        related_ids.add(curr)
+        for child_id in children_map.get(curr, []):
+            stack.append(child_id)
+
+    if not related_ids:
+        return []
+
+    # Fetch all attributes
+    result = await db.execute(
+        select(CategoryAttributeModel)
+        .where(CategoryAttributeModel.category_id.in_(list(related_ids)))
+        .order_by(CategoryAttributeModel.id)
+    )
+    attributes = result.scalars().all()
+
+    # Identify which category IDs are spec groups
+    spec_group_ids = {cid for cid in related_ids if spec_group_map.get(cid)}
+
+    # Group attributes
+    groups: dict = {}   # group_name -> list of attr dicts
+    seen_names: set = set()
+
+    for attr in attributes:
+        if attr.name in seen_names:
+            continue
+        seen_names.add(attr.name)
+
+        # Determine group name
+        if attr.category_id in spec_group_ids:
+            group_name = name_map.get(attr.category_id, "General")
+        else:
+            group_name = "General"
+
+        if group_name not in groups:
+            groups[group_name] = []
+
+        groups[group_name].append({
+            "id": attr.id,
+            "name": attr.name,
+            "category_id": attr.category_id,
+            "is_mandatory": attr.is_mandatory,
+            "is_variant_key": attr.is_variant_key,
+            "datatype": attr.datatype,
+            "allowed_values": list(attr.allowed_values) if attr.allowed_values else [],
+            "unit": attr.unit,
+            "description": attr.description,
+        })
+
+    # Build ordered result: General first, then alphabetical spec groups
+    result_list = []
+    if "General" in groups:
+        result_list.append({"group_name": "General", "attributes": groups["General"]})
+    for gname, attrs in sorted(groups.items()):
+        if gname != "General":
+            result_list.append({"group_name": gname, "attributes": attrs})
+
+    return result_list
+
 
 # Product endpoints
 @router.post("/products", response_model=Product, tags=["products"])
@@ -342,17 +490,31 @@ async def create_product(
     if not cat_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Category not found")
 
-    # Fetch mandatory attributes (including from parents)
-    hierarchy = select(CategoryModel.id, CategoryModel.parent_id).where(CategoryModel.id == product_in.category_id).cte(name="hierarchy", recursive=True)
+    # Fetch mandatory attributes (including from parents and their spec groups)
+    start_id = product_in.subcategory_id if product_in.subcategory_id else product_in.category_id
+    hierarchy = select(CategoryModel.id, CategoryModel.parent_id).where(CategoryModel.id == start_id).cte(name="hierarchy", recursive=True)
     alias = aliased(CategoryModel)
     hierarchy = hierarchy.union_all(
         select(alias.id, alias.parent_id).where(alias.id == hierarchy.c.parent_id)
     )
+    
+    spec_groups = select(CategoryModel.id).where(
+        CategoryModel.parent_id.in_(select(hierarchy.c.id)),
+        CategoryModel.is_spec_group == True
+    )
+
     attr_result = await db.execute(
         select(CategoryAttributeModel)
-        .where(CategoryAttributeModel.category_id.in_(select(hierarchy.c.id)))
+        .where(
+            or_(
+                CategoryAttributeModel.category_id.in_(select(hierarchy.c.id)),
+                CategoryAttributeModel.category_id.in_(spec_groups)
+            )
+        )
     )
-    required_attributes = [attr for attr in attr_result.scalars().all() if attr.is_mandatory]
+    all_attributes = attr_result.scalars().all()
+    required_attributes = [attr for attr in all_attributes if attr.is_mandatory]
+    variant_attributes = [attr for attr in all_attributes if attr.is_variant_key]
     
     # Check if incoming product matches required attributes
     product_attributes = product_in.attributes or {}
@@ -373,6 +535,11 @@ async def create_product(
     product_data = product_in.model_dump()
     product_data.pop("dealer_delivery_days", None)
     
+    if product_data.get("sku") == "":
+        product_data["sku"] = None
+        
+    variants_data = product_data.pop("variants", [])
+    
     db_product = ProductModel(**product_data)
     
     # Automatically assign dealer_id if the user is a dealer
@@ -388,70 +555,79 @@ async def create_product(
     
     # If dealer_id is still not set (e.g. admin didn't provide one), check if it's mandatory
     if not db_product.dealer_id:
-        if current_user.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN] and product_in.dealer_id:
-             db_product.dealer_id = product_in.dealer_id
+        if current_user.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+             db_product.dealer_id = product_in.dealer_id or 1
         else:
              raise HTTPException(status_code=400, detail="Dealer ID is required for product creation.")
 
     db.add(db_product)
     await db.flush() # Get product ID without committing
     
-    # --- Parent-Child Variant Auto-Generation ---
-    # If there are multiple sizes or colors, create child products for each combination
-    colors = []
-    for img in product_in.images:
-        if isinstance(img, dict) and "color" in img and img["color"] != "Default":
-            colors.append(img["color"])
-    
-    if not colors:
-        colors = ["Default"]
-        
-    sizes = product_in.sizes if product_in.sizes else ["One Size"]
-    
-    # We only auto-generate children if there's more than 1 combination
-    if len(sizes) > 1 or len(colors) > 1 or (len(sizes) == 1 and len(colors) == 1 and colors[0] != "Default"):
-        for size in sizes:
-            for color in colors:
-                # Find images for this specific color
-                color_images = []
-                for img in product_in.images:
-                    if isinstance(img, dict) and img.get("color") == color:
-                        color_images = [img]
-                        break
+    if variants_data:
+        if not variant_attributes:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create variants because the category does not have any variant keys defined."
+            )
+        for v_data in variants_data:
+            # Backwards compatibility for price calculation
+            child_price = v_data.get("dealer_price")
+            if child_price is None:
+                child_price = db_product.dealer_price + v_data.get("price_adjustment", 0.0)
                 
-                if not color_images and product_in.images:
-                    # Fallback to first image group if specific color not found
-                    color_images = [product_in.images[0]]
-
-                child_data = product_data.copy()
-                child_data["parent_product_id"] = db_product.id
-                child_data["sizes"] = [size]
-                child_data["color"] = color
-                child_data["images"] = color_images
-                child_data["name"] = f"{db_product.name} ({size}, {color})"
+            # Merge parent and child attributes
+            parent_attrs = db_product.attributes or {}
+            child_attrs = v_data.get("attributes", {})
+            merged_attrs = {**parent_attrs, **child_attrs}
+            
+            if v_data.get("sku") == "":
+                v_data["sku"] = None
                 
-                db_child = ProductModel(**child_data)
-                db_child.dealer_id = db_product.dealer_id
-                db.add(db_child)
+            db_child = ProductModel(
+                name=db_product.name,
+                description=db_product.description,
+                sku=v_data.get("sku"),
+                dealer_price=child_price,
+                selling_price=db_product.selling_price,
+                category_id=db_product.category_id,
+                subcategory=db_product.subcategory,
+                brand_id=db_product.brand_id,
+                dealer_id=db_product.dealer_id,
+                is_approved=db_product.is_approved,
+                is_returnable=db_product.is_returnable,
+                return_window_days=db_product.return_window_days,
+                is_exchangeable=db_product.is_exchangeable,
+                return_policy_note=db_product.return_policy_note,
+                estimated_delivery_days=db_product.estimated_delivery_days,
+                hsn_code=db_product.hsn_code,
+                tax_rule_id=db_product.tax_rule_id,
+                parent_product_id=db_product.id,
+                images=v_data.get("images") or db_product.images,
+                attributes=merged_attrs
+            )
+            db.add(db_child)
 
     await db.commit()
     await db.refresh(db_product)
     
-    # Fetch product with category and variants loaded for response
+    # Fetch product with category and children loaded for response
     result = await db.execute(
         select(ProductModel)
         .where(ProductModel.id == db_product.id)
         .options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-            selectinload(ProductModel.children)
+        joinedload(ProductModel.brand),
+            selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+        selectinload(ProductModel.children).selectinload(ProductModel.children),
+        selectinload(ProductModel.children).joinedload(ProductModel.brand)
         )
     )
     return result.scalar_one()
 
 @router.put("/products/{product_id}", response_model=Product, tags=["products"])
 async def update_product(
-    product_id: int, 
+    product_id: UUID, 
     product_in: ProductUpdate, 
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
@@ -472,9 +648,97 @@ async def update_product(
         if not dealer.is_active:
             raise HTTPException(status_code=403, detail="Your dealer account is currently inactive. You cannot update products.")
     update_data = product_in.model_dump(exclude_unset=True)
+    if update_data.get("sku") == "":
+        update_data["sku"] = None
+        
+    variants_data = update_data.pop("variants", None)
+    
+    # We should validate mandatory attributes if they are being updated
+    variant_attributes = []
+    if "attributes" in update_data or variants_data is not None:
+        start_id = update_data.get("subcategory_id", db_product.subcategory_id) if update_data.get("subcategory_id", db_product.subcategory_id) else update_data.get("category_id", db_product.category_id)
+        hierarchy = select(CategoryModel.id, CategoryModel.parent_id).where(CategoryModel.id == start_id).cte(name="hierarchy", recursive=True)
+        alias = aliased(CategoryModel)
+        hierarchy = hierarchy.union_all(
+            select(alias.id, alias.parent_id).where(alias.id == hierarchy.c.parent_id)
+        )
+        spec_groups = select(CategoryModel.id).where(
+            CategoryModel.parent_id.in_(select(hierarchy.c.id)),
+            CategoryModel.is_spec_group == True
+        )
+        attr_result = await db.execute(
+            select(CategoryAttributeModel).where(
+                or_(
+                    CategoryAttributeModel.category_id.in_(select(hierarchy.c.id)),
+                    CategoryAttributeModel.category_id.in_(spec_groups)
+                )
+            )
+        )
+        all_attributes = attr_result.scalars().all()
+        required_attributes = [attr for attr in all_attributes if attr.is_mandatory]
+        variant_attributes = [attr for attr in all_attributes if attr.is_variant_key]
+        
+        if "attributes" in update_data:
+            product_attributes = update_data["attributes"] or {}
+            missing_attributes = []
+            for req_attr in required_attributes:
+                val = product_attributes.get(req_attr.name)
+                if val is None or val == "":
+                    missing_attributes.append(req_attr.name)
+                    
+            if missing_attributes:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Missing mandatory attributes for this category: {', '.join(missing_attributes)}"
+                )
+
     for key, value in update_data.items():
         setattr(db_product, key, value)
 
+    if variants_data is not None:
+        if variants_data and not variant_attributes:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create variants because the category does not have any variant keys defined."
+            )
+        # Simple implementation: Delete existing children and insert new ones
+        await db.execute(ProductModel.__table__.delete().where(ProductModel.parent_product_id == db_product.id))
+        
+        for v_data in variants_data:
+            child_price = v_data.get("dealer_price")
+            if child_price is None:
+                child_price = db_product.dealer_price + v_data.get("price_adjustment", 0.0)
+                
+            parent_attrs = db_product.attributes or {}
+            child_attrs = v_data.get("attributes", {})
+            merged_attrs = {**parent_attrs, **child_attrs}
+            
+            if v_data.get("sku") == "":
+                v_data["sku"] = None
+                
+            db_child = ProductModel(
+                name=db_product.name,
+                description=db_product.description,
+                sku=v_data.get("sku"),
+                dealer_price=child_price,
+                selling_price=db_product.selling_price,
+                category_id=db_product.category_id,
+                subcategory_id=db_product.subcategory_id,
+                brand_id=db_product.brand_id,
+                dealer_id=db_product.dealer_id,
+                is_approved=db_product.is_approved,
+                is_returnable=db_product.is_returnable,
+                return_window_days=db_product.return_window_days,
+                is_exchangeable=db_product.is_exchangeable,
+                return_policy_note=db_product.return_policy_note,
+                estimated_delivery_days=db_product.estimated_delivery_days,
+                hsn_code=db_product.hsn_code,
+                tax_rule_id=db_product.tax_rule_id,
+                parent_product_id=db_product.id,
+                images=v_data.get("images") or db_product.images,
+                attributes=merged_attrs
+            )
+            db.add(db_child)
 
     await db.commit()
     await db.refresh(db_product)
@@ -486,15 +750,17 @@ async def update_product(
         .options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-            selectinload(ProductModel.children)
+        joinedload(ProductModel.brand),
+            selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+        selectinload(ProductModel.children).selectinload(ProductModel.children),
+        selectinload(ProductModel.children).joinedload(ProductModel.brand)
         )
     )
     return result.scalar_one()
 
-
 @router.delete("/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["products"])
 async def delete_product(
-    product_id: int, 
+    product_id: UUID, 
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
@@ -512,9 +778,118 @@ async def delete_product(
         if not dealer or db_product.dealer_id != dealer.id:
             raise HTTPException(status_code=403, detail="Not authorized to delete this product")
 
-    await db.delete(db_product)
+    # Check if ordered
+    order_result = await db.execute(select(OrderItemModel).where(OrderItemModel.product_id == product_id))
+    has_orders = order_result.first() is not None
+
+    # Check if in inventory
+    inv_result = await db.execute(select(ProductInventoryModel).where(ProductInventoryModel.product_id == product_id))
+    has_inventory = inv_result.first() is not None
+
+    if has_orders or has_inventory:
+        db_product.is_deleted = True
+    else:
+        await db.delete(db_product)
+        
     await db.commit()
     return None
+
+@router.get("/brands", response_model=List[Brand], tags=["products"])
+async def get_brands(
+    subcategory_id: Optional[int] = Query(None), 
+    category_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all active brands, optionally filtered by subcategory or category"""
+    query = select(BrandModel).where(BrandModel.is_active == True)
+    if subcategory_id:
+        query = query.join(SubcategoryBrand, SubcategoryBrand.brand_id == BrandModel.id).where(SubcategoryBrand.subcategory_id == subcategory_id)
+    elif category_id:
+        query = query.join(SubcategoryBrand, SubcategoryBrand.brand_id == BrandModel.id)\
+                     .join(CategoryModel, CategoryModel.id == SubcategoryBrand.subcategory_id)\
+                     .where(CategoryModel.parent_id == category_id)
+    
+    query = query.order_by(BrandModel.name.asc()).distinct()
+    result = await db.execute(query)
+    return result.scalars().all()
+
+@router.post("/brands", response_model=Brand, tags=["products"])
+async def create_brand(
+    brand_in: BrandCreate, 
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """Create a new brand"""
+    try:
+        brand_data = brand_in.model_dump()
+        subcategory_id = brand_data.pop("subcategory_id", None)
+        
+        # Check if brand already exists (case-insensitive)
+        existing_brand_result = await db.execute(select(BrandModel).where(func.lower(BrandModel.name) == brand_data["name"].lower()))
+        existing_brand = existing_brand_result.scalar_one_or_none()
+        
+        if existing_brand:
+            db_brand = existing_brand
+        else:
+            db_brand = BrandModel(**brand_data)
+            db.add(db_brand)
+            await db.flush()
+        
+        if subcategory_id:
+            # check if mapping already exists
+            existing_mapping = await db.execute(select(SubcategoryBrand).where(
+                and_(
+                    SubcategoryBrand.subcategory_id == subcategory_id,
+                    SubcategoryBrand.brand_id == db_brand.id
+                )
+            ))
+            if not existing_mapping.scalar_one_or_none():
+                subcat_brand = SubcategoryBrand(subcategory_id=subcategory_id, brand_id=db_brand.id)
+                db.add(subcat_brand)
+            
+        await db.commit()
+        await db.refresh(db_brand)
+        return db_brand
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/brands/{brand_id}", response_model=Brand, tags=["products"])
+async def update_brand(
+    brand_id: int,
+    brand_in: BrandUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """Update a brand"""
+    result = await db.execute(select(BrandModel).where(BrandModel.id == brand_id))
+    db_brand = result.scalar_one_or_none()
+    if not db_brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    
+    update_data = brand_in.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_brand, key, value)
+    
+    await db.commit()
+    await db.refresh(db_brand)
+    return db_brand
+
+@router.delete("/brands/{brand_id}", tags=["products"])
+async def delete_brand(
+    brand_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """Delete a brand"""
+    result = await db.execute(select(BrandModel).where(BrandModel.id == brand_id))
+    db_brand = result.scalar_one_or_none()
+    if not db_brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+        
+    await db.delete(db_brand)
+    await db.commit()
+    return {"message": "Brand deleted successfully"}
 
 @router.get("/products", response_model=List[Product], tags=["products"])
 async def get_products(
@@ -522,23 +897,28 @@ async def get_products(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=5000),
     category_id: Optional[int] = None,
-    dealer_id: Optional[int] = Query(None),
+    dealer_id: Optional[UUID] = Query(None),
     hub_id: Optional[int] = Query(None),
     search: Optional[str] = None,
     is_approved: Optional[bool] = Query(None),
+    include_children: Optional[bool] = Query(False),
     db: AsyncSession = Depends(get_db)
 ):
     """Get all products with pagination, search, and category filter"""
-    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id)
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
+        ProductModel.is_deleted == False
+    )
     
-    # If no specific dealer is requested, show only active/approved products (Public view)
+    # If no specific dealer is requested, show only active/approved parent products (Public view)
     if not dealer_id:
         query = query.where(
             DealerModel.access_status == 'active',
             DealerModel.is_active == True, DealerModel.is_deleted == False,
             ProductModel.is_approved == True,
-            or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
+            or_(DealerModel.partner_id.is_(None), PartnerModel.is_active == True)
         )
+        if not include_children:
+            query = query.where(ProductModel.parent_product_id.is_(None))
 
     
     if category_id:
@@ -547,11 +927,18 @@ async def get_products(
         hierarchy = hierarchy.union_all(
             select(alias.id).where(alias.parent_id == hierarchy.c.id)
         )
-        query = query.where(ProductModel.category_id.in_(select(hierarchy.c.id)))
+        query = query.where(or_(
+            ProductModel.category_id.in_(select(hierarchy.c.id)),
+            ProductModel.subcategory_id.in_(select(hierarchy.c.id))
+        ))
     
     if dealer_id:
         # For a specific dealer, show ALL their products including pending ones
-        query = query.where(ProductModel.dealer_id == dealer_id)
+        query = query.where(
+            ProductModel.dealer_id == dealer_id
+        )
+        if not include_children:
+            query = query.where(ProductModel.parent_product_id.is_(None))
 
     if search:
         query = query.where(ProductModel.name.ilike(f"%{search}%"))
@@ -576,7 +963,10 @@ async def get_products(
     query = query.offset(skip).limit(limit).options(
         joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
         joinedload(ProductModel.dealer),
-        selectinload(ProductModel.children)
+        joinedload(ProductModel.brand),
+        selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+        selectinload(ProductModel.children).selectinload(ProductModel.children),
+        selectinload(ProductModel.children).joinedload(ProductModel.brand)
     )
     result = await db.execute(query)
     products = result.scalars().all()
@@ -613,15 +1003,15 @@ async def get_search_history(
 async def search_products(
     q: Optional[str] = None,
     category_id: Optional[int] = None,
+    subcategory_id: Optional[int] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     min_rating: Optional[float] = None,
     min_discount: Optional[int] = None,
-    brands: Optional[List[str]] = Query(None),
-    colors: Optional[List[str]] = Query(None),
-    gender: Optional[str] = None,
+    brands: Optional[List[int]] = Query(None),
     attributes: Optional[str] = None, # JSON string of selected dynamic attribute filters
     in_stock: bool = False,
+    include_variants: bool = False,
     sort_by: str = "name",
     sort_order: str = "asc",
     skip: int = 0,
@@ -638,11 +1028,14 @@ async def search_products(
         await db.commit()  # Commit history even if search fails or returns nothing
     
     query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
+        ProductModel.is_deleted == False,
         DealerModel.access_status == 'active',
         DealerModel.is_active == True, DealerModel.is_deleted == False,
         ProductModel.is_approved == True,
-        or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
+        or_(DealerModel.partner_id.is_(None), PartnerModel.is_active == True)
     )
+    if not include_variants:
+        query = query.where(ProductModel.parent_product_id.is_(None))
     
     # Text search (name and description)
     if q:
@@ -672,13 +1065,19 @@ async def search_products(
             for child_id in children_map.get(curr, []):
                 stack.append(child_id)
                 
-        query = query.where(ProductModel.category_id.in_(list(visited)))
+        query = query.where(or_(
+            ProductModel.category_id.in_(list(visited)),
+            ProductModel.subcategory_id.in_(list(visited))
+        ))
     
+    if subcategory_id is not None:
+        query = query.where(ProductModel.subcategory_id == subcategory_id)
+        
     # Price range
     if min_price is not None:
-        query = query.where(ProductModel.price >= min_price)
+        query = query.where(ProductModel.selling_price >= min_price)
     if max_price is not None:
-        query = query.where(ProductModel.price <= max_price)
+        query = query.where(ProductModel.selling_price <= max_price)
     
     # Rating filter
     if min_rating is not None:
@@ -688,17 +1087,11 @@ async def search_products(
     if min_discount is not None:
         query = query.where(ProductModel.discount_percentage >= min_discount)
 
-    # Brand filter
+    # Brand filter (by brand_id)
     if brands:
-        query = query.where(ProductModel.brand.in_(brands))
+        query = query.where(ProductModel.brand_id.in_(brands))
     
-    # Color filter
-    if colors:
-        query = query.where(ProductModel.color.in_(colors))
     
-    # Gender filter
-    if gender:
-        query = query.where(ProductModel.gender == gender)
         
     # Dynamic Attributes Filter
     # attributes param comes as JSON string e.g. '{"RAM":["8GB","12GB"],"Storage":["128GB"]}'
@@ -708,19 +1101,23 @@ async def search_products(
             for attr_key, attr_values in attr_filters.items():
                 if attr_values and isinstance(attr_values, list):
                     # We need to check if the JSON value stored at attr_key is in the list attr_values
-                    # For PostgreSQL JSONB, we cast to String. Because the JSON element returns a string wrapped in quotes (e.g. "\"8GB\""), we wrap our values.
-                    query = query.where(cast(ProductModel.attributes[attr_key], String).in_([f'"{v}"' for v in attr_values]))
+                    # Check parent product OR any of its children
+                    formatted_values = [f'"{v}"' for v in attr_values]
+                    parent_has_it = cast(ProductModel.attributes[attr_key], String).in_(formatted_values)
+                    child_has_it = ProductModel.children.any(cast(ProductModel.attributes[attr_key], String).in_(formatted_values))
+                    query = query.where(or_(parent_has_it, child_has_it))
         except (json.JSONDecodeError, TypeError):
             print(f"DEBUG: Failed to parse attributes JSON: {attributes}")
             pass
     
-    # Stock filter
+    # Stock filter - need to handle inventory
     if in_stock:
-        query = query.where(ProductModel.stock > 0)
+        # We can't filter purely on ProductModel.stock > 0 anymore in DB, we'd have to filter the results.
+        pass
     
     # Sorting
     if sort_by == "price":
-        query = query.order_by(ProductModel.price.asc() if sort_order == "asc" else ProductModel.price.desc())
+        query = query.order_by(ProductModel.selling_price.asc() if sort_order == "asc" else ProductModel.selling_price.desc())
     elif sort_by == "rating":
         query = query.order_by(ProductModel.average_rating.desc())
     elif sort_by == "newest":
@@ -734,12 +1131,19 @@ async def search_products(
     query = query.offset(skip).limit(limit).options(
         joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
         joinedload(ProductModel.dealer),
-        selectinload(ProductModel.children)
+        joinedload(ProductModel.brand),
+        selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+        selectinload(ProductModel.children).selectinload(ProductModel.children),
+        selectinload(ProductModel.children).joinedload(ProductModel.brand)
     )
     
     result = await db.execute(query)
     products = result.scalars().all()
     
+    if in_stock:
+        # safely check inventory
+        products = [p for p in products if (getattr(p, 'hub_stock', 0) or 0) > 0]
+            
     return products
 
 @router.get("/products/autocomplete", tags=["products"])
@@ -752,7 +1156,7 @@ async def autocomplete_products(
     
     # Get matching product names
     result = await db.execute(
-        select(ProductModel.name, ProductModel.id, ProductModel.price, ProductModel.images)
+        select(ProductModel.name, ProductModel.id, ProductModel.selling_price, ProductModel.images)
         .join(DealerModel)
         .outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id)
         .where(
@@ -812,18 +1216,50 @@ async def get_filter_options(
     """Get available filter options for products"""
     
     query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
+        ProductModel.is_deleted == False,
         DealerModel.access_status == 'active',
         DealerModel.is_active == True, DealerModel.is_deleted == False,
         ProductModel.is_approved == True,
+        ProductModel.parent_product_id.is_(None),
         or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
-    )
+    ).options(joinedload(ProductModel.brand), selectinload(ProductModel.children))
+    
+    clean_visited = []
+    all_category_ids_for_attrs = set()
     if category_id:
-        hierarchy = select(CategoryModel.id).where(CategoryModel.id == category_id).cte(name="hierarchy", recursive=True)
-        alias = aliased(CategoryModel)
-        hierarchy = hierarchy.union_all(
-            select(alias.id).where(alias.parent_id == hierarchy.c.id)
-        )
-        query = query.where(ProductModel.category_id.in_(select(hierarchy.c.id)))
+        res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id))
+        all_cats = res.all()
+        children_map = {}
+        parent_map = {}
+        for cid, pid in all_cats:
+            parent_map[cid] = pid
+            if pid not in children_map:
+                children_map[pid] = []
+            children_map[pid].append(cid)
+            
+        stack = [category_id]
+        visited = set()
+        while stack:
+            curr = stack.pop()
+            if curr in visited: continue
+            visited.add(curr)
+            for child_id in children_map.get(curr, []):
+                stack.append(child_id)
+                
+        clean_visited = [int(x) for x in visited if x is not None]
+        
+        # Build hierarchy (including parents) for fetching attributes
+        curr_parent = category_id
+        while curr_parent is not None:
+            all_category_ids_for_attrs.add(curr_parent)
+            curr_parent = parent_map.get(curr_parent)
+        for v in clean_visited:
+            all_category_ids_for_attrs.add(v)
+            
+        query = query.where(or_(
+            ProductModel.category_id.in_(clean_visited),
+            ProductModel.subcategory_id.in_(clean_visited)
+        ))
     
     result = await db.execute(query)
     products = result.scalars().all()
@@ -831,11 +1267,28 @@ async def get_filter_options(
     if not products:
         return {
             "price_range": {"min": 0, "max": 0},
-            "rating_distribution": {}
+            "rating_distribution": {},
+            "brands": [],
+            "colors": [],
+            "dynamic_attributes": [],
+            "total_products": 0,
+            "in_stock_count": 0
         }
     
+    # Fetch configured dynamic attributes for the given categories
+    dynamic_attributes_schema = []
+    if all_category_ids_for_attrs:
+        attr_query = select(CategoryAttributeModel).where(
+            CategoryAttributeModel.category_id.in_(list(all_category_ids_for_attrs)),
+            CategoryAttributeModel.is_filter == True
+        )
+        attr_res = await db.execute(attr_query)
+        dynamic_attributes_schema = attr_res.scalars().all()
+    
+    configured_attr_names = {attr.name for attr in dynamic_attributes_schema}
+    
     # Calculate price range
-    prices = [p.price for p in products]
+    prices = [p.selling_price for p in products if p.selling_price is not None]
     price_range = {
         "min": min(prices) if prices else 0,
         "max": max(prices) if prices else 0
@@ -851,16 +1304,54 @@ async def get_filter_options(
     }
 
     # Extract facets
-    brands = sorted(list(set(p.brand for p in products if p.brand)))
-    colors = sorted(list(set(p.color for p in products if p.color)))
+    brands_map = {}
+    for p in products:
+        if p.brand:
+            brands_map[p.brand.id] = p.brand.name
+    brands = [{"id": bid, "name": bname} for bid, bname in brands_map.items()]
+    brands = sorted(brands, key=lambda x: x["name"])
     
+    colors_set = set()
+    dynamic_attributes_values = {attr_name: set() for attr_name in configured_attr_names}
+    
+    for p in products:
+        all_items = [p] + (p.children if p.children else [])
+        for item in all_items:
+            if item.attributes and isinstance(item.attributes, dict):
+                # Legacy explicit colors mapping
+                if 'Color' in item.attributes:
+                    colors_set.add(item.attributes['Color'])
+                # Dynamic mapping
+                for attr_name in configured_attr_names:
+                    if attr_name in item.attributes:
+                        val = item.attributes[attr_name]
+                        if val:
+                            dynamic_attributes_values[attr_name].add(str(val))
+                            
+    colors = sorted(list(colors_set))
+    
+    dynamic_attributes_list = []
+    for attr_name, val_set in dynamic_attributes_values.items():
+        if val_set:
+            dynamic_attributes_list.append({
+                "name": attr_name,
+                "values": sorted(list(val_set))
+            })
+    
+    # Safely get stock
+    def get_stock(p):
+        if hasattr(p, 'stock'): return p.stock
+        if hasattr(p, 'hub_stock'): return p.hub_stock
+        return 0
+        
     return {
         "price_range": price_range,
         "rating_distribution": rating_distribution,
         "brands": brands,
         "colors": colors,
+        "dynamic_attributes": dynamic_attributes_list,
         "total_products": len(products),
-        "in_stock_count": len([p for p in products if p.stock > 0])
+        "in_stock_count": len([p for p in products if get_stock(p) > 0])
     }
 
 @router.get("/categories/{category_id}/filter-counts", tags=["products"])
@@ -905,12 +1396,15 @@ async def get_filter_counts(category_id: int, db: AsyncSession = Depends(get_db)
 
 @router.get("/products/{product_id}", response_model=Product, tags=["products"])
 async def get_product(
-    product_id: int, 
+    product_id: UUID, 
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """Get a single product by ID. Dealers and Admins can see pending products."""
-    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(ProductModel.id == product_id)
+    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
+        ProductModel.id == product_id,
+        ProductModel.is_deleted == False
+    )
     
     # Execute query first to check permissions afterwards if needed, 
     # OR build a smart query. BUILDING A SMART QUERY IS BETTER:
@@ -929,7 +1423,6 @@ async def get_product(
             pass # No extra filter
         # If Dealer, see own products regardless of approval status
         elif current_user.role == UserRole.DEALER:
-            from sqlalchemy import or_
             query = query.where(
                 or_(
                     # Public view
@@ -948,14 +1441,20 @@ async def get_product(
     result = await db.execute(
         query.options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+            joinedload(ProductModel.subcategory).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-            selectinload(ProductModel.children)
+            joinedload(ProductModel.brand),
+            selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
+            selectinload(ProductModel.children).joinedload(ProductModel.subcategory).selectinload(CategoryModel.attributes),
+            selectinload(ProductModel.children).selectinload(ProductModel.children),
+            selectinload(ProductModel.children).joinedload(ProductModel.brand)
         )
     )
     product = result.scalar_one_or_none()
     
     if not product:
         raise HTTPException(status_code=404, detail="Product not found or currently unavailable")
+        
     return product
 
 @router.post("/products/upload-image", response_model=dict, tags=["products"])
@@ -989,7 +1488,7 @@ async def bulk_upload_products(
 ):
     """
     Bulk upload products from CSV file (admin only)
-    CSV Header: name,description,price,stock,category_id,images,discount_price
+    CSV Header: name,description,dealer_price,stock,category_id,images,selling_price
     """
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
@@ -1010,16 +1509,16 @@ async def bulk_upload_products(
     for row_idx, row in enumerate(rows, start=1):
         try:
             # Validate required fields
-            if not row.get('name') or not row.get('price') or not row.get('category_id'):
+            if not row.get('name') or not row.get('dealer_price') or not row.get('category_id'):
                 raise ValueError("Missing required fields (name, price, category_id)")
              
             # Parse numeric fields safely
             try:
-                price = float(row['price'])
+                dealer_price = float(row['dealer_price'])
                 stock = int(row.get('stock', 0))
                 category_id = int(row['category_id'])
-                discount_price_str = row.get('discount_price')
-                discount_price = float(discount_price_str) if discount_price_str else None
+                selling_price_str = row.get('selling_price')
+                discount_price = float(selling_price_str) if selling_price_str else None
             except ValueError:
                 raise ValueError("Invalid numeric format for price, stock, or category_id")
 
@@ -1037,8 +1536,8 @@ async def bulk_upload_products(
             product_data = ProductCreate(
                 name=row['name'],
                 description=row.get('description'),
-                price=price,
-                discount_price=discount_price,
+                dealer_price=dealer_price,
+                selling_price=selling_price,
                 stock=stock,
                 category_id=category_id,
                 images=images_list

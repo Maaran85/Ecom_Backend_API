@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -6,7 +7,7 @@ from models.inventory import MovementType
 # Stock Movement
 class StockMovementResponse(BaseModel):
     id: int
-    product_id: int
+    product_id: UUID
     movement_type: MovementType
     quantity: int
     stock_before: int
@@ -22,7 +23,7 @@ class StockMovementResponse(BaseModel):
 
 # Stock Alert
 class StockAlertCreate(BaseModel):
-    product_id: int
+    product_id: UUID
     threshold: int = Field(default=10, ge=0)
     notify_admin: bool = True
     notify_dealer: bool = True
@@ -35,7 +36,7 @@ class StockAlertUpdate(BaseModel):
 
 class StockAlert(BaseModel):
     id: int
-    product_id: int
+    product_id: UUID
     threshold: int
     is_active: bool
     last_alerted_at: Optional[datetime] = None
@@ -48,7 +49,7 @@ class StockAlert(BaseModel):
 
 # Bulk Stock Update
 class BulkStockUpdateItem(BaseModel):
-    product_id: int
+    product_id: UUID
     quantity: int = Field(..., description="New stock quantity")
     notes: Optional[str] = None
 
@@ -61,5 +62,5 @@ class BulkStockUpdateResponse(BaseModel):
     results: List[dict]
 
 class HubStockAdd(BaseModel):
-    product_id: int
+    product_id: UUID
     quantity: int = Field(..., description="Quantity of stock to add")

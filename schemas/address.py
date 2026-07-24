@@ -10,7 +10,7 @@ class AddressBase(BaseModel):
     address_line1: str
     address_line2: Optional[str] = None
     city: str
-    state: str
+    state_id: int
     pincode: str
     country: str = "India"
     latitude: Optional[str] = None
@@ -26,7 +26,7 @@ class AddressUpdate(BaseModel):
     address_line1: Optional[str] = None
     address_line2: Optional[str] = None
     city: Optional[str] = None
-    state: Optional[str] = None
+    state_id: Optional[int] = None
     pincode: Optional[str] = None
     country: Optional[str] = None
     latitude: Optional[str] = None
@@ -40,6 +40,9 @@ class Address(AddressBase):
     is_default: bool
     created_at: datetime
     updated_at: Optional[datetime] = None
+    
+    state_name: Optional[str] = None
+    state_code: Optional[str] = None
 
     class Config:
         from_attributes = True

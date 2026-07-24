@@ -3,7 +3,7 @@ Analytics & Reporting Router - Sales, Revenue, Product Performance, Customer Ins
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func, desc, case
+from sqlalchemy import select, and_, or_, func, desc, case
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -381,13 +381,19 @@ async def get_dealer_analytics_overview(
     # 11. Support Stats
     queries_query = (
         select(func.count(SupportTicket.id))
-        .where(and_(SupportTicket.dealer_id == dealer_id, SupportTicket.ticket_type == TicketType.QUERY))
+        .where(and_(
+            SupportTicket.dealer_id == dealer_id, 
+            SupportTicket.ticket_type.in_([TicketType.PRODUCT_INQUIRIES, TicketType.ACCOUNT_PROFILE, TicketType.OTHERS])
+        ))
     )
     queries_count = (await db.execute(queries_query)).scalar() or 0
 
     complaints_query = (
         select(func.count(SupportTicket.id))
-        .where(and_(SupportTicket.dealer_id == dealer_id, SupportTicket.ticket_type == TicketType.COMPLAINT))
+        .where(and_(
+            SupportTicket.dealer_id == dealer_id, 
+            SupportTicket.ticket_type.in_([TicketType.ORDER_MANAGEMENT, TicketType.PAYMENT_REFUNDS, TicketType.RETURNS_EXCHANGES, TicketType.TECHNICAL_ISSUES])
+        ))
     )
     complaints_count = (await db.execute(complaints_query)).scalar() or 0
 

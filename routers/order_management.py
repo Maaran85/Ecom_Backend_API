@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from core.database import get_db
 from core.permissions import get_current_active_user, require_admin
-from models import User, Order, OrderItem, OrderReturn, Product, Category, CategoryAttribute, Dealer, CartItem, Coupon, CouponUsage, Payment, ProductVariant
+from models import User, Order, OrderItem, OrderReturn, Product, Category, CategoryAttribute, Dealer, CartItem, Coupon, CouponUsage, Payment
 from models.cart import OrderStatus
 from models.order_return import ReturnStatus
 from models.payment import PaymentStatus
@@ -488,16 +488,18 @@ async def approve_return(
             variant = None
             product = None
             
-            if order_return.exchange_variant_id and order_return.exchange_variant_id > 0:
+            if order_return.exchange_variant_id and order_return.exchange_variant_id != "0":
                 var_res = await db.execute(
-                    select(ProductVariant).where(ProductVariant.id == order_return.exchange_variant_id)
+                    select(Product).where(Product.id == order_return.exchange_variant_id)
                 )
                 variant = var_res.scalar_one_or_none()
-                if variant:
-                    prod_res = await db.execute(select(Product).where(Product.id == variant.product_id))
+                if variant and variant.parent_product_id:
+                    prod_res = await db.execute(select(Product).where(Product.id == variant.parent_product_id))
                     product = prod_res.scalar_one_or_none()
+                else:
+                    product = variant
             else:
-                # Base Product Exchange (None or <= 0)
+                # Base Product Exchange
                 oi_res = await db.execute(
                     select(OrderItem).options(selectinload(OrderItem.product))
                     .where(OrderItem.id == order_return.order_item_id)
@@ -507,7 +509,7 @@ async def approve_return(
                     product = oi.product
             
             # Use product price as fallback if variant missing or base product exchange
-            exchange_price = (variant.price_adjustment + product.price) if (variant and product) else (product.price if product else 0.0)
+            exchange_price = (variant.selling_price or variant.mrp or variant.dealer_price) if variant else ((product.selling_price or product.mrp or product.dealer_price) if product else 0.0)
             exchange_stock = variant.stock if variant else (product.stock if product else 0)
             
             # Calculate extra amount to collect if new item is more expensive
@@ -746,6 +748,11 @@ async def update_tracking(
                     item.payment_status = "paid"
                     if not item.delivered_at:
                         item.delivered_at = datetime.now(timezone.utc)
+                from core.order_status_logic import settle_referral_commissions_for_order
+                await settle_referral_commissions_for_order(db, order.id, credit=True)
+            elif order.status == OrderStatus.CANCELLED:
+                from core.order_status_logic import settle_referral_commissions_for_order
+                await settle_referral_commissions_for_order(db, order.id, credit=False)
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -801,6 +808,7 @@ async def get_order_history(
             joinedload(Product.dealer),
             selectinload(Product.category).selectinload(Category.attributes)
         ),
+        selectinload(Order.items).joinedload(OrderItem.variant),
         selectinload(Order.items).joinedload(OrderItem.hub),
         selectinload(Order.returns).selectinload(OrderReturn.exchange_variant),
         selectinload(Order.shipping_address),

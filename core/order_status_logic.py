@@ -34,9 +34,11 @@ async def calculate_and_update_order_status(db, order_id: int):
                 parent_order.delivered_at = datetime.now(timezone.utc)
             if parent_order.payment and parent_order.payment.status != PaymentStatus.REFUNDED:
                 parent_order.payment.status = PaymentStatus.SUCCESS
+            await settle_referral_commissions_for_order(db, parent_order.id, credit=True)
         else:
             # If all were cancelled/rejected, order is cancelled
             parent_order.status = OrderStatus.CANCELLED
+            await settle_referral_commissions_for_order(db, parent_order.id, credit=False)
     
     # Priority 2: Any out for delivery (High priority "transit" status)
     elif any(s == "out_for_delivery" for s in statuses):
@@ -101,3 +103,51 @@ async def calculate_and_update_order_status(db, order_id: int):
     # Finally commit if inside a task, or let the caller commit
     db.add(parent_order)
     return parent_order
+
+
+async def settle_referral_commissions_for_order(db, order_id: int, credit: bool = True):
+    """
+    Settles pending referral commissions for an order:
+    - If credit=True (Order Delivered): Credits commission amount to referrer's CustomerWallet balance & marks CREDITED.
+    - If credit=False (Order Cancelled/Rejected): Marks pending commission as CANCELLED.
+    """
+    from models.referral import ReferralOrderCommission, CommissionStatus, CustomerWallet
+    result = await db.execute(
+        select(ReferralOrderCommission)
+        .where(ReferralOrderCommission.order_id == order_id)
+        .where(ReferralOrderCommission.status == CommissionStatus.PENDING)
+        .options(selectinload(ReferralOrderCommission.items))
+    )
+    commissions = result.scalars().all()
+    for comm in commissions:
+        new_status = CommissionStatus.CREDITED if credit else CommissionStatus.CANCELLED
+        comm.status = new_status
+        comm.settled_at = datetime.now(timezone.utc)
+        for item_comm in comm.items:
+            item_comm.status = new_status
+
+        if credit and comm.total_commission_amount > 0:
+            w_res = await db.execute(
+                select(CustomerWallet).where(CustomerWallet.customer_id == comm.referrer_id)
+            )
+            wallet = w_res.scalar_one_or_none()
+            if not wallet:
+                wallet = CustomerWallet(
+                    customer_id=comm.referrer_id,
+                    available_balance=comm.total_commission_amount,
+                    lifetime_earned=comm.total_commission_amount
+                )
+                db.add(wallet)
+            else:
+                wallet.available_balance += comm.total_commission_amount
+                wallet.lifetime_earned += comm.total_commission_amount
+
+            from models.referral import WalletTransaction, WalletTransactionType
+            db.add(WalletTransaction(
+                customer_id=comm.referrer_id,
+                amount=comm.total_commission_amount,
+                transaction_type=WalletTransactionType.CREDIT,
+                description=f"Referral commission credited for Order #{order_id}",
+                order_id=order_id
+            ))
+

@@ -1,5 +1,6 @@
-from sqlalchemy import Column, Integer, Float, ForeignKey, String, DateTime, Enum as SQLEnum, Boolean
+from sqlalchemy import Column, Integer, Float, ForeignKey, String, DateTime, Enum as SQLEnum, Boolean, JSON
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 import enum
 from core.database import Base
@@ -9,14 +10,15 @@ class CartItem(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customer_users.id"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
-    variant_id = Column(Integer, ForeignKey("product_variants.id"), nullable=True)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
+    variant_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=True)
     quantity = Column(Integer, default=1)
-    size = Column(String(50), nullable=True) # Selected size
+    size = Column(String, nullable=True)
+    variant_attributes = Column(JSON, nullable=True) # Selected dynamic attributes
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
-    product = relationship("Product")
-    variant = relationship("ProductVariant")
+    product = relationship("Product", foreign_keys=[product_id])
+    variant = relationship("Product", foreign_keys=[variant_id])
     customer = relationship("CustomerUser", backref="cart_items")
 
 class OrderStatus(str, enum.Enum):
@@ -48,6 +50,7 @@ class Order(Base):
     # Pricing
     subtotal = Column(Float, nullable=False)          # Before any discounts (Inclusive of tax)
     discount_amount = Column(Float, default=0.0)      # Coupon discount
+    wallet_amount_used = Column(Float, default=0.0)   # Wallet balance applied to this order
     delivery_charge = Column(Float, default=0.0)      # Total delivery fee
     total_amount = Column(Float, nullable=False)      # Final amount paid by customer
     
@@ -58,7 +61,7 @@ class Order(Base):
     igst_amount      = Column(Float, default=0.0)
     supply_state     = Column(String, nullable=True) # buyer's state code for IGST calc
     is_inter_state   = Column(Boolean, default=False)
-    tax_invoice_no   = Column(String, nullable=True, unique=True, index=True)
+    # tax_invoice_no moved to OrderInvoice
 
     # Platform Revenue
     platform_fee_amount = Column(Float, default=0.0) # Our cut of this order
@@ -70,16 +73,21 @@ class Order(Base):
     # Order status
     status = Column(SQLEnum(OrderStatus), default=OrderStatus.PENDING)
     payment_method = Column(String, default="COD")
+    is_auction_order = Column(Boolean, default=False)
     
     # (Overall payment status removed from order level, now moved to item level)
     
     # Shipping information
     shipping_address_id = Column(Integer, ForeignKey("addresses.id"), nullable=True)
+    billing_address_id = Column(Integer, ForeignKey("addresses.id"), nullable=True)
     tracking_number = Column(String, nullable=True)
     estimated_delivery = Column(DateTime(timezone=True), nullable=True)
     delivered_at = Column(DateTime(timezone=True), nullable=True)
     cancellation_reason = Column(String, nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Invoice
+    tax_invoice_no = Column(String, nullable=True, unique=True)
     
     # POS specific fields
     customer_name = Column(String, nullable=True)
@@ -88,10 +96,12 @@ class Order(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
     
     # Relationships
     items = relationship("OrderItem", back_populates="order")
-    shipping_address = relationship("Address", backref="orders")
+    shipping_address = relationship("Address", backref="orders_shipping", foreign_keys=[shipping_address_id])
+    billing_address = relationship("Address", backref="orders_billing", foreign_keys=[billing_address_id])
     coupon = relationship("Coupon", backref="orders")
     customer = relationship("CustomerUser", backref="orders")
     payment = relationship("Payment", back_populates="order", uselist=False)
@@ -107,18 +117,22 @@ class OrderItem(Base):
     __tablename__ = "order_items"
 
     id = Column(Integer, primary_key=True, index=True)
-    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
-    variant_id = Column(Integer, ForeignKey("product_variants.id"), nullable=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False, index=True)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False)
+    variant_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=True)
     quantity = Column(Integer, nullable=False)
     price = Column(Float, nullable=False)  # Store inclusive price at time of order
-    size = Column(String(50), nullable=True)
+    size = Column(String, nullable=True)
+    variant_attributes = Column(JSON, nullable=True)
     
     # Financial breakdown (Calculated at checkout)
     tax_amount       = Column(Float, default=0.0)
     cgst_rate        = Column(Float, default=0.0)
     sgst_rate        = Column(Float, default=0.0)
     igst_rate        = Column(Float, default=0.0)
+    cgst_amount      = Column(Float, default=0.0)
+    sgst_amount      = Column(Float, default=0.0)
+    igst_amount      = Column(Float, default=0.0)
     hsn_code         = Column(String, nullable=True)
     platform_fee     = Column(Float, default=0.0)
     
@@ -164,8 +178,8 @@ class OrderItem(Base):
     
     # Relationships
     order = relationship("Order", back_populates="items")
-    product = relationship("Product")
-    variant = relationship("ProductVariant")
+    product = relationship("Product", foreign_keys=[product_id])
+    variant = relationship("Product", foreign_keys=[variant_id])
     rider = relationship("DeliveryRider", backref="assigned_items")
     hub = relationship("DeliveryHub", backref="order_items")
     logistics_partner = relationship("LogisticsPartner", back_populates="order_items")

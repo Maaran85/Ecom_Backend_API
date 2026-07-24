@@ -1,11 +1,13 @@
 """
 Inventory Management Router - Stock Alerts, Movement History, Bulk Updates
 """
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from datetime import datetime
 from typing import Optional, List
+from uuid import UUID
 
 from core.database import get_db
 from core.permissions import get_current_active_user, require_admin
@@ -171,7 +173,7 @@ async def delete_stock_alert(
 
 @router.get("/admin/products/{product_id}/stock-history", response_model=List[StockMovementResponse])
 async def get_product_stock_history(
-    product_id: int,
+    product_id: UUID,
     movement_type: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
@@ -200,7 +202,7 @@ async def get_product_stock_history(
 @router.get("/admin/stock-movements", response_model=List[StockMovementResponse])
 async def get_all_stock_movements(
     movement_type: Optional[str] = None,
-    product_id: Optional[int] = None,
+    product_id: Optional[UUID] = None,
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(require_admin),

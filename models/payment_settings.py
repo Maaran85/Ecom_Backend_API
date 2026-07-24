@@ -25,7 +25,7 @@ class PlatformPaymentSettings(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     # Platform fee
-    platform_fee_percent = Column(Float, default=0.0, nullable=False)
+    platform_fee_amount = Column(Float, default=0.0, nullable=False)
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())

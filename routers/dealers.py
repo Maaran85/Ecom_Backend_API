@@ -3,8 +3,9 @@ Dealer management router
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from typing import Optional, List, Any
+from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_, and_
 from core.database import get_db
 from core.permissions import get_current_active_user, require_admin
 from models import User, Dealer, UserRole, Order, OrderItem, Product, DeliveryRider, CustomerUser
@@ -176,14 +177,14 @@ class AuditLogResponse(BaseModel):
 
 async def get_current_dealer(user: User, db: AsyncSession) -> Dealer:
     # 1. Check if user IS the primary dealer user
-    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.user_id == user.id))
+    res = await db.execute(select(Dealer).options(selectinload(Dealer.state_rel)).where(Dealer.is_deleted == False).where(Dealer.user_id == user.id))
     dealer = res.scalar_one_or_none()
     if dealer:
         return dealer
     
     # 2. Check if user is staff (has dealer_id)
     if user.dealer_id:
-        res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == user.dealer_id))
+        res = await db.execute(select(Dealer).options(selectinload(Dealer.state_rel)).where(Dealer.is_deleted == False).where(Dealer.id == user.dealer_id))
         dealer = res.scalar_one_or_none()
         if dealer:
             return dealer
@@ -212,7 +213,7 @@ class DealerDiscountCreate(BaseModel):
     discount_percentage: float
     start_time: datetime
     end_time: datetime
-    product_ids: list[int] = []
+    product_ids: list[UUID] = []
 
 @router.get("/discounts", response_model=list[FlashSaleSchema])
 async def get_dealer_discounts(
@@ -407,18 +408,44 @@ async def get_dealer_orders(
     if status:
         if type in ["return", "exchange"]:
             status_enum_val = str(status).upper()
-            item_match = item_match.join(OrderReturn, or_(OrderReturn.order_item_id == OrderItem.id, OrderReturn.order_item_id.is_(None)))
-            item_match = item_match.where(cast(OrderReturn.status, AlchemyString) == status_enum_val)
-        else:
-            if str(status).lower() == 'cancelled':
-                item_match = item_match.where(or_(
-                    func.lower(OrderItem.status).in_(['cancelled', 'rejected', 'undelivered', 'returned']),
-                    func.lower(cast(Order.status, AlchemyString)) == 'cancelled'
-                ))
-            elif str(status).lower() == 'packaging':
-                item_match = item_match.where(func.lower(OrderItem.status).in_(['packaging', 'packed']), func.lower(cast(Order.status, AlchemyString)) != 'cancelled')
+            if status_enum_val == 'REJECTED':
+                item_match = item_match.join(OrderReturn, or_(OrderReturn.order_item_id == OrderItem.id, OrderReturn.order_item_id.is_(None)))
+                item_match = item_match.where(cast(OrderReturn.status, AlchemyString).in_(['REJECTED', 'PICKUP_FAILED']))
             else:
-                item_match = item_match.where(func.lower(OrderItem.status) == func.lower(status), func.lower(cast(Order.status, AlchemyString)) != 'cancelled')
+                item_match = item_match.join(OrderReturn, or_(OrderReturn.order_item_id == OrderItem.id, OrderReturn.order_item_id.is_(None)))
+                item_match = item_match.where(cast(OrderReturn.status, AlchemyString) == status_enum_val)
+        else:
+            s_lower = str(status).lower()
+            if s_lower in ['cancelled', 'failed', 'rejected', 'undelivered', 'returned']:
+                item_match = item_match.where(or_(
+                    func.lower(OrderItem.status).in_(['cancelled', 'rejected', 'undelivered', 'returned', 'failed']),
+                    func.lower(cast(Order.status, AlchemyString)).in_(['cancelled', 'failed'])
+                ))
+            elif s_lower in ['order_placed', 'new', 'pending']:
+                item_match = item_match.where(
+                    func.lower(OrderItem.status).in_(['order_placed', 'pending']),
+                    func.lower(cast(Order.status, AlchemyString)) != 'cancelled'
+                )
+            elif s_lower == 'confirmed':
+                item_match = item_match.where(
+                    func.lower(OrderItem.status).in_(['confirmed', 'processing']),
+                    func.lower(cast(Order.status, AlchemyString)) != 'cancelled'
+                )
+            elif s_lower == 'packaging':
+                item_match = item_match.where(
+                    func.lower(OrderItem.status).in_(['packaging', 'packed']),
+                    func.lower(cast(Order.status, AlchemyString)) != 'cancelled'
+                )
+            elif s_lower == 'dispatched':
+                item_match = item_match.where(
+                    func.lower(OrderItem.status).in_(['dispatched', 'at_hub']),
+                    func.lower(cast(Order.status, AlchemyString)) != 'cancelled'
+                )
+            else:
+                item_match = item_match.where(
+                    func.lower(OrderItem.status) == s_lower,
+                    func.lower(cast(Order.status, AlchemyString)) != 'cancelled'
+                )
     
     # 3.3 Add global type filtering
     if type == "return":
@@ -427,6 +454,8 @@ async def get_dealer_orders(
     elif type == "exchange":
         item_match = item_match.join(OrderReturn, or_(OrderReturn.order_item_id == OrderItem.id, OrderReturn.order_item_id.is_(None)))
         item_match = item_match.where(OrderReturn.is_exchange == True)
+    elif type == "auction":
+        base_query = base_query.where(Order.is_auction_order == True)
     elif type == "new":
         pass
 
@@ -469,6 +498,7 @@ async def get_dealer_orders(
         .distinct()
         .options(
             selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+            selectinload(Order.items).selectinload(OrderItem.variant),
             selectinload(Order.items).selectinload(OrderItem.rider).selectinload(DeliveryRider.user),
             selectinload(Order.shipping_address),
             selectinload(Order.returns).selectinload(OrderReturn.exchange_variant),
@@ -498,6 +528,40 @@ async def get_dealer_orders(
                      # Match specifically by order_item_id, or if no item is specified (applies to all)
                      item_return = next((r for r in order.returns if r.order_item_id == item.id or r.order_item_id is None), None)
 
+                 if status:
+                     if type in ["return", "exchange"]:
+                         if not item_return:
+                             continue
+                         ret_status_val = str(item_return.status.value if hasattr(item_return.status, 'value') else item_return.status).upper()
+                         status_upper = str(status).upper()
+                         if status_upper == 'REJECTED':
+                             if ret_status_val not in ['REJECTED', 'PICKUP_FAILED']:
+                                 continue
+                         elif ret_status_val != status_upper:
+                             continue
+                     else:
+                         item_status_lower = str(item.status).lower() if item.status else ""
+                         order_status_lower = str(order.status.value if hasattr(order.status, 'value') else order.status).lower() if order.status else ""
+                         s_lower = str(status).lower()
+                         if s_lower in ['cancelled', 'failed', 'rejected', 'undelivered', 'returned']:
+                             if not (item_status_lower in ['cancelled', 'rejected', 'undelivered', 'returned', 'failed'] or order_status_lower in ['cancelled', 'failed']):
+                                 continue
+                         elif s_lower in ['order_placed', 'new', 'pending']:
+                             if not (item_status_lower in ['order_placed', 'pending'] and order_status_lower != 'cancelled'):
+                                 continue
+                         elif s_lower == 'confirmed':
+                             if not (item_status_lower in ['confirmed', 'processing'] and order_status_lower != 'cancelled'):
+                                 continue
+                         elif s_lower == 'packaging':
+                             if not (item_status_lower in ['packaging', 'packed'] and order_status_lower != 'cancelled'):
+                                 continue
+                         elif s_lower == 'dispatched':
+                             if not (item_status_lower in ['dispatched', 'at_hub'] and order_status_lower != 'cancelled'):
+                                 continue
+                         else:
+                             if not (item_status_lower == s_lower and order_status_lower != 'cancelled'):
+                                 continue
+
                  dealer_items.append(OrderItemDealer(
                      id=item.id,
                      item_order_id=getattr(item, 'item_order_id', f"ITEM-{item.id}"),
@@ -505,7 +569,8 @@ async def get_dealer_orders(
                      product_name=prod.name,
                      quantity=item.quantity,
                      price=item.price,
-                     size=item.size,
+                     mrp=(item.variant.mrp if hasattr(item, 'variant') and item.variant and item.variant.mrp else None) or prod.mrp or item.price,
+                     variant_attributes=item.variant_attributes,
                      product_image=prod.images[0] if prod.images else None,
                      status=OrderStatus.CANCELLED.value if order.status == OrderStatus.CANCELLED else item.status,
                      reject_reason=item.reject_reason,
@@ -536,10 +601,7 @@ async def get_dealer_orders(
                      delivery_attempts=getattr(item, 'delivery_attempts', 0),
                      is_exchange=getattr(item_return, 'is_exchange', False) if item_return else False,
                      exchange_variant_id=getattr(item_return, 'exchange_variant_id', None) if item_return else None,
-                     exchange_variant={
-                         "size": item_return.exchange_variant.size if hasattr(item_return.exchange_variant, 'size') else None,
-                         "color": item_return.exchange_variant.color if hasattr(item_return.exchange_variant, 'color') else None
-                     } if item_return and getattr(item_return, 'exchange_variant', None) else None
+                     exchange_variant=item_return.exchange_variant.attributes if item_return and hasattr(item_return.exchange_variant, 'attributes') else None
                  ))
                  dealer_order_total += (item.quantity * item.price)
         
@@ -589,7 +651,12 @@ async def get_dealer_orders(
                 id=order.id,
                 order_number=order.order_number,
                 created_at=order.created_at,
-                total_amount=dealer_order_total,
+                subtotal=order.subtotal,
+                discount_amount=order.discount_amount,
+                delivery_charge=order.delivery_charge,
+                platform_fee_amount=order.platform_fee_amount,
+                coupon_code=order.coupon_code,
+                total_amount=order.total_amount,
                 status=order.status,
                 payment_method=order.payment_method,
                 shipping_address=addr_str,
@@ -610,6 +677,52 @@ async def get_dealer_orders(
         "page": page,
         "limit": limit
     }
+
+@router.get("/auction-bids")
+async def get_dealer_auction_bids(
+    page: int = 1,
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role != UserRole.DEALER:
+        raise HTTPException(status_code=403, detail="Only dealers can access this")
+        
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer not found")
+        
+    from auction.models import AuctionBid, AuctionItem
+    from models.customer_user import CustomerUser
+    from sqlalchemy import select, desc
+    
+    skip = (page - 1) * limit
+    
+    q = (
+        select(AuctionBid, CustomerUser.full_name)
+        .join(AuctionItem, AuctionItem.id == AuctionBid.auction_id)
+        .join(CustomerUser, CustomerUser.id == AuctionBid.user_id)
+        .where(AuctionItem.dealer_id == dealer.id)
+        .order_by(desc(AuctionBid.created_at))
+        .offset(skip)
+        .limit(limit)
+    )
+    
+    res = await db.execute(q)
+    rows = res.all()
+    
+    bids = []
+    for bid, user_name in rows:
+        bids.append({
+            "id": str(bid.id),
+            "auction_id": str(bid.auction_id),
+            "user_name": user_name or 'Customer',
+            "amount": bid.bid_amount,
+            "status": "WINNING" if bid.is_winning else "OUTBID",
+            "time": bid.created_at.isoformat()
+        })
+        
+    return bids
 
 @router.get("/dashboard/stats")
 async def get_dashboard_stats(
@@ -702,6 +815,8 @@ async def get_dashboard_stats(
             .where(Product.dealer_id == dealer_id)
             .where(~Order.order_number.ilike("SR-%"))
         )
+        if type == "auction":
+            q = q.where(Order.is_auction_order == True)
         if hub_id:
             q = q.where(OrderItem.hub_id == hub_id)
         for f in filters:
@@ -786,6 +901,7 @@ async def get_dealer_order_detail(
         .where(Order.id == order_id)
         .options(
             selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+            selectinload(Order.items).selectinload(OrderItem.variant),
             selectinload(Order.items).selectinload(OrderItem.rider).selectinload(DeliveryRider.user),
             selectinload(Order.items).selectinload(OrderItem.hub),
             selectinload(Order.shipping_address),
@@ -838,7 +954,8 @@ async def get_dealer_order_detail(
                  product_name=prod.name,
                  quantity=item.quantity,
                  price=item.price,
-                 size=item.size,
+                 mrp=(item.variant.mrp if hasattr(item, 'variant') and item.variant and item.variant.mrp else None) or prod.mrp or item.price,
+                 variant_attributes=item.variant_attributes,
                  product_image=prod.images[0] if prod.images else None,
                  status=OrderStatus.CANCELLED.value if order.status == OrderStatus.CANCELLED else item.status,
                  reject_reason=item.reject_reason,
@@ -869,10 +986,7 @@ async def get_dealer_order_detail(
                  delivery_attempts=getattr(item, 'delivery_attempts', 0),
                  is_exchange=getattr(item_return, 'is_exchange', False) if item_return else False,
                  exchange_variant_id=getattr(item_return, 'exchange_variant_id', None) if item_return else None,
-                 exchange_variant={
-                     "size": item_return.exchange_variant.size if hasattr(item_return.exchange_variant, 'size') else None,
-                     "color": item_return.exchange_variant.color if hasattr(item_return.exchange_variant, 'color') else None
-                 } if item_return and getattr(item_return, 'exchange_variant', None) else None
+                 exchange_variant=item_return.exchange_variant.attributes if item_return and hasattr(item_return.exchange_variant, 'attributes') else None
              ))
              dealer_order_total += (item.quantity * item.price)
 
@@ -903,7 +1017,12 @@ async def get_dealer_order_detail(
         id=order.id,
         order_number=order.order_number,
         created_at=order.created_at,
-        total_amount=dealer_order_total,
+        subtotal=order.subtotal,
+        discount_amount=order.discount_amount,
+        delivery_charge=order.delivery_charge,
+        platform_fee_amount=order.platform_fee_amount,
+        coupon_code=order.coupon_code,
+        total_amount=order.total_amount,
         status=order.status,
         payment_method=order.payment_method,
         shipping_address=addr_str,
@@ -975,7 +1094,7 @@ async def update_dealer_order_status(
                  product_name=prod.name,
                  quantity=item.quantity,
                  price=item.price,
-                 size=item.size,
+                 variant_attributes=item.variant_attributes,
                  product_image=prod.images[0] if prod.images else None,
                  status=item.status,
                  reject_reason=item.reject_reason,
@@ -1005,6 +1124,11 @@ async def update_dealer_order_status(
     response_data = DealerOrderResponse(
         id=order.id,
         created_at=order.created_at,
+        subtotal=order.subtotal,
+        discount_amount=order.discount_amount,
+        delivery_charge=order.delivery_charge,
+        platform_fee_amount=order.platform_fee_amount,
+        coupon_code=order.coupon_code,
         total_amount=order.total_amount,
         status=order.status, # Overall Order Status
         payment_status=order.payment.status.value if order.payment else "pending",
@@ -1045,14 +1169,20 @@ async def get_available_riders(
     
     dealer = await get_current_dealer(current_user, db)
     dealer_id = dealer.id if dealer else None
+    
+    from models.hub import DeliveryHub
+    hub_result = await db.execute(select(DeliveryHub).where(DeliveryHub.user_id == current_user.id))
+    my_hub = hub_result.scalars().first()
+    my_hub_id = my_hub.id if my_hub else None
 
-    # Show approved riders OR riders managed by this dealer
+    # Show approved riders OR riders managed by this dealer OR riders managed by this hub
     # (Allowing assignment of own riders even if approval status is pending)
     from sqlalchemy import or_
     query = select(DeliveryRider).where(
         or_(
             DeliveryRider.is_approved == True,
-            DeliveryRider.dealer_id == dealer_id if dealer_id else False
+            DeliveryRider.dealer_id == dealer_id if dealer_id else False,
+            DeliveryRider.hub_id == my_hub_id if my_hub_id else False
         )
     ).options(selectinload(DeliveryRider.user))
     
@@ -1095,10 +1225,23 @@ async def get_dealer_riders(
         raise HTTPException(status_code=403, detail="Not authorized")
 
     dealer = await get_current_dealer(current_user, db)
-    if not dealer:
-        raise HTTPException(status_code=404, detail="Dealer profile not found")
+    dealer_id = dealer.id if dealer else None
+    
+    from models.hub import DeliveryHub
+    hub_result = await db.execute(select(DeliveryHub).where(DeliveryHub.user_id == current_user.id))
+    my_hub = hub_result.scalars().first()
+    my_hub_id = my_hub.id if my_hub else None
 
-    stmt = select(DeliveryRider).where(DeliveryRider.dealer_id == dealer.id)
+    if not dealer_id and not my_hub_id:
+        raise HTTPException(status_code=404, detail="Dealer or Hub profile not found")
+
+    from sqlalchemy import or_
+    stmt = select(DeliveryRider).where(
+        or_(
+            DeliveryRider.dealer_id == dealer_id if dealer_id else False,
+            DeliveryRider.hub_id == my_hub_id if my_hub_id else False
+        )
+    )
     
     if hub_id:
         stmt = stmt.where(DeliveryRider.hub_id == hub_id)
@@ -1531,7 +1674,7 @@ async def update_dealer_order_item(
         product_name=prod.name,
         quantity=item.quantity,
         price=item.price,
-        size=item.size,
+        variant_attributes=item.variant_attributes,
         product_image=prod.images[0] if prod.images else None,
         status=item.status,
         reject_reason=item.reject_reason,
@@ -1976,7 +2119,7 @@ async def delivery_preview(
     for ci in cart_items:
         if ci.product and ci.product.dealer_id:
             d_id = ci.product.dealer_id
-            price = float(ci.product.discount_price or ci.product.price)
+            price = float(ci.product.selling_price or ci.product.mrp or ci.product.dealer_price)
             dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + price * ci.quantity
 
     if not dealer_subtotals:
@@ -2183,7 +2326,7 @@ class HubUpdate(BaseModel):
 
 class HubResponse(BaseModel):
     id: int
-    dealer_id: int
+    dealer_id: UUID
     name: str
     address: str
     city: Optional[str] = None
@@ -2209,6 +2352,7 @@ class HubResponse(BaseModel):
     item_count: int = 0
     user_id: Optional[int] = None
     email: Optional[str] = None
+    auction_reserved: Optional[int] = 0
 
     class Config:
         from_attributes = True
@@ -2286,7 +2430,7 @@ async def get_my_hub_profile(
 @router.get("/hubs", response_model=List[HubResponse])
 async def get_dealer_hubs(
     active_only: bool = True,
-    product_id: Optional[int] = None,
+    product_id: Optional[UUID] = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2341,15 +2485,42 @@ async def get_dealer_hubs(
     if hubs and product_id:
         try:
             hub_ids = [h.id for h in hubs]
-            stock_query = select(ProductInventory.hub_id, ProductInventory.stock).where(
+            
+            # Find all variant IDs
+            children_query = select(Product.id).where(Product.parent_product_id == product_id)
+            children_res = await db.execute(children_query)
+            variant_ids = [r for r, in children_res.all()]
+            all_ids_to_check = [product_id] + variant_ids
+            
+            stock_query = select(ProductInventory.hub_id, sqlfunc.sum(ProductInventory.stock)).where(
                 ProductInventory.hub_id.in_(hub_ids),
-                ProductInventory.product_id == product_id
-            )
+                ProductInventory.product_id.in_(all_ids_to_check)
+            ).group_by(ProductInventory.hub_id)
+            
             stock_result = await db.execute(stock_query)
             for row in stock_result.all():
-                stock_map[row[0]] = row[1]
+                stock_map[row[0]] = row[1] or 0
         except Exception as e:
             print(f"Error fetching stock: {e}")
+
+    auction_map = {}
+    if hubs and product_id:
+        try:
+            from auction.models import AuctionItem, AuctionStatus
+            hub_ids = [h.id for h in hubs]
+            
+            auction_query = select(AuctionItem.hub_id, sqlfunc.sum(AuctionItem.qty)).where(
+                AuctionItem.hub_id.in_(hub_ids),
+                AuctionItem.product_id == product_id,
+                AuctionItem.status.in_([AuctionStatus.ACTIVE, AuctionStatus.PENDING])
+            ).group_by(AuctionItem.hub_id)
+            
+            auction_result = await db.execute(auction_query)
+            for row in auction_result.all():
+                if row[0] is not None:
+                    auction_map[row[0]] = row[1] or 0
+        except Exception as e:
+            print(f"Error fetching auction stock: {e}")
 
     response = []
     for hub in hubs:
@@ -2635,37 +2806,41 @@ async def get_hub_items(
     # Fetch standard items
     items_result = await db.execute(
         select(OrderItem)
+        .join(Product, OrderItem.product_id == Product.id)
         .options(
             selectinload(OrderItem.product).selectinload(Product.dealer),
             selectinload(OrderItem.order).selectinload(Order.customer),
             selectinload(OrderItem.order).selectinload(Order.shipping_address),
             selectinload(OrderItem.rider).selectinload(DeliveryRider.user),
         )
-        .where(OrderItem.hub_id == hub_id)
-        .where(OrderItem.status.notin_(["delivered", "rejected", "cancelled", "returned", "picked_up", "returning", "pickup_failed"]))
+        .where(
+            or_(
+                OrderItem.hub_id == hub_id,
+                and_(OrderItem.hub_id.is_(None), Product.dealer_id == dealer.id)
+            )
+        )
         .order_by(OrderItem.id.desc())
     )
     items = items_result.scalars().all()
     
-    # Fetch returns assigned to this hub
+    # Fetch returns assigned to this hub or dealer
     returns_result = await db.execute(
         select(OrderReturn)
+        .join(OrderItem, OrderReturn.order_item_id == OrderItem.id)
+        .join(Product, OrderItem.product_id == Product.id)
         .options(
             selectinload(OrderReturn.order_item).selectinload(OrderItem.product).selectinload(Product.dealer),
             selectinload(OrderReturn.order).selectinload(Order.customer),
             selectinload(OrderReturn.order).selectinload(Order.shipping_address),
             selectinload(OrderReturn.customer),
         )
-        .where(OrderReturn.hub_id == hub_id)
-        .where(OrderReturn.status.in_([
-            ReturnStatus.REQUESTED,
-            ReturnStatus.APPROVED,
-            ReturnStatus.OUT_FOR_PICKUP,
-            ReturnStatus.OUT_FOR_SWAP,
-            ReturnStatus.PICKUP_FAILED,
-            ReturnStatus.PICKED_UP,
-            ReturnStatus.COMPLETED
-        ]))
+        .where(
+            or_(
+                OrderReturn.hub_id == hub_id,
+                and_(OrderReturn.hub_id.is_(None), Product.dealer_id == dealer.id)
+            )
+        )
+        .order_by(OrderReturn.id.desc())
     )
     returns = returns_result.scalars().all()
 
@@ -2685,7 +2860,7 @@ async def get_hub_items(
             "product_image": item.product.images[0] if item.product and item.product.images else None,
             "quantity": item.quantity,
             "price": item.price,
-            "size": item.size,
+            "variant_attributes": item.variant_attributes,
             "status": item.status,
             "dispatch_date": item.dispatch_date.isoformat() if item.dispatch_date else None,
             "accepted_at": item.accepted_at.isoformat() if item.accepted_at else None,
@@ -2693,7 +2868,7 @@ async def get_hub_items(
             "customer_name": order.customer.full_name if (order and order.customer) else None,
             "customer_phone": order.customer.phone if (order and order.customer) else None,
             "shipping_address": (
-                f"{order.shipping_address.address_line1}{', ' + order.shipping_address.address_line2 if order.shipping_address.address_line2 else ''}{', ' + order.shipping_address.landmark if hasattr(order.shipping_address, 'landmark') and order.shipping_address.landmark else ''}, {order.shipping_address.city}, {order.shipping_address.state} - {order.shipping_address.pincode}"
+                f"{order.shipping_address.address_line1}{', ' + order.shipping_address.address_line2 if order.shipping_address.address_line2 else ''}{', ' + order.shipping_address.landmark if hasattr(order.shipping_address, 'landmark') and order.shipping_address.landmark else ''}, {order.shipping_address.city} - {order.shipping_address.pincode}"
                 if (order and order.shipping_address) else None
             ),
             "rider_id": item.rider_id,
@@ -2720,7 +2895,7 @@ async def get_hub_items(
             "product_image": item.product.images[0] if item and item.product and item.product.images else None,
             "quantity": item.quantity if item else 1,
             "price": item.price if item else 0,
-            "size": item.size if item else None,
+            "variant_attributes": item.variant_attributes if item else None,
             "status": ret.status.value if hasattr(ret.status, 'value') else ret.status,
             "customer_name": ret.customer.full_name if ret.customer else (order.customer.full_name if (order and order.customer) else None),
             "customer_phone": ret.customer.phone if ret.customer else (order.customer.phone if (order and order.customer) else None),
@@ -3135,7 +3310,7 @@ async def remove_serviceable_pincode(
 # Moved dealer_id routes to prevent shadowing
 @router.get("/{dealer_id}", response_model=DealerSchema)
 async def get_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -3153,7 +3328,7 @@ async def get_dealer(
 
 @router.put("/{dealer_id}", response_model=DealerSchema)
 async def update_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     dealer_data: DealerUpdate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
@@ -3195,7 +3370,7 @@ async def update_dealer(
 
 @router.put("/{dealer_id}/approve", response_model=DealerSchema)
 async def approve_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -3262,7 +3437,7 @@ class RejectReasonPayload(BaseModel):
 
 @router.put("/{dealer_id}/reject", response_model=DealerSchema)
 async def reject_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     payload: RejectReasonPayload,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
@@ -3638,7 +3813,7 @@ async def delete_dealer_user(
 
 @router.post("/products/{product_id}/stock", status_code=status.HTTP_200_OK)
 async def update_dealer_stock(
-    product_id: int,
+    product_id: UUID,
     payload: DealerStockUpdate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)

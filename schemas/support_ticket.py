@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -40,10 +41,10 @@ class SupportTicketResponse(BaseModel):
     id: int
     ticket_number: str
     customer_id: int
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
     partner_id: Optional[int] = None
     order_id: Optional[int] = None
-    product_id: Optional[int] = None
+    product_id: Optional[UUID] = None
     
     subject: str
     description: str

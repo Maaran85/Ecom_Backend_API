@@ -1,3 +1,5 @@
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, JSON, ForeignKey
 from sqlalchemy.sql import func
 from core.database import Base
@@ -19,7 +21,7 @@ class FlashSale(Base):
     # Applicability
     product_ids = Column(JSON, nullable=True)  # List of specific product IDs
     category_ids = Column(JSON, nullable=True)  # Or entire categories
-    dealer_id = Column(Integer, ForeignKey("dealers.id", ondelete="CASCADE"), nullable=True)
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey("dealers.id", ondelete="CASCADE"), nullable=True)
     
     # Status
     is_active = Column(Boolean, default=True, nullable=False)

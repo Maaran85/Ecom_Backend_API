@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean, Enum as SAEnum, JSON
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import UUID
 import enum
 from datetime import datetime, timezone
 from core.database import Base
@@ -50,10 +51,10 @@ class SupportTicket(Base):
     ticket_number = Column(String(50), unique=True, index=True, nullable=True) # E.g., TKT-123456
     
     customer_id = Column(Integer, ForeignKey("customer_users.id"), nullable=False, index=True)
-    dealer_id = Column(Integer, ForeignKey("dealers.id"), nullable=True, index=True)
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey("dealers.id"), nullable=True, index=True)
     partner_id = Column(Integer, ForeignKey("partners.id"), nullable=True, index=True)
     order_id = Column(Integer, ForeignKey("orders.id"), nullable=True, index=True)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=True, index=True)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=True, index=True)
     
     ticket_type = Column(SAEnum(TicketType), nullable=False, default=TicketType.OTHERS)
     status = Column(SAEnum(TicketStatus), default=TicketStatus.OPEN)

@@ -1,6 +1,7 @@
 """
 Bulk discounts management router
 """
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -55,7 +56,7 @@ async def list_bulk_discounts(
 
 @router.get("/product/{product_id}", response_model=list[BulkDiscountSchema])
 async def get_product_bulk_discounts(
-    product_id: int,
+    product_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
     """Get bulk discounts for a specific product"""

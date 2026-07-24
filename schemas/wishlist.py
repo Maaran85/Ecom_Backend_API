@@ -1,11 +1,11 @@
+from uuid import UUID
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
 # Wishlist Schemas
 class WishlistItemBase(BaseModel):
-    product_id: int
-    variant_id: Optional[int] = None
+    product_id: UUID
 
 class WishlistItemCreate(WishlistItemBase):
     pass
@@ -24,8 +24,5 @@ class WishlistItemWithProduct(WishlistItem):
     product_price: Optional[float] = None
     product_discount_price: Optional[float] = None
     product_images: Optional[list] = None
-    variant_size: Optional[str] = None
-    variant_color: Optional[str] = None
-
     class Config:
         from_attributes = True

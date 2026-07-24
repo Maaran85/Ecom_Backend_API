@@ -4,6 +4,8 @@ from typing import Optional, List
 class StateBase(BaseModel):
     name: str
     country_id: int
+    state_code: Optional[str] = None
+    type: Optional[str] = None
     is_active: bool = True
 
 class State(StateBase):

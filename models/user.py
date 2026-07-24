@@ -1,3 +1,5 @@
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -63,7 +65,7 @@ class User(Base):
 
     # Association with a dealer (for dealer staff and hub managers)
     from sqlalchemy import ForeignKey
-    dealer_id = Column(Integer, ForeignKey('dealers.id'), nullable=True)
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey('dealers.id'), nullable=True)
     hub_id = Column(Integer, ForeignKey('delivery_hubs.id'), nullable=True)
     logistics_partner_id = Column(Integer, ForeignKey('logistics_partners.id'), nullable=True)
     partner_id = Column(Integer, ForeignKey('partners.id'), nullable=True)

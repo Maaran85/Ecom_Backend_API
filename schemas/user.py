@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, Any
 from datetime import datetime
@@ -19,7 +20,7 @@ class UserInDBBase(UserBase):
     id: int
     role: UserRole
     is_active: bool
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
     hub_id: Optional[int] = None
     logistics_partner_id: Optional[int] = None
     partner_id: Optional[int] = None
@@ -58,7 +59,7 @@ class User(UserInDBBase):
 class AdminUserCreate(UserBase):
     password: str
     role: str
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
     hub_id: Optional[int] = None
     logistics_partner_id: Optional[int] = None
     partner_id: Optional[int] = None
@@ -77,7 +78,7 @@ class AdminUserUpdate(UserBase):
     email: Optional[EmailStr] = None
     password: Optional[str] = None
     role: Optional[str] = None
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
     hub_id: Optional[int] = None
     logistics_partner_id: Optional[int] = None
     partner_id: Optional[int] = None

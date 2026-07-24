@@ -5,11 +5,13 @@ from core.database import Base
 from core.config import settings
 from sqlalchemy_utils import EncryptedType
 from sqlalchemy_utils.types.encrypted.encrypted_type import AesEngine
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 
 class Dealer(Base):
     __tablename__ = "dealers"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), unique=True, nullable=False)
     business_name = Column(String, nullable=False)
     business_address = Column(String, nullable=True)
@@ -18,15 +20,27 @@ class Dealer(Base):
     partner_id = Column(Integer, ForeignKey('partners.id'), nullable=True)
     
     # Statuses
+    @property
+    def is_verified(self):
+        return self.is_approved and self.profile_status == 'completed'
+        
+    @property
+    def state_name(self):
+        return self.state_rel.name if self.state_rel else None
+
+    @property
+    def state_code(self):
+        return self.state_rel.state_code if self.state_rel else None
+
     profile_status = Column(String, default="draft", nullable=False) # draft, pending, completed
     access_status = Column(String, default="pending", nullable=False)  # pending, active, reject
     is_active = Column(Boolean, default=True, nullable=False)
     is_deleted = Column(Boolean, default=False, nullable=False)
+    is_auction_enabled = Column(Boolean, default=False, nullable=False)
     reject_reason = Column(String, nullable=True)
     
     # Company Details Extension
     city = Column(String, nullable=True)
-    state = Column(String, nullable=True)
     pincode = Column(String, nullable=True)
     country_id = Column(Integer, ForeignKey('countries.id'), nullable=True)
     state_id = Column(Integer, ForeignKey('states.id'), nullable=True)
@@ -45,6 +59,7 @@ class Dealer(Base):
     cin_number = Column(String, nullable=True)
     cin_certificate_url = Column(String, nullable=True)
     company_logo_url = Column(String, nullable=True)
+    signature_image_url = Column(String, nullable=True)
     
     # Bank Details
     bank_name = Column(String, nullable=True)
@@ -60,7 +75,7 @@ class Dealer(Base):
     estimated_delivery_days = Column(Integer, default=7, nullable=False) # e.g. 5 means 5 days from order date
     
     # Financial Settings
-    platform_fee_percent = Column(Float, default=5.0, nullable=False)  # The % the platform takes from each sale
+    platform_fee_amount = Column(Float, default=5.0, nullable=False)  # The flat amount the platform takes from each sale
     free_delivery_above = Column(Float, default=0.0, nullable=False)    # 0 = always free; >0 = waived above this amount
     estimated_delivery_days = Column(Integer, default=7, nullable=False) # e.g. 5 means 5 days from order date
 

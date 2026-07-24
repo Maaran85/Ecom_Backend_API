@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, List
 from datetime import datetime
@@ -36,7 +37,7 @@ class RiderAdminCreate(RiderBase):
 class RiderCreate(RiderBase):
     user_id: int
     managed_by: str = "admin"
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
 
 class RiderSelfRegistration(BaseModel):
     full_name: str
@@ -64,7 +65,7 @@ class Rider(RiderBase):
     id: int
     user_id: int
     managed_by: str
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
     partner_id: Optional[int] = None
     is_available: bool
     current_status: str
@@ -118,10 +119,10 @@ class OrderItemForRider(BaseModel):
     id: int
     order_number: str
     product_name: str
-    product_id: int
+    product_id: UUID
     quantity: int
     price: float
-    size: Optional[str]
+    variant_attributes: Optional[dict] = None
     shipping_address: Optional[str]
     customer_name: Optional[str]
     customer_phone: Optional[str]
@@ -130,7 +131,6 @@ class OrderItemForRider(BaseModel):
     payment_method: str = "COD"
     total_amount: float = 0.0
     delivery_attempts: int = 0
-    color: Optional[str] = None
     product_image: Optional[str] = None
     rider_payment_method: Optional[str] = None  # online, cash, upi — set by rider at delivery
     is_exchange: bool = False
@@ -144,10 +144,9 @@ class RiderReturnTask(BaseModel):
     return_id: int
     order_number: str
     product_name: str
-    product_id: int
+    product_id: UUID
     quantity: int
-    size: Optional[str] = None
-    color: Optional[str] = None
+    variant_attributes: Optional[dict] = None
     product_image: Optional[str] = None
     pickup_address: str
     customer_name: Optional[str]
@@ -155,8 +154,7 @@ class RiderReturnTask(BaseModel):
     status: str
     reason: str
     is_exchange: bool = False
-    exchange_size: Optional[str] = None
-    exchange_color: Optional[str] = None
+    exchange_variant_attributes: Optional[dict] = None
     pickup_attempts: int = 0
     pickup_date: Optional[datetime] = None
     created_at: datetime

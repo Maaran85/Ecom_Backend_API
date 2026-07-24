@@ -1,9 +1,9 @@
 from .user import User, UserRole
 from .customer_user import CustomerUser
-from .product import Category, Product, CategoryAttribute
+from .product import Category, Product, CategoryAttribute, Brand, SubcategoryBrand
 from .cart import CartItem, Order, OrderItem, OrderStatus
+from .invoice import OrderInvoice
 from .dealer import Dealer
-from .product_variant import ProductVariant
 from .address import Address, AddressType
 from .review import Review, ReviewVote
 from .wishlist import WishlistItem
@@ -33,13 +33,13 @@ from .dealer_remittance import DealerRemittance
 from .recharge import RechargeTransaction, RechargeStatus
 from .reward import SpinConfig, SpinToken, SpinResult, RewardPrize, MonthlyLeaderboard, SpinSource, RewardSession, RewardSessionStatus
 from .partner import Partner
+from auction.models import AuctionItem, AuctionBid
 
 __all__ = [
     "User", "UserRole", "CustomerUser",
-    "Category", "Product", "CategoryAttribute",
+    "Category", "Product", "CategoryAttribute", "Brand", "SubcategoryBrand",
     "CartItem", "Order", "OrderItem", "OrderStatus",
     "Dealer",
-    "ProductVariant",
     "Address", "AddressType",
     "Review", "ReviewVote",
     "WishlistItem", "ConsentLog",
@@ -65,7 +65,8 @@ __all__ = [
     "DealerRemittance",
     "RechargeTransaction", "RechargeStatus",
     "SpinConfig", "SpinToken", "SpinResult", "RewardPrize", "MonthlyLeaderboard", "SpinSource", "RewardSession", "RewardSessionStatus",
-    "Partner"
+    "Partner",
+    "AuctionItem", "AuctionBid"
 ]
 
 # Dynamically calculate stock from ProductInventory to avoid circular imports and premature mapper initialization

@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -9,9 +10,9 @@ class FlashSaleBase(BaseModel):
     discount_percentage: float = Field(..., gt=0, le=100)
     start_time: datetime
     end_time: datetime
-    product_ids: Optional[List[int]] = None
+    product_ids: Optional[List[UUID]] = None
     category_ids: Optional[List[int]] = None
-    dealer_id: Optional[int] = None
+    dealer_id: Optional[UUID] = None
 
 class FlashSaleCreate(FlashSaleBase):
     is_active: bool = True
@@ -22,7 +23,7 @@ class FlashSaleUpdate(BaseModel):
     discount_percentage: Optional[float] = Field(None, gt=0, le=100)
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    product_ids: Optional[List[int]] = None
+    product_ids: Optional[List[UUID]] = None
     category_ids: Optional[List[int]] = None
     is_active: Optional[bool] = None
 

@@ -6,7 +6,6 @@ from .admin import router as admin_router
 from .wishlist import router as wishlist_router
 from .addresses import router as addresses_router
 from .reviews import router as reviews_router
-from .variants import router as variants_router
 from .coupons import router as coupons_router
 from .flash_sales import router as flash_sales_router
 from .bulk_discounts import router as bulk_discounts_router
@@ -29,11 +28,12 @@ from .logistics import router as logistics_router
 from .recharge import router as recharge_router
 from .rewards import router as rewards_router
 from .partners import router as partners_router
+from .referrals import router as referrals_router
 
 __all__ = [
     "auth_router", "products_router", "cart_router",
     "dealers_router", "admin_router",
-    "wishlist_router", "addresses_router", "reviews_router", "variants_router",
+    "wishlist_router", "addresses_router", "reviews_router",
     "coupons_router", "flash_sales_router", "bulk_discounts_router",
     "payments_router", "order_management_router",
     "inventory_router", "notifications_router",
@@ -41,5 +41,5 @@ __all__ = [
     "riders_router", "rider_reviews_router", "locations_router",
     "showroom_router", "dealer_docs_router", "payment_settings_router",
     "finance_router", "logistics_router",
-    "rewards_router", "partners_router"
+    "rewards_router", "partners_router", "referrals_router"
 ]

@@ -1,8 +1,9 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 from models.order_return import ReturnStatus
-import schemas.product_variant
+import schemas.product
 
 # Order Cancellation
 class OrderCancelRequest(BaseModel):
@@ -20,7 +21,7 @@ class ReturnRequest(BaseModel):
     description: Optional[str] = Field(None, max_length=1000)
     images: Optional[List[str]] = None  # Image URLs
     is_exchange: bool = False
-    exchange_variant_id: Optional[int] = None
+    exchange_variant_id: Optional[UUID] = None
     pickup_date: Optional[datetime] = None
 
 class ReturnResponse(BaseModel):
@@ -56,8 +57,8 @@ class OrderReturn(BaseModel):
     description: Optional[str] = None
     images: Optional[List[str]] = None
     is_exchange: bool = False
-    exchange_variant_id: Optional[int] = None
-    exchange_variant: Optional["schemas.product_variant.ProductVariant"] = None
+    exchange_variant_id: Optional[UUID] = None
+    exchange_product: Optional["schemas.product.Product"] = None
     replacement_order_id: Optional[int] = None
     status: ReturnStatus
     admin_notes: Optional[str] = None
@@ -90,7 +91,7 @@ class AdminReturnDetail(BaseModel):
     description: Optional[str] = None
     images: Optional[List[str]] = None
     is_exchange: bool = False
-    exchange_variant_id: Optional[int] = None
+    exchange_variant_id: Optional[UUID] = None
     replacement_order_id: Optional[int] = None
     status: ReturnStatus
     admin_notes: Optional[str] = None

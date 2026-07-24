@@ -3,7 +3,6 @@ from .auth import Token, TokenData, LoginRequest
 from .product import Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate, Product, ProductCreate, ProductUpdate
 from .cart import CartItem, CartItemCreate, Order, OrderCreate, OrderItem
 from .dealer import Dealer, DealerCreate, DealerUpdate, DealerWithUser
-from .product_variant import ProductVariant, ProductVariantCreate, ProductVariantUpdate
 from .address import Address, AddressCreate, AddressUpdate
 from .review import Review, ReviewCreate, ReviewUpdate, ReviewWithUser, ReviewVote, ReviewVoteCreate
 from .wishlist import WishlistItem, WishlistItemCreate, WishlistItemWithProduct
@@ -38,7 +37,6 @@ __all__ = [
     "CartItem", "CartItemCreate",
     "Order", "OrderCreate", "OrderItem",
     "Dealer", "DealerCreate", "DealerUpdate", "DealerWithUser",
-    "ProductVariant", "ProductVariantCreate", "ProductVariantUpdate",
     "Address", "AddressCreate", "AddressUpdate",
     "Review", "ReviewCreate", "ReviewUpdate", "ReviewWithUser",
     "ReviewVote", "ReviewVoteCreate",

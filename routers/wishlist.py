@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from core.database import get_db
 from core.permissions import get_current_active_user
-from models import User, WishlistItem, Product, ProductVariant, CustomerUser
+from models import User, WishlistItem, Product, CustomerUser
 from schemas.wishlist import WishlistItemCreate, WishlistItem as WishlistItemSchema, WishlistItemWithProduct
 
 router = APIRouter()
@@ -19,6 +19,12 @@ async def add_to_wishlist(
 ):
     """Add product to wishlist"""
     
+    if not isinstance(current_user, CustomerUser):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only customers can use the wishlist"
+        )
+        
     # Check if product exists
     result = await db.execute(select(Product).where(Product.id == item_data.product_id))
     product = result.scalar_one_or_none()
@@ -33,23 +39,18 @@ async def add_to_wishlist(
     result = await db.execute(
         select(WishlistItem).where(
             WishlistItem.customer_id == current_user.id,
-            WishlistItem.product_id == item_data.product_id,
-            WishlistItem.variant_id == item_data.variant_id
+            WishlistItem.product_id == item_data.product_id
         )
     )
     existing = result.scalar_one_or_none()
     
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Product already in wishlist"
-        )
+        return existing
     
     # Add to wishlist
     wishlist_item = WishlistItem(
         customer_id=current_user.id,
-        product_id=item_data.product_id,
-        variant_id=item_data.variant_id
+        product_id=item_data.product_id
     )
     
     db.add(wishlist_item)
@@ -64,6 +65,12 @@ async def get_wishlist(
     db: AsyncSession = Depends(get_db)
 ):
     """Get user's wishlist with product details"""
+    if not isinstance(current_user, CustomerUser):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only customers can use the wishlist"
+        )
+
     result = await db.execute(
         select(WishlistItem).where(WishlistItem.customer_id == current_user.id)
     )
@@ -75,19 +82,12 @@ async def get_wishlist(
         product_result = await db.execute(select(Product).where(Product.id == item.product_id))
         product = product_result.scalar_one_or_none()
         
-        variant = None
-        if item.variant_id:
-            variant_result = await db.execute(select(ProductVariant).where(ProductVariant.id == item.variant_id))
-            variant = variant_result.scalar_one_or_none()
-        
         enriched_item = {
             **item.__dict__,
             "product_name": product.name if product else None,
-            "product_price": product.price if product else None,
-            "product_discount_price": product.discount_price if product else None,
+            "product_price": product.dealer_price if product else None,
+            "product_discount_price": product.selling_price if product else None,
             "product_images": product.images if product else None,
-            "variant_size": variant.size if variant else None,
-            "variant_color": variant.color if variant else None,
         }
         enriched_items.append(enriched_item)
     

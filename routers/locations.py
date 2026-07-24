@@ -1,3 +1,4 @@
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -72,7 +73,7 @@ from schemas.location import ServiceabilityCheckResponse
 @router.get("/check-serviceability", response_model=ServiceabilityCheckResponse)
 async def check_serviceability(
     pincode: str, 
-    product_id: int, 
+    product_id: UUID, 
     lat: float = None, 
     long: float = None, 
     db: AsyncSession = Depends(get_db)

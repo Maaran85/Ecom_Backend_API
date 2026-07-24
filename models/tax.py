@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, Boolean, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import UUID
 from core.database import Base
 
 
@@ -40,7 +41,7 @@ class TaxRule(Base):
     # If set, applies to all products in this category
     category_id = Column(Integer, ForeignKey("categories.id", ondelete="CASCADE"), nullable=True)
     # If set, applies to this specific product (overrides category rule)
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=True)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=True)
     
     tax_category_id = Column(Integer, ForeignKey("tax_categories.id"), nullable=False)
     

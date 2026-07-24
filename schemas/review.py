@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -10,7 +11,7 @@ class ReviewBase(BaseModel):
     images: Optional[List[str]] = None
 
 class ReviewCreate(ReviewBase):
-    product_id: int
+    product_id: UUID
 
 class ReviewUpdate(BaseModel):
     rating: Optional[int] = Field(None, ge=1, le=5)
@@ -20,7 +21,7 @@ class ReviewUpdate(BaseModel):
 
 class Review(ReviewBase):
     id: int
-    product_id: int
+    product_id: UUID
     customer_id: int
     order_id: Optional[int] = None
     is_verified_purchase: bool

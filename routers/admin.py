@@ -1,6 +1,7 @@
 """
 Admin dashboard and management router
 """
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Optional
 from pydantic import BaseModel
@@ -48,6 +49,7 @@ class DealerAdminCreate(BaseModel):
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
+    is_auction_enabled: bool = False
 
 class DealerAdminUpdate(BaseModel):
     full_name: Optional[str] = None
@@ -77,7 +79,8 @@ class DealerAdminUpdate(BaseModel):
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
-    platform_fee_percent: Optional[float] = None
+    is_auction_enabled: Optional[bool] = None
+    platform_fee_amount: Optional[float] = None
 
 @router.get("/stats")
 async def get_dashboard_stats(
@@ -189,7 +192,7 @@ async def get_pending_approvals(
             for d in pending_dealers
         ],
         "pending_products": [
-            {"id": p.id, "name": p.name, "dealer_id": p.dealer_id, "price": p.price, "created_at": p.created_at}
+            {"id": str(p.id), "name": p.name, "dealer_id": str(p.dealer_id), "price": p.dealer_price, "mrp": p.mrp, "created_at": p.created_at}
             for p in pending_products
         ]
     }
@@ -199,7 +202,7 @@ async def list_all_users(
     skip: int = 0,
     limit: int = 200,
     role: str = None,
-    dealer_id: int = None,
+    dealer_id: UUID = None,
     logistics_partner_id: int = None,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
@@ -273,6 +276,31 @@ async def list_all_users(
         for u in users
     ]
 
+def _manual_decrypt(val: str) -> str:
+    if not val or len(val) < 20: return val
+    try:
+        from sqlalchemy_utils.types.encrypted.encrypted_type import AesEngine
+        from core.config import settings
+        engine = AesEngine()
+        engine._update_key(settings.ENCRYPTION_KEY)
+        decrypted = engine.decrypt(val)
+        if isinstance(decrypted, bytes):
+            return decrypted.decode('utf-8')
+        return str(decrypted) if decrypted else val
+    except Exception:
+        pass
+    
+    try:
+        import base64
+        from cryptography.fernet import Fernet
+        from core.config import settings
+        key = base64.urlsafe_b64encode(settings.ENCRYPTION_KEY.encode()[:32].ljust(32, b'0'))
+        f = Fernet(key)
+        return f.decrypt(val.encode()).decode()
+    except Exception:
+        pass
+    return val
+
 @router.get("/dealers")
 async def list_all_dealers(
     skip: int = 0,
@@ -298,12 +326,12 @@ async def list_all_dealers(
             "is_approved": d.is_approved, "profile_status": d.profile_status,
             "access_status": d.access_status, "created_at": d.created_at,
             "business_phone": d.business_phone,
-            "city": d.city, "state": d.state, "pincode": d.pincode,
+            "city": d.city, "pincode": d.pincode,
             "country_id": d.country_id, "country_name": d.country.name if d.country else None,
             "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
             "partner_id": d.partner_id,
             "pan_number": d.pan_number, "bank_name": d.bank_name,
-            "account_number": d.account_number, "ifsc_code": d.ifsc_code,
+            "account_number": _manual_decrypt(d.account_number), "ifsc_code": _manual_decrypt(d.ifsc_code),
             "reject_reason": d.reject_reason, "is_active": d.is_active,
             "company_photo_url": d.company_photo_url, "gst_certificate_url": d.gst_certificate_url,
             "incorporation_certificate_url": d.incorporation_certificate_url,
@@ -315,6 +343,7 @@ async def list_all_dealers(
             "lat_long": d.lat_long
         }
         for d in dealers
+
     ]
 
 @router.get("/logistics-partners")
@@ -433,7 +462,7 @@ async def list_unsettled_orders(
 
 @router.get("/dealers/{dealer_id}/logistics")
 async def list_dealer_logistics(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -454,7 +483,7 @@ async def list_dealer_logistics(
 
 @router.post("/dealers/{dealer_id}/logistics/{partner_id}")
 async def map_logistics_to_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     partner_id: int,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
@@ -481,7 +510,7 @@ async def map_logistics_to_dealer(
 
 @router.delete("/dealers/{dealer_id}/logistics/{partner_id}")
 async def unmap_logistics_from_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     partner_id: int,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
@@ -505,7 +534,7 @@ async def unmap_logistics_from_dealer(
     return {"message": "Unmapped successfully"}
 @router.put("/dealers/{dealer_id}/toggle-active")
 async def toggle_dealer_active(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -600,7 +629,7 @@ async def delete_user(
 
 @router.get("/products")
 async def list_all_products(
-    skip: int = 0, limit: int = 50, dealer_id: int = None,
+    skip: int = 0, limit: int = 50, dealer_id: UUID = None,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -612,7 +641,7 @@ async def list_all_products(
     products = result.scalars().all()
     return [
         {
-            "id": p.id, "name": p.name, "price": p.price, "stock": p.stock,
+            "id": p.id, "name": p.name, "price": p.selling_price or p.dealer_price, "mrp": p.mrp, "stock": getattr(p, 'stock', 0),
             "dealer_id": p.dealer_id, "dealer_name": p.dealer.business_name if p.dealer else None,
             "is_approved": p.is_approved, "created_at": p.created_at
         } for p in products
@@ -620,7 +649,7 @@ async def list_all_products(
 
 @router.put("/dealers/{dealer_id}/approve")
 async def approve_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -681,7 +710,7 @@ class RejectReasonPayload(BaseModel):
 
 @router.put("/dealers/{dealer_id}/reject")
 async def reject_dealer(
-    dealer_id: int, payload: RejectReasonPayload,
+    dealer_id: UUID, payload: RejectReasonPayload,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -727,7 +756,7 @@ async def reject_dealer(
 
 @router.put("/products/{product_id}/approve", tags=["products"])
 async def approve_product(
-    product_id: int,
+    product_id: UUID,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -746,13 +775,18 @@ async def approve_product(
     
     return {"message": f"Product '{product_name}' approved successfully", "id": product_id}
 
+class RejectProductRequest(BaseModel):
+    reason: str
+
 @router.put("/products/{product_id}/reject", tags=["products"])
 async def reject_product(
-    product_id: int,
+    product_id: UUID,
+    payload: RejectProductRequest,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Reject a product (admin only)"""
+    from datetime import datetime
     result = await db.execute(select(Product).where(Product.id == product_id))
     product = result.scalar_one_or_none()
     
@@ -760,6 +794,15 @@ async def reject_product(
         raise HTTPException(status_code=404, detail="Product not found")
     
     product.is_approved = False
+    
+    # Track rejection reason
+    current_reasons = list(product.reject_reasons) if product.reject_reasons else []
+    current_reasons.append({
+        "date": datetime.utcnow().isoformat(),
+        "reason": payload.reason
+    })
+    product.reject_reasons = current_reasons
+    
     product_name = product.name
     product_id = product.id
     
@@ -852,6 +895,7 @@ async def create_dealer(
             cin_number=dealer_in.cin_number,
             cin_certificate_url=dealer_in.cin_certificate_url,
             company_logo_url=dealer_in.company_logo_url,
+            is_auction_enabled=dealer_in.is_auction_enabled,
             access_status='active', is_approved=True, profile_status='complete', is_active=True
         )
         db.add(db_dealer)
@@ -885,7 +929,7 @@ async def create_dealer(
 
 @router.patch("/dealers/{dealer_id}")
 async def update_dealer_profile(
-    dealer_id: int, dealer_in: DealerAdminUpdate,
+    dealer_id: UUID, dealer_in: DealerAdminUpdate,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -910,7 +954,7 @@ async def update_dealer_profile(
 
 @router.delete("/dealers/{dealer_id}")
 async def delete_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):

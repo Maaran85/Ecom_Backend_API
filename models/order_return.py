@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, Boolean, DateTime, JSON, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, DateTime, JSON, Enum as SQLEnum
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from core.database import Base
@@ -35,7 +36,7 @@ class OrderReturn(Base):
     
     # Exchange details
     is_exchange = Column(Boolean, default=False, nullable=False)
-    exchange_variant_id = Column(Integer, ForeignKey("product_variants.id", ondelete="SET NULL"), nullable=True)
+    exchange_variant_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
     replacement_order_id = Column(Integer, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True)
     
     # Status
@@ -70,7 +71,7 @@ class OrderReturn(Base):
     order_item = relationship("OrderItem")
     customer = relationship("CustomerUser", foreign_keys=[customer_id], backref="order_returns")
     approver = relationship("User", foreign_keys=[approved_by])
-    exchange_variant = relationship("ProductVariant", foreign_keys=[exchange_variant_id])
+    exchange_variant = relationship("Product", foreign_keys=[exchange_variant_id])
     replacement_order = relationship("Order", foreign_keys=[replacement_order_id])
     hub = relationship("DeliveryHub", backref="returns")
     logistics_partner = relationship("LogisticsPartner")

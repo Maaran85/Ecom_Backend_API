@@ -1,3 +1,4 @@
+from uuid import UUID
 """
 Dealer Documents Router - Specialized handling for dealer business documents
 """
@@ -24,7 +25,7 @@ DOC_TYPE_MAPPING = {
 
 @router.post("/{dealer_id}/documents/{doc_type}")
 async def upload_dealer_document(
-    dealer_id: int,
+    dealer_id: UUID,
     doc_type: str,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
@@ -84,7 +85,7 @@ async def upload_dealer_document(
 
 @router.delete("/{dealer_id}/documents/{doc_type}")
 async def delete_dealer_document(
-    dealer_id: int,
+    dealer_id: UUID,
     doc_type: str,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)

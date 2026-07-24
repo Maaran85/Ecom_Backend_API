@@ -1,3 +1,5 @@
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Boolean, Float, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -15,7 +17,7 @@ class DeliveryRider(Base):
     
     # Association (Managed by Admin or Dealer)
     managed_by = Column(String, default="admin") # "admin" or "dealer"
-    dealer_id = Column(Integer, ForeignKey("dealers.id"), nullable=True) # If managed by a specific dealer
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey("dealers.id"), nullable=True) # If managed by a specific dealer
     partner_id = Column(Integer, ForeignKey("logistics_partners.id", ondelete="SET NULL"), nullable=True) # If they work for a specific partner
 
     # Rider Specific Details

@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, Boolean, DateTime, Enum as SQLEnum
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 from core.database import Base
 import enum
@@ -19,7 +20,7 @@ class StockMovement(Base):
     __tablename__ = "stock_movements"
 
     id = Column(Integer, primary_key=True, index=True)
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True)
     
     movement_type = Column(SQLEnum(MovementType), nullable=False)
     quantity = Column(Integer, nullable=False)  # +ve for increase, -ve for decrease
@@ -51,7 +52,7 @@ class ProductInventory(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     hub_id = Column(Integer, ForeignKey("delivery_hubs.id", ondelete="CASCADE"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     stock = Column(Integer, default=0, nullable=False)
     
     # Relationships
@@ -63,7 +64,7 @@ class StockReservation(Base):
     __tablename__ = "stock_reservations"
 
     id = Column(Integer, primary_key=True, index=True)
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     quantity = Column(Integer, nullable=False)
     
@@ -84,7 +85,7 @@ class StockAlert(Base):
     __tablename__ = "stock_alerts"
 
     id = Column(Integer, primary_key=True, index=True)
-    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False, unique=True)
+    product_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False, unique=True)
     threshold = Column(Integer, default=10, nullable=False)  # Alert when stock < threshold
     
     # Alert status

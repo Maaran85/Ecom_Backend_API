@@ -1,3 +1,4 @@
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func, or_, update
@@ -179,22 +180,25 @@ async def get_dealer_finance_settings(
     
     # Try to fetch global platform fee from active payment settings if dealer fee is default
     # Or just return both and let the frontend decide, but usually we want one "effective" fee.
-    effective_fee = dealer.platform_fee_percent
+    effective_fee = dealer.platform_fee_amount
     
     # If dealer fee is the initial default (5.0), check if there's an admin-configured global fee
-    if effective_fee == 5.0:
-        result = await db.execute(
-            select(PlatformPaymentSettings.platform_fee_percent)
+    if effective_fee is None or effective_fee == 0:
+        # fallback to platform settings
+        platform_fee_q = await db.execute(
+            select(PlatformPaymentSettings.platform_fee_amount)
             .where(PlatformPaymentSettings.is_active == True)
             .limit(1)
         )
-        global_fee = result.scalar()
-        if global_fee is not None:
-            effective_fee = global_fee
+        platform_fee = platform_fee_q.scalar()
+        if platform_fee is not None:
+            effective_fee = platform_fee
+        else:
+            effective_fee = 5.0 # fallback default
 
     return {
-        "platform_fee_percent": effective_fee,
-        "dealer_custom_fee": dealer.platform_fee_percent
+        "platform_fee_amount": effective_fee,
+        "dealer_custom_fee": dealer.platform_fee_amount
     }
 
 
@@ -433,8 +437,8 @@ async def get_tds_payout_report(
         gross_value = item.price * item.quantity
         
         # Calculate commission (EXTRACTED from the bundled price)
-        fee_percent = dealer.platform_fee_percent if dealer else 5.0
-        commission = gross_value * (fee_percent / (100.0 + fee_percent))
+        fee_amount = dealer.platform_fee_amount if dealer else 5.0
+        commission = fee_amount * item.quantity
         
         # We need the net taxable value to calculate TCS under GST
         # Approximate taxable value extraction if not stored directly
@@ -460,7 +464,9 @@ async def get_tds_payout_report(
         tcs = taxable * 0.01  # 1% under GST
         tds = gov * 0.01      # 1% under Sec 194-O (Gross value)
         
-        net_payout = gov - comm - tcs - tds
+        # The platform fee (comm) is collected from the customer at checkout, 
+        # so it is not deducted from the dealer's gross order value.
+        net_payout = gov - tcs - tds
         
         total_gross += gov
         total_comm += comm
@@ -626,7 +632,7 @@ async def debug_delivered_items(
 
 @router.get("/admin/finance/unremitted-order-items")
 async def list_unremitted_order_items(
-    dealer_id: Optional[int] = None,
+    dealer_id: Optional[UUID] = None,
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_admin)
 ):
@@ -765,7 +771,7 @@ async def create_dealer_remittance(
 
 @router.get("/admin/finance/dealer-remittances", response_model=List[DealerRemittanceOut])
 async def list_all_remittances(
-    dealer_id: Optional[int] = None,
+    dealer_id: Optional[UUID] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -1052,7 +1058,7 @@ async def get_dealer_tax_reports(
 @router.get("/admin/finance/reports/remittances/export")
 async def export_remittances(
     format: str = Query("csv"),
-    dealer_id: Optional[int] = None,
+    dealer_id: Optional[UUID] = None,
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     token: Optional[str] = Query(None),

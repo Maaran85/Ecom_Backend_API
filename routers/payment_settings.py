@@ -27,7 +27,7 @@ class PaymentSettingCreate(BaseModel):
     webhook_secret: Optional[str] = None
     is_live: bool = False
     is_active: bool = True
-    platform_fee_percent: float = 0.0
+    platform_fee_amount: float = 0.0
 
 
 class PaymentSettingUpdate(BaseModel):
@@ -40,7 +40,7 @@ class PaymentSettingUpdate(BaseModel):
     webhook_secret: Optional[str] = None
     is_live: Optional[bool] = None
     is_active: Optional[bool] = None
-    platform_fee_percent: Optional[float] = None
+    platform_fee_amount: Optional[float] = None
 
 
 def _serialize(s: PlatformPaymentSettings) -> dict:
@@ -56,7 +56,7 @@ def _serialize(s: PlatformPaymentSettings) -> dict:
         "webhook_secret": "••••••••" if s.webhook_secret else None,
         "is_live": s.is_live,
         "is_active": s.is_active,
-        "platform_fee_percent": s.platform_fee_percent,
+        "platform_fee_amount": s.platform_fee_amount,
         "created_at": s.created_at,
         "updated_at": s.updated_at,
     }
@@ -111,7 +111,7 @@ async def get_payment_setting(
         "webhook_secret": setting.webhook_secret,
         "is_live": setting.is_live,
         "is_active": setting.is_active,
-        "platform_fee_percent": setting.platform_fee_percent,
+        "platform_fee_amount": setting.platform_fee_amount,
         "created_at": setting.created_at,
         "updated_at": setting.updated_at,
     }

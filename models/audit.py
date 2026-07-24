@@ -1,3 +1,5 @@
+import uuid
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -8,7 +10,7 @@ class AuditLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    dealer_id = Column(Integer, ForeignKey("dealers.id", ondelete="SET NULL"), nullable=True)
+    dealer_id = Column(UUID(as_uuid=True), ForeignKey("dealers.id", ondelete="SET NULL"), nullable=True)
     
     # Action details
     action = Column(String(50), nullable=False) # CREATE, UPDATE, DELETE, LOGIN, etc.

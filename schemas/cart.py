@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
@@ -8,10 +9,11 @@ from schemas.dealer import Hub
 
 # Cart Schemas
 class CartItemBase(BaseModel):
-    product_id: int
-    variant_id: Optional[int] = None
+    product_id: UUID
     quantity: int = 1
+    variant_id: Optional[UUID] = None
     size: Optional[str] = None
+    variant_attributes: Optional[dict] = None
 
 class CartItemCreate(CartItemBase):
     pass
@@ -30,11 +32,12 @@ class CartItem(CartItemBase):
 
 # Order Schemas
 class OrderItemBase(BaseModel):
-    product_id: int
-    variant_id: Optional[int] = None
+    product_id: UUID
+    variant_id: Optional[UUID] = None
     quantity: int
     price: float
     size: Optional[str] = None
+    variant_attributes: Optional[dict] = None
 
 class OrderItem(OrderItemBase):
     id: int
@@ -42,6 +45,7 @@ class OrderItem(OrderItemBase):
     item_order_id: Optional[str] = None
     order_number: Optional[str] = None
     product: Optional[Product] = None
+    variant: Optional[Product] = None
     status: str = "pending"
     payment_status: str = "pending"
     reject_reason: Optional[str] = None
@@ -72,6 +76,7 @@ class Order(OrderBase):
     subtotal: float
     discount_amount: float = 0.0
     delivery_charge: float = 0.0
+    platform_fee_amount: float = 0.0
     payment_status: str = "pending"
     payment_method: str = "COD"
     status: OrderStatus
@@ -85,6 +90,7 @@ class Order(OrderBase):
     cgst_amount: float = 0.0
     sgst_amount: float = 0.0
     igst_amount: float = 0.0
+    is_auction_order: bool = False
     created_at: datetime
     items: List[OrderItem] = []
     returns: List["schemas.order_management.OrderReturn"] = []

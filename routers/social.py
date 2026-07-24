@@ -1,3 +1,4 @@
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -12,7 +13,7 @@ from models import User, Dealer, DealerFollow, CustomerUser
 router = APIRouter()
 
 class DealerFollowResponse(BaseModel):
-    dealer_id: int
+    dealer_id: UUID
     dealer_name: str
     followed_at: datetime
     
@@ -21,7 +22,7 @@ class DealerFollowResponse(BaseModel):
 
 @router.post("/dealers/{dealer_id}/follow", status_code=status.HTTP_201_CREATED)
 async def follow_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: CustomerUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -53,7 +54,7 @@ async def follow_dealer(
 
 @router.delete("/dealers/{dealer_id}/follow", status_code=status.HTTP_204_NO_CONTENT)
 async def unfollow_dealer(
-    dealer_id: int,
+    dealer_id: UUID,
     current_user: CustomerUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):

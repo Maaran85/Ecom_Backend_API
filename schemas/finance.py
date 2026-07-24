@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
@@ -43,7 +44,7 @@ class TaxCategoryOut(TaxCategoryBase):
 class TaxRuleBase(BaseModel):
     name: str
     category_id: Optional[int] = None
-    product_id: Optional[int] = None
+    product_id: Optional[UUID] = None
     tax_category_id: int
     priority: int = 0
     state_code: Optional[str] = None
@@ -55,7 +56,7 @@ class TaxRuleCreate(TaxRuleBase):
 class TaxRuleUpdate(BaseModel):
     name: Optional[str] = None
     category_id: Optional[int] = None
-    product_id: Optional[int] = None
+    product_id: Optional[UUID] = None
     tax_category_id: Optional[int] = None
     priority: Optional[int] = None
     state_code: Optional[str] = None
@@ -105,7 +106,7 @@ class GST1SummaryOut(BaseModel):
     hsn_summary: List[GST1SummaryRow]
 
 class DealerPayoutRow(BaseModel):
-    dealer_id: int
+    dealer_id: UUID
     dealer_name: str
     gross_order_value: float
     refunds: float
@@ -126,7 +127,7 @@ class TDSReportOut(BaseModel):
 
 # --- Tax Calculator Schema ---
 class TaxCalculatorRequest(BaseModel):
-    product_id: int
+    product_id: UUID
     inclusive_price: float
     quantity: int = 1
     buyer_state: Optional[str] = None
@@ -144,7 +145,7 @@ class DealerRemittanceBase(BaseModel):
     type: str = Field(default="payout", description="payout or collection")
 
 class DealerRemittanceCreate(DealerRemittanceBase):
-    dealer_id: int
+    dealer_id: UUID
     order_item_ids: List[int] = []
 
 class DealerRemittanceSubmit(DealerRemittanceBase):
@@ -155,7 +156,7 @@ class DealerRemittanceStatusUpdate(BaseModel):
 
 class DealerRemittanceOut(DealerRemittanceBase):
     id: int
-    dealer_id: int
+    dealer_id: UUID
     status: str
     created_at: datetime
     updated_at: Optional[datetime]

@@ -50,10 +50,11 @@ class TaxService:
         return None
 
     @staticmethod
-    async def calculate_item_tax(db: AsyncSession, inclusive_price: float, qty: int, product_id: int, buyer_state: str, seller_state: str):
+    async def calculate_item_tax(db: AsyncSession, base_price: float, qty: int, product_id: int, buyer_state: str, seller_state: str, is_inclusive: bool = True):
         """
-        Parses B2C tax-inclusive pricing into Net Taxable Value and Tax Amounts.
+        Parses pricing into Net Taxable Value and Tax Amounts.
         Supports Inter-state (IGST) vs Intra-state (CGST+SGST).
+        If is_inclusive is True, base_price includes tax. If False, base_price excludes tax.
         """
         rule = await TaxService.get_applicable_tax_rule(db, product_id)
         
@@ -76,11 +77,17 @@ class TaxService:
         # Determine total applicable rate
         total_rate = igst_rate if is_inter_state else (cgst_rate + sgst_rate)
         
-        # The price passed in is INCLUSIVE of this rate.
-        # Math: Net Taxable Value = Inclusive Price / (1 + Rate%)
-        gross_value = inclusive_price * qty
-        taxable_amount = gross_value / (1 + (total_rate / 100))
-        total_tax = gross_value - taxable_amount
+        if is_inclusive:
+            # The price passed in is INCLUSIVE of this rate.
+            # Math: Net Taxable Value = Inclusive Price / (1 + Rate%)
+            gross_value = base_price * qty
+            taxable_amount = gross_value / (1 + (total_rate / 100))
+            total_tax = gross_value - taxable_amount
+        else:
+            # The price passed in is EXCLUSIVE of this rate.
+            taxable_amount = base_price * qty
+            total_tax = taxable_amount * (total_rate / 100)
+            gross_value = taxable_amount + total_tax
         
         # Split GST components
         cgst_amount = 0.0
@@ -110,16 +117,14 @@ class TaxService:
     @staticmethod
     async def generate_tax_invoice_number(db: AsyncSession) -> str:
         """Generates a sequential tax invoice number like TAX-2026-000042"""
+        from models.invoice import OrderInvoice
         year = datetime.now().year
         
-        # Get count of orders this year with tax invoices
+        # Get count of invoices this year
         result = await db.execute(
-            select(func.count(Order.id))
+            select(func.count(OrderInvoice.id))
             .where(
-                and_(
-                    Order.tax_invoice_no.isnot(None),
-                    func.extract('year', Order.created_at) == year
-                )
+                func.extract('year', OrderInvoice.invoice_date) == year
             )
         )
         count = result.scalar() or 0

@@ -9,12 +9,14 @@ from core.permissions import get_current_active_user
 from schemas.cart import CartItem, CartItemCreate, CartItemUpdate, Order
 from models.cart import CartItem as CartItemModel, Order as OrderModel, OrderItem as OrderItemModel, OrderStatus
 from models.product import Product as ProductModel, Category as CategoryModel
-from models.product_variant import ProductVariant as ProductVariantModel
 from models.dealer import Dealer as DealerModel
 from models.user import User
 from models.customer_user import CustomerUser
 from models.coupon import Coupon as CouponModel, CouponUsage as CouponUsageModel
 from models.order_return import OrderReturn as OrderReturnModel
+from models.invoice import OrderInvoice as OrderInvoiceModel
+from models.address import Address as AddressModel
+from fastapi.responses import StreamingResponse
 from services.notification import EmailService
 from datetime import datetime, timezone
 from pydantic import BaseModel
@@ -32,6 +34,9 @@ class OrderRequest(BaseModel):
     coupon_code: Optional[str] = None
     payment_method: str = "COD"
     address_id: Optional[int] = None
+    billing_address_id: Optional[int] = None
+    use_wallet: Optional[bool] = False
+    wallet_amount: Optional[float] = None
 
 router = APIRouter()
 
@@ -45,7 +50,7 @@ async def add_to_cart(
     """Add item to cart or update quantity if already exists"""
     from sqlalchemy import insert as sql_insert
     customer_id = int(current_user.id)
-    product_id = int(item_in.product_id)
+    product_id = item_in.product_id
     variant_id = item_in.variant_id
     quantity = int(item_in.quantity)
 
@@ -76,7 +81,8 @@ async def add_to_cart(
                 product_id=product_id,
                 variant_id=variant_id,
                 quantity=quantity,
-                size=item_in.size
+                size=item_in.size,
+                variant_attributes=item_in.variant_attributes
             )
         )
 
@@ -95,7 +101,7 @@ async def add_to_cart(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.children)
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
 
@@ -112,7 +118,7 @@ async def add_to_cart(
                 joinedload(CartItemModel.product).options(
                     joinedload(ProductModel.dealer),
                     joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                    selectinload(ProductModel.children)
+                    selectinload(ProductModel.children).selectinload(ProductModel.children)
                 )
             )
 
@@ -135,7 +141,7 @@ async def get_cart(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.children)
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
 
@@ -178,7 +184,7 @@ async def update_cart_item(
             joinedload(CartItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.children)
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
 
@@ -231,8 +237,8 @@ async def create_order(
         )
         .options(
             joinedload(CartItemModel.product).options(
-                joinedload(ProductModel.dealer),
-                selectinload(ProductModel.children)
+                joinedload(ProductModel.dealer).selectinload(DealerModel.state_rel),
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
 
@@ -259,6 +265,16 @@ async def create_order(
     stock_updates = []  # (product_id, deduct_qty)
     dealer_subtotals: dict[int, float] = {}  # dealer_id -> subtotal of their items
 
+    # Fetch buyer state from shipping address
+    shipping_address_state = "UNKNOWN"
+    if order_request and order_request.address_id:
+        addr_res = await db.execute(
+            select(AddressModel).options(selectinload(AddressModel.state_rel)).where(AddressModel.id == order_request.address_id)
+        )
+        shipping_addr = addr_res.scalar_one_or_none()
+        if shipping_addr and shipping_addr.state_rel:
+            shipping_address_state = shipping_addr.state_rel.state_code
+
     for cart_item in cart_items:
         product = cart_item.product
 
@@ -283,22 +299,23 @@ async def create_order(
             if product.stock < cart_item.quantity:
                 raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
 
-        price = float(product.discount_price if product.discount_price else product.price)
+        price = float(product.selling_price if product.selling_price else (product.mrp or product.dealer_price))
         line_total = price * cart_item.quantity
         total_amount += line_total
 
         # Track per-dealer subtotal for delivery fee calc
-        d_id = int(product.dealer_id) if product.dealer_id else 0
-        dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + line_total
+        d_id = product.dealer_id
+        if d_id:
+            dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + line_total
 
         # --- FINANCIAL SPLITS (Tax & Platform Commission) ---
         # 1. Tax Calculation (from inclusive price)
-        buyer_state = "UNKNOWN" # To be derived from address if provided, ignoring for MVP
-        seller_state = product.dealer.state if product.dealer else "UNKNOWN"
+        buyer_state = shipping_address_state
+        seller_state = product.dealer.state_code if product.dealer and product.dealer.state_code else "UNKNOWN"
         
         tax_res = await TaxService.calculate_item_tax(
             db=db,
-            inclusive_price=price,
+            base_price=price,
             qty=cart_item.quantity,
             product_id=product.id,
             buyer_state=buyer_state,
@@ -308,25 +325,27 @@ async def create_order(
         # 2. Platform Commission Calculation (EXTRACTED from the bundled price)
         # Using Hidden Markup Strategy: Platform Fee is added on top of (Base + Tax).
         # To extract: Fee = Total * (Fee% / (100 + Fee%))
-        fee_percent = product.dealer.platform_fee_percent if product.dealer else 5.0
-        # If the platform collects the fee from the customer (hidden as markup),
-        # we extract it from the inclusive price.
-        platform_fee = line_total * (fee_percent / (100.0 + fee_percent))
+        fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
+        # Platform fee is a flat amount per unit
+        platform_fee = fee_amount * cart_item.quantity
 
         order_items_data.append({
-            "product_id": int(cart_item.product_id),
+            "product_id": cart_item.product_id,
             "variant_id": cart_item.variant_id,
+            "category_id": product.category_id,
             "quantity": int(cart_item.quantity),
             "price": price,
             "size": cart_item.size,
+            "variant_attributes": cart_item.variant_attributes,
             "dealer_id": d_id,
             # Tax and fee data
             "tax_data": tax_res,
-            "platform_fee": platform_fee
+            "platform_fee": platform_fee,
+            "referral_commission_rate": product.referral_commission_rate
         })
         # For stock updates, we'll handle variant stock deduction too
         stock_updates.append({
-            "product_id": int(product.id),
+            "product_id": product.id,
             "variant_id": cart_item.variant_id,
             "quantity": int(cart_item.quantity)
         })
@@ -427,25 +446,47 @@ async def create_order(
             .execution_options(synchronize_session=False)
         )
 
+    # ── Wallet Deduction ───────────────────────────────────────────────────────
+    total_wallet_discount = 0.0
+    if order_request and order_request.use_wallet:
+        from models.referral import CustomerWallet
+        w_res = await db.execute(select(CustomerWallet).where(CustomerWallet.customer_id == customer_id))
+        wallet_obj = w_res.scalar_one_or_none()
+        if wallet_obj and wallet_obj.available_balance > 0:
+            max_payable = max(0.0, round(total_amount - total_discount_amount + total_delivery_charge, 2))
+            total_wallet_discount = round(min(wallet_obj.available_balance, max_payable), 2)
+            if order_request.wallet_amount and order_request.wallet_amount > 0:
+                total_wallet_discount = round(min(total_wallet_discount, float(order_request.wallet_amount)), 2)
+            if total_wallet_discount > 0:
+                wallet_obj.available_balance = round(max(0.0, wallet_obj.available_balance - total_wallet_discount), 2)
+                db.add(wallet_obj)
+
     # ── Create Separate Orders Per Item ────────────────────────────────────────
     from sqlalchemy import insert as sql_insert
     created_order_ids = []
+    created_order_items_list = []
     
     for item_data in order_items_data:
-        item_subtotal = item_data["price"] * item_data["quantity"]
+        item_subtotal = round(item_data["price"] * item_data["quantity"], 2)
         
         # Pro-rata discount
         item_discount = 0.0
         if total_amount > 0:
-            item_discount = (item_subtotal / total_amount) * total_discount_amount
+            item_discount = round((item_subtotal / total_amount) * total_discount_amount, 2)
+            
+        # Pro-rata wallet discount
+        item_wallet_discount = 0.0
+        if total_amount > 0 and total_wallet_discount > 0:
+            item_wallet_discount = round((item_subtotal / total_amount) * total_wallet_discount, 2)
             
         # Pro-rata delivery charge (for same dealer grouping)
         item_delivery = 0.0
         dealer_info = dealer_fees_map.get(item_data["dealer_id"], {"fee": 0.0, "total_dealer_subtotal": 0.0})
         if dealer_info["total_dealer_subtotal"] > 0:
-            item_delivery = (item_subtotal / dealer_info["total_dealer_subtotal"]) * dealer_info["fee"]
+            item_delivery = round((item_subtotal / dealer_info["total_dealer_subtotal"]) * dealer_info["fee"], 2)
             
-        final_item_total = max(0.0, item_subtotal - item_discount) + item_delivery
+        total_item_discount = round(item_discount + item_wallet_discount, 2)
+        final_item_total = round(max(0.0, item_subtotal - total_item_discount) + item_delivery + item_data["platform_fee"], 2)
         
         tax_data = item_data["tax_data"]
         
@@ -454,7 +495,8 @@ async def create_order(
                 customer_id=customer_id,
                 subtotal=item_subtotal,
                 order_number=generate_order_number(),
-                discount_amount=item_discount,
+                discount_amount=total_item_discount,
+                wallet_amount_used=item_wallet_discount,
                 delivery_charge=item_delivery,
                 total_amount=final_item_total,
                 status=OrderStatus.ORDER_PLACED.value,
@@ -468,13 +510,25 @@ async def create_order(
                 sgst_amount=tax_data["sgst_amount"],
                 igst_amount=tax_data["igst_amount"],
                 is_inter_state=tax_data["is_inter_state"],
-                tax_invoice_no=await TaxService.generate_tax_invoice_number(db),
+                billing_address_id=order_request.billing_address_id if order_request else None,
                 # Platform Revenue
                 platform_fee_amount=item_data["platform_fee"]
             ).returning(OrderModel.id)
         )
         new_order_id = order_result.scalar_one()
         created_order_ids.append(new_order_id)
+        
+        if item_wallet_discount > 0:
+            from models.referral import WalletTransaction, WalletTransactionType
+            await db.execute(
+                sql_insert(WalletTransaction).values(
+                    customer_id=customer_id,
+                    amount=item_wallet_discount,
+                    transaction_type=WalletTransactionType.DEBIT,
+                    description=f"Used wallet balance for Order #{new_order_id}",
+                    order_id=new_order_id
+                )
+            )
         
         # Insert matching OrderItem
         item_result = await db.execute(
@@ -485,16 +539,32 @@ async def create_order(
                 quantity=item_data["quantity"],
                 price=item_data["price"],
                 size=item_data.get("size"),
+                variant_attributes=item_data.get("variant_attributes"),
                 status="order_placed",
-                # Tax Fields
                 tax_amount=tax_data["total_tax"],
                 cgst_rate=tax_data["cgst_rate"],
                 sgst_rate=tax_data["sgst_rate"],
                 igst_rate=tax_data["igst_rate"],
+                cgst_amount=tax_data["cgst_amount"],
+                sgst_amount=tax_data["sgst_amount"],
+                igst_amount=tax_data["igst_amount"],
                 platform_fee=item_data["platform_fee"]
             ).returning(OrderItemModel.id)
         )
         new_item_id = item_result.scalar_one()
+        created_order_items_list.append((new_order_id, new_item_id, item_data))
+        
+        # Insert OrderInvoice
+        invoice_result = await db.execute(
+            sql_insert(OrderInvoiceModel).values(
+                order_id=new_order_id,
+                dealer_id=item_data["dealer_id"],
+                invoice_number=await TaxService.generate_tax_invoice_number(db),
+                total_amount=final_item_total,
+                tax_amount=tax_data["total_tax"],
+                is_reverse_charge=False
+            )
+        )
         
         # Insert into Tax Ledger for audit trail
         if tax_data["tax_category_id"]:
@@ -510,6 +580,53 @@ async def create_order(
                     total_tax=tax_data["total_tax"]
                 )
             )
+
+    # Track Category-Specific Lifetime Referral Commission if customer was referred
+    try:
+        from models.referral import (
+            CustomerReferralProfile,
+            ReferralOrderCommission,
+            ReferralItemCommission,
+            CommissionStatus
+        )
+        res_ref = await db.execute(
+            select(CustomerReferralProfile).where(CustomerReferralProfile.customer_id == customer_id)
+        )
+        ref_profile = res_ref.scalar_one_or_none()
+        if ref_profile and ref_profile.referred_by_id:
+            cats_res = await db.execute(select(CategoryModel))
+            cats_map = {c.id: (c.referral_commission_rate if c.referral_commission_rate is not None else 2.0) for c in cats_res.scalars().all()}
+            for ord_id, itm_id, itm_data in created_order_items_list:
+                cat_id = itm_data.get("category_id")
+                prod_rate = itm_data.get("referral_commission_rate")
+                if prod_rate is not None:
+                    rate_pct = float(prod_rate)
+                else:
+                    rate_pct = cats_map.get(cat_id, 2.0)
+                item_total = itm_data["price"] * itm_data["quantity"]
+                comm_amt = round(item_total * (rate_pct / 100.0), 2)
+                if comm_amt > 0:
+                    ord_comm = ReferralOrderCommission(
+                        referrer_id=ref_profile.referred_by_id,
+                        referee_id=customer_id,
+                        order_id=ord_id,
+                        total_commission_amount=comm_amt,
+                        status=CommissionStatus.PENDING
+                    )
+                    db.add(ord_comm)
+                    await db.flush()
+                    item_comm = ReferralItemCommission(
+                        order_commission_id=ord_comm.id,
+                        order_item_id=itm_id,
+                        category_id=cat_id,
+                        item_price=item_total,
+                        applied_rate_percent=rate_pct,
+                        commission_amount=comm_amt,
+                        status=CommissionStatus.PENDING
+                    )
+                    db.add(item_comm)
+    except Exception as e:
+        print(f"DEBUG: Referral commission creation error: {e}")
 
     # Clear cart
     await db.execute(
@@ -549,13 +666,86 @@ async def create_order(
             selectinload(OrderModel.items).joinedload(OrderItemModel.product).options(
                 joinedload(ProductModel.dealer),
                 selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
-                selectinload(ProductModel.children)
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
             ),
 
             selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
             selectinload(OrderModel.returns)
         )
         .order_by(OrderModel.created_at.desc())
+    )
+    return res.scalars().all()
+
+@router.post("/orders/{order_id}/checkout", response_model=list, tags=["orders"])
+async def checkout_pending_order(
+    order_id: int,
+    order_request: OrderRequest,
+    background_tasks: BackgroundTasks,
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Checkout an existing pending order (e.g. from an auction win)"""
+    result = await db.execute(
+        select(OrderModel)
+        .where(OrderModel.id == order_id, OrderModel.customer_id == current_user.id)
+        .options(selectinload(OrderModel.items))
+    )
+    order = result.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+        
+    if order.status != OrderStatus.PENDING:
+        raise HTTPException(status_code=400, detail=f"Order is not pending. Current status: {order.status}")
+        
+    if not order_request.address_id:
+        raise HTTPException(status_code=400, detail="Shipping address is required")
+        
+    order.shipping_address_id = order_request.address_id
+    order.payment_method = order_request.payment_method or "COD"
+    order.status = OrderStatus.ORDER_PLACED
+    
+    for item in order.items:
+        item.status = "order_placed"
+        
+    user_email = current_user.email
+    order_id_val = order.id
+    order_total = order.total_amount
+    
+    await db.commit()
+    
+    background_tasks.add_task(
+        EmailService.send_order_confirmation,
+        to_email=user_email,
+        order_data={"ids": [order_id_val], "total": order_total}
+    )
+    
+    try:
+        from services.notification import AppNotificationService
+        from models import NotificationType
+        await AppNotificationService.create_notification(
+            db,
+            customer_id=current_user.id,
+            type=NotificationType.ORDER_PLACED,
+            title="Order Placed!",
+            message=f"Your order ID {order_id_val} has been placed successfully. Thank you for shopping!"
+        )
+        await db.commit()
+    except Exception as e:
+        print(f"Error sending in-app notification: {e}")
+        
+    res = await db.execute(
+        select(OrderModel)
+        .where(OrderModel.id == order.id)
+        .options(
+            selectinload(OrderModel.items).joinedload(OrderItemModel.product).options(
+                joinedload(ProductModel.dealer),
+                selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
+            ),
+            selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
+            selectinload(OrderModel.returns)
+        )
     )
     return res.scalars().all()
 
@@ -569,9 +759,10 @@ async def get_orders(
         select(OrderModel)
         .where(OrderModel.customer_id == current_user.id)
         .options(
-            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.children),
+            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.children).selectinload(ProductModel.children),
             selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.dealer),
             selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
+            selectinload(OrderModel.items).selectinload(OrderItemModel.variant),
             selectinload(OrderModel.items).selectinload(OrderItemModel.hub),
             selectinload(OrderModel.returns).selectinload(OrderReturnModel.exchange_variant),
             selectinload(OrderModel.shipping_address),
@@ -605,3 +796,82 @@ async def get_orders(
         response_list.append(o_dict)
     
     return response_list
+
+@router.get("/orders/{order_id}/invoice", tags=["orders"])
+async def download_invoice(
+    order_id: int,
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Download PDF invoice for an order"""
+    result = await db.execute(
+        select(OrderModel)
+        .where(OrderModel.id == order_id, OrderModel.customer_id == current_user.id)
+        .options(
+            selectinload(OrderModel.items).selectinload(OrderItemModel.product),
+            selectinload(OrderModel.shipping_address).selectinload(AddressModel.state_rel),
+            selectinload(OrderModel.billing_address).selectinload(AddressModel.state_rel),
+            selectinload(OrderModel.invoices).selectinload(OrderInvoiceModel.dealer).selectinload(DealerModel.state_rel)
+        )
+    )
+    order = result.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+        
+    if not order.invoices:
+        # Auto-create invoice on the fly if missing
+        dealer_id = None
+        if order.items and order.items[0].product:
+            dealer_id = order.items[0].product.dealer_id
+            
+        if not dealer_id:
+            # Try loading product dealer_id
+            prod_res = await db.execute(select(ProductModel).where(ProductModel.id == order.items[0].product_id))
+            prod = prod_res.scalar_one_or_none()
+            if prod:
+                dealer_id = prod.dealer_id
+
+        if not dealer_id:
+            raise HTTPException(status_code=404, detail="Dealer information not found for this order")
+
+        from services.tax_service import TaxService
+        inv_number = await TaxService.generate_tax_invoice_number(db)
+        new_inv = OrderInvoiceModel(
+            order_id=order.id,
+            dealer_id=dealer_id,
+            invoice_number=inv_number,
+            total_amount=order.total_amount or 0.0,
+            tax_amount=order.tax_amount or 0.0,
+            is_reverse_charge=False
+        )
+        db.add(new_inv)
+        await db.commit()
+        await db.refresh(new_inv)
+        
+        dealer_res = await db.execute(
+            select(DealerModel).where(DealerModel.id == dealer_id).options(selectinload(DealerModel.state_rel))
+        )
+        dealer = dealer_res.scalar_one_or_none()
+        invoice = new_inv
+    else:
+        invoice = order.invoices[0]
+        dealer = invoice.dealer
+    
+    from services.invoice_pdf import generate_invoice_pdf
+    pdf_buffer = generate_invoice_pdf(
+        invoice=invoice,
+        dealer=dealer,
+        order=order,
+        order_items=order.items,
+        billing_address=order.billing_address,
+        shipping_address=order.shipping_address
+    )
+    
+    filename = f"Invoice_{invoice.invoice_number}.pdf"
+    
+    return StreamingResponse(
+        pdf_buffer, 
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )

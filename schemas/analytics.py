@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 from datetime import datetime
@@ -69,7 +70,7 @@ class RevenueAnalytics(BaseModel):
 
 # Product Performance
 class ProductPerformance(BaseModel):
-    product_id: int
+    product_id: UUID
     product_name: str
     total_sold: int
     revenue: float

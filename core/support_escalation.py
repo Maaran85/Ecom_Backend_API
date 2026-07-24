@@ -15,7 +15,7 @@ async def escalate_overdue_tickets():
     """
     try:
         async with SessionLocal() as db:
-            now = datetime.now(timezone.utc)
+            now = datetime.utcnow()
             
             # Find all tickets currently open/in-progress that are past deadline
             query = select(SupportTicket).where(

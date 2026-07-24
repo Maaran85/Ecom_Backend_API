@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any
 from datetime import datetime
@@ -24,7 +25,7 @@ class ShowroomUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 class ProductInventoryBase(BaseModel):
-    product_id: int
+    product_id: UUID
     hub_id: int
     quantity: int
 
@@ -43,15 +44,15 @@ class ProductInventoryResponse(ProductInventoryBase):
         from_attributes = True
 
 class StockAddRequest(BaseModel):
-    product_id: int
+    product_id: UUID
     quantity: int
     notes: Optional[str] = None
 
 class ShowroomSaleItem(BaseModel):
-    product_id: int
+    product_id: UUID
     quantity: int
     price: float
-    size: Optional[str] = None
+    variant_attributes: Optional[dict] = None
 
 class ShowroomSaleRequest(BaseModel):
     customer_name: Optional[str] = None
