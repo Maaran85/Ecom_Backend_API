@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +11,8 @@ import io
 import json
 
 from core.database import get_db
+
+gst_logger = logging.getLogger("gst")
 from schemas.product import (
     Product, ProductCreate, ProductUpdate, Brand, BrandCreate, BrandUpdate,
     Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate
@@ -600,7 +603,7 @@ async def create_product(
                 return_policy_note=db_product.return_policy_note,
                 estimated_delivery_days=db_product.estimated_delivery_days,
                 hsn_code=db_product.hsn_code,
-                tax_rule_id=db_product.tax_rule_id,
+                tax_category_id=db_product.tax_category_id,
                 parent_product_id=db_product.id,
                 images=v_data.get("images") or db_product.images,
                 attributes=merged_attrs
@@ -609,7 +612,12 @@ async def create_product(
 
     await db.commit()
     await db.refresh(db_product)
-    
+
+    gst_logger.info(
+        "[GST] Creating Product | ID: %s | Name: %s | HSN: %s | tax_category_id: %s",
+        db_product.id, db_product.name, db_product.hsn_code, db_product.tax_category_id
+    )
+
     # Fetch product with category and children loaded for response
     result = await db.execute(
         select(ProductModel)
@@ -692,8 +700,19 @@ async def update_product(
                     detail=f"Missing mandatory attributes for this category: {', '.join(missing_attributes)}"
                 )
 
+    # GST logging for product update — capture old values before applying
+    old_tax_category_id = db_product.tax_category_id
+    old_tax_rule_id = db_product.tax_rule_id
+
     for key, value in update_data.items():
         setattr(db_product, key, value)
+
+    if "tax_category_id" in update_data:
+        gst_logger.info(
+            "[GST] Updating Product | ID: %s | Previous tax_category_id: %s | New tax_category_id: %s | tax_rule_id: %s",
+            db_product.id, old_tax_category_id, db_product.tax_category_id,
+            db_product.tax_rule_id or "NULL"
+        )
 
     if variants_data is not None:
         if variants_data and not variant_attributes:
@@ -733,7 +752,7 @@ async def update_product(
                 return_policy_note=db_product.return_policy_note,
                 estimated_delivery_days=db_product.estimated_delivery_days,
                 hsn_code=db_product.hsn_code,
-                tax_rule_id=db_product.tax_rule_id,
+                tax_category_id=db_product.tax_category_id,
                 parent_product_id=db_product.id,
                 images=v_data.get("images") or db_product.images,
                 attributes=merged_attrs

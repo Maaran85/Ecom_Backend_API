@@ -95,7 +95,8 @@ class Product(Base):
 
     # Tax & Compliance
     hsn_code = Column(String, nullable=False)   # for GST invoice compliance
-    tax_rule_id = Column(Integer, ForeignKey("tax_rules.id"), nullable=False)
+    tax_rule_id = Column(Integer, ForeignKey("tax_rules.id"), nullable=True)
+    tax_category_id = Column(Integer, ForeignKey("tax_categories.id"), nullable=True)
     referral_commission_rate = Column(Float, nullable=True)  # Product-level referral override rate
 
     @property

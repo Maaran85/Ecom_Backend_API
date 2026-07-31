@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update
@@ -5,6 +6,8 @@ from sqlalchemy.orm import selectinload, joinedload
 from typing import List
 
 from core.database import get_db
+
+gst_logger = logging.getLogger("gst")
 from core.permissions import get_current_active_user
 from schemas.cart import CartItem, CartItemCreate, CartItemUpdate, Order
 from models.cart import CartItem as CartItemModel, Order as OrderModel, OrderItem as OrderItemModel, OrderStatus
@@ -17,6 +20,8 @@ from models.order_return import OrderReturn as OrderReturnModel
 from models.invoice import OrderInvoice as OrderInvoiceModel
 from models.address import Address as AddressModel
 from fastapi.responses import StreamingResponse
+
+
 from services.notification import EmailService
 from datetime import datetime, timezone
 from pydantic import BaseModel
@@ -53,6 +58,22 @@ async def add_to_cart(
     product_id = item_in.product_id
     variant_id = item_in.variant_id
     quantity = int(item_in.quantity)
+    
+    print(f"[DEBUG] ADD TO CART: product_id={product_id}, variant_id={variant_id}, quantity={quantity}")
+    
+    # Verify product exists
+    prod_check = await db.execute(
+        select(ProductModel.id).where(ProductModel.id == product_id)
+    )
+    product_exists = prod_check.scalar_one_or_none()
+    print(f"[DEBUG] ADD TO CART: Product exists? {product_exists is not None}")
+    if product_exists is None:
+        print(f"[DEBUG] ADD TO CART: Product ID {product_id} NOT FOUND in products table!")
+        from models.product import ProductModel as ProductModelCls
+        print(f"[DEBUG] ADD TO CART: Available products (first 5):")
+        available_prods = await db.execute(select(ProductModelCls.id, ProductModelCls.name).limit(5))
+        for prod_id, prod_name in available_prods.fetchall():
+            print(f"[DEBUG] ADD TO CART:   Product ID: {prod_id}, Name: {prod_name}")
 
     # Check if item with SAME product AND same size AND same variant already in cart
     result = await db.execute(
@@ -265,15 +286,31 @@ async def create_order(
     stock_updates = []  # (product_id, deduct_qty)
     dealer_subtotals: dict[int, float] = {}  # dealer_id -> subtotal of their items
 
-    # Fetch buyer state from shipping address
-    shipping_address_state = "UNKNOWN"
+    # Fetch buyer state_id from shipping address
+    shipping_address_state_id = None
+    shipping_address = None
     if order_request and order_request.address_id:
         addr_res = await db.execute(
             select(AddressModel).options(selectinload(AddressModel.state_rel)).where(AddressModel.id == order_request.address_id)
         )
         shipping_addr = addr_res.scalar_one_or_none()
         if shipping_addr and shipping_addr.state_rel:
-            shipping_address_state = shipping_addr.state_rel.state_code
+            shipping_address_state_id = shipping_addr.state_rel.id
+            shipping_address = shipping_addr
+            
+            print(f"\n{'=' * 80}")
+            print(f"[GST DEBUG] STAGE 1: GST Checkout Flow - Input Values")
+            print(f"{'=' * 80}")
+            print(f"[GST DEBUG] STAGE 1: buyer_state_id = {shipping_address_state_id}")
+            print(f"[GST DEBUG] STAGE 1: seller_state_id = NULL (will be set from product/dealer)")
+            print(f"[GST DEBUG] STAGE 1: dealer.state_id = NULL (will be set from product/dealer)")
+            print(f"[GST DEBUG] STAGE 1: shipping_address.state_id = {shipping_address_state_id}")
+            print(f"{'=' * 80}\n")
+            print(f"[DEBUG] STAGE 1: BEFORE TAX SERVICE CALCULATION")
+            print(f"[DEBUG] STAGE 1: buyer_state_id = {shipping_address_state_id}")
+            print(f"[DEBUG] STAGE 1: seller_state_id = NULL (will be set per product)")
+            print(f"[DEBUG] STAGE 1: shipping_address.state_id = {shipping_address_state_id}")
+            print()
 
     for cart_item in cart_items:
         product = cart_item.product
@@ -310,8 +347,16 @@ async def create_order(
 
         # --- FINANCIAL SPLITS (Tax & Platform Commission) ---
         # 1. Tax Calculation (from inclusive price)
-        buyer_state = shipping_address_state
-        seller_state = product.dealer.state_code if product.dealer and product.dealer.state_code else "UNKNOWN"
+        # Resolve buyer/seller GST state codes (e.g. '33') from the address/dealer.
+        buyer_state = shipping_address.state_rel.state_code if (shipping_address and shipping_address.state_rel) else None
+        seller_state = product.dealer.state_code if product.dealer else None
+        
+        print(f"[DEBUG] STAGE 2: BEFORE TaxService.calculate_item_tax()")
+        print(f"[DEBUG] STAGE 2: buyer_state = {buyer_state}")
+        print(f"[DEBUG] STAGE 2: seller_state = {seller_state}")
+        print(f"[DEBUG] STAGE 2: dealer.state_code = {seller_state}")
+        print(f"[DEBUG] STAGE 2: shipping_address.state_code = {buyer_state}")
+        print()
         
         tax_res = await TaxService.calculate_item_tax(
             db=db,
@@ -322,6 +367,17 @@ async def create_order(
             seller_state=seller_state
         )
         
+        print(f"[DEBUG] STAGE 2: AFTER TaxService.calculate_item_tax()")
+        print(f"[DEBUG] STAGE 2: tax_data = {tax_res}")
+        print(f"[DEBUG] STAGE 2: is_inter_state = {tax_res.get('is_inter_state')}")
+        print(f"[DEBUG] STAGE 2: cgst_rate = {tax_res.get('cgst_rate')}")
+        print(f"[DEBUG] STAGE 2: sgst_rate = {tax_res.get('sgst_rate')}")
+        print(f"[DEBUG] STAGE 2: igst_rate = {tax_res.get('igst_rate')}")
+        print(f"[DEBUG] STAGE 2: cgst_amount = {tax_res.get('cgst_amount')}")
+        print(f"[DEBUG] STAGE 2: sgst_amount = {tax_res.get('sgst_amount')}")
+        print(f"[DEBUG] STAGE 2: igst_amount = {tax_res.get('igst_amount')}")
+        print()
+        
         # 2. Platform Commission Calculation (EXTRACTED from the bundled price)
         # Using Hidden Markup Strategy: Platform Fee is added on top of (Base + Tax).
         # To extract: Fee = Total * (Fee% / (100 + Fee%))
@@ -331,6 +387,7 @@ async def create_order(
 
         order_items_data.append({
             "product_id": cart_item.product_id,
+            "product_name": product.name,
             "variant_id": cart_item.variant_id,
             "category_id": product.category_id,
             "quantity": int(cart_item.quantity),
@@ -490,6 +547,13 @@ async def create_order(
         
         tax_data = item_data["tax_data"]
         
+        print(f"[DEBUG] STAGE 3: BEFORE creating Order model")
+        print(f"[DEBUG] STAGE 3: Order.is_inter_state = {tax_data.get('is_inter_state')}")
+        print(f"[DEBUG] STAGE 3: Order.cgst_amount = {tax_data.get('cgst_amount')}")
+        print(f"[DEBUG] STAGE 3: Order.sgst_amount = {tax_data.get('sgst_amount')}")
+        print(f"[DEBUG] STAGE 3: Order.igst_amount = {tax_data.get('igst_amount')}")
+        print()
+        
         order_result = await db.execute(
             sql_insert(OrderModel).values(
                 customer_id=customer_id,
@@ -530,6 +594,15 @@ async def create_order(
                 )
             )
         
+        print(f"[DEBUG] STAGE 4: BEFORE creating OrderItem")
+        print(f"[DEBUG] STAGE 4: OrderItem.cgst_rate = {tax_data.get('cgst_rate')}")
+        print(f"[DEBUG] STAGE 4: OrderItem.sgst_rate = {tax_data.get('sgst_rate')}")
+        print(f"[DEBUG] STAGE 4: OrderItem.igst_rate = {tax_data.get('igst_rate')}")
+        print(f"[DEBUG] STAGE 4: OrderItem.cgst_amount = {tax_data.get('cgst_amount')}")
+        print(f"[DEBUG] STAGE 4: OrderItem.sgst_amount = {tax_data.get('sgst_amount')}")
+        print(f"[DEBUG] STAGE 4: OrderItem.igst_amount = {tax_data.get('igst_amount')}")
+        print()
+        
         # Insert matching OrderItem
         item_result = await db.execute(
             sql_insert(OrderItemModel).values(
@@ -553,6 +626,31 @@ async def create_order(
         )
         new_item_id = item_result.scalar_one()
         created_order_items_list.append((new_order_id, new_item_id, item_data))
+
+        # Checkout GST logging
+        source = "tax_category_id" if tax_data.get("tax_category_id") else "Legacy tax_rule_id fallback"
+        prod_name = item_data.get('product_name', '')
+        gst_logger.info(
+            "[Checkout][GST] Order: %s | Product ID: %s | Product Name: %s | GST Slab: %s%% | Source: %s | CGST: %s%% | SGST: %s%% | IGST: %s%% | Tax Amount: ₹%s",
+            new_order_id,
+            item_data['product_id'],
+            prod_name,
+            tax_data['cgst_rate'] + tax_data['sgst_rate'] if not tax_data['is_inter_state'] else tax_data['igst_rate'],
+            source,
+            tax_data['cgst_rate'],
+            tax_data['sgst_rate'],
+            tax_data['igst_rate'],
+            tax_data['total_tax']
+        )
+        gst_logger.info(
+            "[Order Snapshot] Order: %s | Order Item: %s | Product ID: %s | Product Name: %s | CGST: %s%% | SGST: %s%% | IGST: %s%% | Tax Amount: ₹%s | Source: %s",
+            new_order_id, new_item_id,
+            item_data['product_id'],
+            prod_name,
+            tax_data['cgst_rate'], tax_data['sgst_rate'], tax_data['igst_rate'],
+            tax_data['total_tax'],
+            source
+        )
         
         # Insert OrderInvoice
         invoice_result = await db.execute(
@@ -633,7 +731,67 @@ async def create_order(
         delete(CartItemModel).where(CartItemModel.customer_id == customer_id)
     )
     
+    print(f"\n[DEBUG] STAGE 5: BEFORE session.commit()")
+    print(f"[DEBUG] STAGE 5: About to commit the transaction...")
+    print()
+    
     await db.commit()
+    
+    print(f"\n[DEBUG] STAGE 5: AFTER session.commit()")
+    print(f"[DEBUG] STAGE 5: Querying database for the created order...")
+    print()
+    
+    # Query the database for the SAME order that was just created
+    # Get the most recent order for this customer
+    import sqlalchemy as sql
+    
+    # Get the orders that were just created
+    if created_order_ids:
+        # Query Orders table
+        orders_query = sql.select(
+            OrderModel.id,
+            OrderModel.is_inter_state,
+            OrderModel.cgst_amount,
+            OrderModel.sgst_amount,
+            OrderModel.igst_amount
+        ).where(OrderModel.id.in_(created_order_ids))
+        
+        orders_result = await db.execute(orders_query)
+        orders = orders_result.mappings().all()
+        
+        print(f"[DEBUG] STAGE 5: Orders table values:")
+        for order in orders:
+            print(f"[DEBUG] STAGE 5:   Order ID: {order['id']}")
+            print(f"[DEBUG] STAGE 5:   is_inter_state: {order['is_inter_state']}")
+            print(f"[DEBUG] STAGE 5:   cgst_amount: {order['cgst_amount']}")
+            print(f"[DEBUG] STAGE 5:   sgst_amount: {order['sgst_amount']}")
+            print(f"[DEBUG] STAGE 5:   igst_amount: {order['igst_amount']}")
+            print()
+            
+            # Query OrderItems table for this order
+            items_query = sql.select(
+                OrderItemModel.order_id,
+                OrderItemModel.cgst_rate,
+                OrderItemModel.sgst_rate,
+                OrderItemModel.igst_rate,
+                OrderItemModel.cgst_amount,
+                OrderItemModel.sgst_amount,
+                OrderItemModel.igst_amount
+            ).where(OrderItemModel.order_id == order['id'])
+            
+            items_result = await db.execute(items_query)
+            items = items_result.mappings().all()
+            
+            print(f"[DEBUG] STAGE 5: OrderItems table values:")
+            for item in items:
+                print(f"[DEBUG] STAGE 5:   Order ID: {item['order_id']}")
+                print(f"[DEBUG] STAGE 5:   cgst_rate: {item['cgst_rate']}")
+                print(f"[DEBUG] STAGE 5:   sgst_rate: {item['sgst_rate']}")
+                print(f"[DEBUG] STAGE 5:   igst_rate: {item['igst_rate']}")
+                print(f"[DEBUG] STAGE 5:   cgst_amount: {item['cgst_amount']}")
+                print(f"[DEBUG] STAGE 5:   sgst_amount: {item['sgst_amount']}")
+                print(f"[DEBUG] STAGE 5:   igst_amount: {item['igst_amount']}")
+                print()
     
     # Send confirmation for each (or just once)
     background_tasks.add_task(

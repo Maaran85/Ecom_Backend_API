@@ -103,7 +103,7 @@ class ProductBase(BaseModel):
     subcategory_id: Optional[int] = None
     brand_id: Optional[int] = None
     hsn_code: str
-    tax_rule_id: int
+    tax_category_id: int
     discount_percentage: Optional[int] = None
     average_rating: Optional[float] = None
     reject_reasons: Optional[List[dict]] = []
@@ -162,7 +162,7 @@ class ProductUpdate(BaseModel):
     is_exchangeable: Optional[bool] = None
     return_policy_note: Optional[str] = None
     hsn_code: Optional[str] = None
-    tax_rule_id: Optional[int] = None
+    tax_category_id: Optional[int] = None
     parent_product_id: Optional[UUID] = None
     referral_commission_rate: Optional[float] = None
 

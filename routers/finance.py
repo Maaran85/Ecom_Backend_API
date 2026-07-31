@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,6 +7,8 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from core.database import get_db
+
+gst_logger = logging.getLogger("gst")
 from core.permissions import require_admin, get_current_active_user
 from models import User, Order, OrderItem, OrderStatus, Dealer, Product, TaxCategory, TaxRule, TaxLedger, DealerRemittance
 from schemas.finance import (
@@ -145,13 +148,35 @@ async def delete_tax_rule(
     await db.delete(rule)
     await db.commit()
 
-# Public/Dealer accessible tax rules
+# Public/Dealer accessible tax categories (GST Slabs)
+@router.get("/finance/tax-categories", response_model=List[TaxCategoryOut])
+async def get_tax_categories(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """List all active GST slabs for selection during product creation"""
+    gst_logger.info("[GST DIAG] Dealer requested tax categories")
+    result = await db.execute(
+        select(TaxCategory).where(TaxCategory.is_active == True).order_by(TaxCategory.name)
+    )
+    categories = result.scalars().all()
+    gst_logger.info(f"[GST DIAG] Returning {len(categories)} slabs")
+    for cat in categories:
+        gst_logger.info(f"[GST DIAG] Slab id={cat.id} name={cat.name} igst={cat.igst_rate} cgst={cat.cgst_rate} sgst={cat.sgst_rate}")
+    return categories
+
+# Public/Dealer accessible tax rules — DEPRECATED: kept only for backward compatibility
+# New application flow uses GET /finance/tax-categories (GST Slabs) instead
 @router.get("/finance/tax-rules", response_model=List[TaxRuleOut])
 async def get_tax_rules(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """List all active tax rules for selection during product creation"""
+    """[DEPRECATED] List all active tax rules. Use /finance/tax-categories instead."""
+    gst_logger.warning(
+        "[LEGACY API] GET /finance/tax-rules called | Deprecated | "
+        "Use /finance/tax-categories instead"
+    )
     result = await db.execute(
         select(TaxRule).where(TaxRule.is_active == True).order_by(TaxRule.priority.desc())
     )
@@ -377,8 +402,8 @@ async def preview_tax_calculation(
         inclusive_price=request.inclusive_price,
         qty=request.quantity,
         product_id=request.product_id,
-        buyer_state=request.buyer_state,
-        seller_state=request.seller_state
+        buyer_state_id=request.buyer_state_id,
+        seller_state_id=request.seller_state_id
     )
     return result
 

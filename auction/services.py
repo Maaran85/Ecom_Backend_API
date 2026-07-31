@@ -454,8 +454,8 @@ async def finalize_auction(db: AsyncSession, auction_id: UUID):
                 base_price=bid.bid_amount, 
                 qty=bid.allocated_qty, 
                 product_id=auction.product_id, 
-                buyer_state=None, 
-                seller_state=None,
+                buyer_state_id=None, 
+                seller_state_id=None,
                 is_inclusive=False
             )
             bids_tax_data.append((bid, tax_data))

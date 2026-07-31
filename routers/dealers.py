@@ -3368,6 +3368,37 @@ async def update_dealer(
     
     return dealer
 
+REQUIRED_APPROVAL_FIELDS = [
+    "business_name",
+    "business_address",
+    "city",
+    "pincode",
+    "country_id",
+    "state_id",
+    "gst_number",
+]
+
+def _validate_dealer_for_approval(dealer: Dealer):
+    """Validate that the dealer profile is complete before approval.
+
+    Collects all missing mandatory fields and raises a single HTTP 400
+    listing every missing field. Returns True if the profile is complete.
+    """
+    missing = []
+    for field in REQUIRED_APPROVAL_FIELDS:
+        value = getattr(dealer, field, None)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.append(field)
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Dealer profile is incomplete. Complete the following required fields before approval.",
+                "missing_fields": missing,
+            }
+        )
+    return True
+
 @router.put("/{dealer_id}/approve", response_model=DealerSchema)
 async def approve_dealer(
     dealer_id: UUID,
@@ -3377,7 +3408,7 @@ async def approve_dealer(
     """Approve dealer (admin only)"""
     result = await db.execute(
         select(Dealer).where(Dealer.is_deleted == False)
-        .options(selectinload(Dealer.user))
+        .options(selectinload(Dealer.user), selectinload(Dealer.state_rel))
         .where(Dealer.id == dealer_id)
     )
     dealer = result.scalar_one_or_none()
@@ -3391,6 +3422,9 @@ async def approve_dealer(
     # Extract email and business name before committing, as commit expires attributes
     dealer_email = dealer.user.email if (dealer.user and dealer.user.email) else None
     business_name = dealer.business_name
+    
+    # Do not approve incomplete dealer profiles
+    _validate_dealer_for_approval(dealer)
     
     dealer.is_approved = True
     dealer.access_status = 'active'
@@ -3406,7 +3440,7 @@ async def approve_dealer(
             name="Primary Warehouse",
             address=dealer.business_address or "Head Office",
             city=dealer.city,
-            state=dealer.state,
+            state=dealer.state_name,
             state_id=dealer.state_id,
             country_id=dealer.country_id,
             pincode=dealer.pincode,

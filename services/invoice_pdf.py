@@ -261,7 +261,12 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         item_price = getattr(item, 'price', 0.0) or 0.0
         item_total = item_price * item_qty
 
-        total_rate = cgst_rate + sgst_rate + igst_rate
+        if cgst_rate > 0 or sgst_rate > 0:
+            total_rate = cgst_rate + sgst_rate
+        elif igst_rate > 0:
+            total_rate = igst_rate
+        else:
+            total_rate = 0
         unit_price_excl = item_price / (1 + (total_rate / 100)) if total_rate else item_price
         net_amt = unit_price_excl * item_qty
         item_tax_amt = cgst_amt + sgst_amt + igst_amt

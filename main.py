@@ -33,6 +33,18 @@ app.add_middleware(SlowAPIMiddleware)
 
 from fastapi.encoders import jsonable_encoder
 
+import traceback
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    print(f"GLOBAL EXCEPTION: {request.method} {request.url}")
+    print(tb)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error", "traceback": tb}
+    )
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     try:
@@ -138,3 +150,14 @@ async def startup_event():
 
     # Start the support escalation background loop
     asyncio.create_task(start_support_escalation_loop())
+
+    # GST configuration startup log
+    import logging
+    gst_logger = logging.getLogger("gst")
+    gst_logger.info(
+        "[GST] Configuration Loaded | "
+        "Primary Tax Source: GST Slabs (Tax Categories) | "
+        "Legacy TaxRule Support: Enabled | "
+        "New Product Flow: tax_category_id \u2192 TaxService | "
+        "Legacy Fallback: tax_rule_id (historical products only)"
+    )

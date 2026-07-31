@@ -130,8 +130,8 @@ class TaxCalculatorRequest(BaseModel):
     product_id: UUID
     inclusive_price: float
     quantity: int = 1
-    buyer_state: Optional[str] = None
-    seller_state: Optional[str] = None
+    buyer_state_id: Optional[int] = None
+    seller_state_id: Optional[int] = None
 
 
 # --- Dealer Remittance Schemas ---
