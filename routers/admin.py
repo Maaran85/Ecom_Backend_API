@@ -56,6 +56,7 @@ class DealerAdminUpdate(BaseModel):
     business_name: Optional[str] = None
     business_address: Optional[str] = None
     gst_number: Optional[str] = None
+    organization_type: Optional[str] = None  # individual, huf, company, llp, private_limited, ...
     business_phone: Optional[str] = None
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None

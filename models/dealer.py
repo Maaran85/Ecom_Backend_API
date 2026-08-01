@@ -40,6 +40,7 @@ class Dealer(Base):
     reject_reason = Column(String, nullable=True)
     
     # Company Details Extension
+    organization_type = Column(String, nullable=True)  # individual, huf, company, llp, private_limited, ...
     city = Column(String, nullable=True)
     pincode = Column(String, nullable=True)
     country_id = Column(Integer, ForeignKey('countries.id'), nullable=True)

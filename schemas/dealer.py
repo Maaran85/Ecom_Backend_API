@@ -58,6 +58,7 @@ class DealerProfileComplete(BaseModel):
     state_id: Optional[int] = None
     lat_long: Optional[str] = None
     business_phone: Optional[str] = None
+    organization_type: Optional[str] = None  # individual, huf, company, llp, private_limited, ...
     
     # Documents
     company_photo_url: Optional[str] = None
@@ -105,6 +106,7 @@ class DealerUpdate(BaseModel):
     business_name: Optional[str] = None
     business_address: Optional[str] = None
     gst_number: Optional[str] = None
+    organization_type: Optional[str] = None  # individual, huf, company, llp, private_limited, ...
     delivery_charge: Optional[float] = None
     free_delivery_above: Optional[float] = None
     estimated_delivery_days: Optional[int] = None
@@ -124,6 +126,7 @@ class Dealer(DealerBase):
     free_delivery_above: float
     estimated_delivery_days: int
     platform_fee_amount: float
+    organization_type: Optional[str] = None  # individual, huf, company, llp, private_limited, ...
     created_at: datetime
     
     city: Optional[str] = None

@@ -1,5 +1,5 @@
 from uuid import UUID
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional
 from datetime import datetime
 from models.cart import OrderStatus
@@ -92,8 +92,27 @@ class Order(OrderBase):
     igst_amount: float = 0.0
     is_auction_order: bool = False
     created_at: datetime
+    shipping_address_id: Optional[int] = None
+    billing_address_id: Optional[int] = None
+    shipping_address: Optional[str] = None
     items: List[OrderItem] = []
     returns: List["schemas.order_management.OrderReturn"] = []
+
+    @field_validator('shipping_address', mode='before')
+    def validate_shipping_address(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        street = getattr(v, 'address_line1', getattr(v, 'street_address', ''))
+        city = getattr(v, 'city', '')
+        state_rel = getattr(v, 'state_rel', None)
+        state = state_rel.name if state_rel else getattr(v, 'state', '')
+        zip_code = getattr(v, 'pincode', getattr(v, 'postal_code', ''))
+        parts = [p for p in [street, city, state] if p]
+        if parts:
+            return ", ".join(parts) + (f" - {zip_code}" if zip_code else "")
+        return None
 
     class Config:
         from_attributes = True

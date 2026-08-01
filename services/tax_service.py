@@ -36,16 +36,29 @@ class TaxService:
             return rule
             
         # Optional: check parent category if no rule on direct category
-        if product.category and product.category.parent_id:
-             result = await db.execute(
-                 select(TaxRule)
-                 .where(and_(TaxRule.category_id == product.category.parent_id, TaxRule.is_active == True))
-                 .order_by(TaxRule.priority.desc())
-                 .limit(1)
-             )
-             rule = result.scalar_one_or_none()
-             if rule:
-                 return rule
+        if product.category_id:
+             category = await db.get(Category, product.category_id)
+             if category and category.parent_id:
+                 result = await db.execute(
+                     select(TaxRule)
+                     .where(and_(TaxRule.category_id == category.parent_id, TaxRule.is_active == True))
+                     .order_by(TaxRule.priority.desc())
+                     .limit(1)
+                 )
+                 rule = result.scalar_one_or_none()
+                 if rule:
+                     return rule
+
+        # 3. Global fallback rule
+        result = await db.execute(
+            select(TaxRule)
+            .where(and_(TaxRule.category_id.is_(None), TaxRule.product_id.is_(None), TaxRule.is_active == True))
+            .order_by(TaxRule.priority.desc())
+            .limit(1)
+        )
+        rule = result.scalar_one_or_none()
+        if rule:
+            return rule
 
         return None
 
@@ -57,6 +70,7 @@ class TaxService:
         If is_inclusive is True, base_price includes tax. If False, base_price excludes tax.
         """
         rule = await TaxService.get_applicable_tax_rule(db, product_id)
+        product = await db.get(Product, product_id) if product_id else None
         
         # Default if no rule found
         cgst_rate = 0.0
@@ -64,7 +78,14 @@ class TaxService:
         igst_rate = 0.0
         tax_category_id = None
         
-        if rule:
+        if product and product.tax_category_id:
+            tax_category = await db.get(TaxCategory, product.tax_category_id)
+            if tax_category:
+                tax_category_id = tax_category.id
+                cgst_rate = tax_category.cgst_rate
+                sgst_rate = tax_category.sgst_rate
+                igst_rate = tax_category.igst_rate
+        elif rule:
             tax_category = await db.get(TaxCategory, rule.tax_category_id)
             if tax_category:
                 tax_category_id = tax_category.id

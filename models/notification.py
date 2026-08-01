@@ -23,6 +23,9 @@ class NotificationType(str, enum.Enum):
     PROMOTIONAL = "promotional"
     RIDER_APPROVED = "rider_approved"
     RIDER_REJECTED = "rider_rejected"
+    SETTLEMENT_GENERATED = "settlement_generated"
+    SETTLEMENT_APPROVED = "settlement_approved"
+    SETTLEMENT_PAID = "settlement_paid"
 
 class NotificationChannel(str, enum.Enum):
     EMAIL = "email"

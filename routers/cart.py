@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update
 from sqlalchemy.orm import selectinload, joinedload
@@ -21,11 +21,11 @@ from models.invoice import OrderInvoice as OrderInvoiceModel
 from models.address import Address as AddressModel
 from fastapi.responses import StreamingResponse
 
-
 from services.notification import EmailService
 from datetime import datetime, timezone
 from pydantic import BaseModel
 from typing import Optional
+from uuid import UUID
 import secrets
 import string
 from services.tax_service import TaxService
@@ -42,6 +42,13 @@ class OrderRequest(BaseModel):
     billing_address_id: Optional[int] = None
     use_wallet: Optional[bool] = False
     wallet_amount: Optional[float] = None
+
+    # Buy Now fields
+    is_buy_now: Optional[bool] = False
+    product_id: Optional[UUID] = None
+    variant_id: Optional[UUID] = None
+    quantity: Optional[int] = 1
+    size: Optional[str] = None
 
 router = APIRouter()
 
@@ -61,19 +68,25 @@ async def add_to_cart(
     
     print(f"[DEBUG] ADD TO CART: product_id={product_id}, variant_id={variant_id}, quantity={quantity}")
     
-    # Verify product exists
+    # Verify product exists, is approved, and seller is active
     prod_check = await db.execute(
-        select(ProductModel.id).where(ProductModel.id == product_id)
+        select(ProductModel)
+        .join(DealerModel, ProductModel.dealer_id == DealerModel.id)
+        .where(
+            ProductModel.id == product_id,
+            ProductModel.is_deleted == False,
+            ProductModel.is_approved == True,
+            DealerModel.access_status == 'active',
+            DealerModel.is_active == True,
+            DealerModel.is_deleted == False
+        )
     )
     product_exists = prod_check.scalar_one_or_none()
-    print(f"[DEBUG] ADD TO CART: Product exists? {product_exists is not None}")
     if product_exists is None:
-        print(f"[DEBUG] ADD TO CART: Product ID {product_id} NOT FOUND in products table!")
-        from models.product import ProductModel as ProductModelCls
-        print(f"[DEBUG] ADD TO CART: Available products (first 5):")
-        available_prods = await db.execute(select(ProductModelCls.id, ProductModelCls.name).limit(5))
-        for prod_id, prod_name in available_prods.fetchall():
-            print(f"[DEBUG] ADD TO CART:   Product ID: {prod_id}, Name: {prod_name}")
+        raise HTTPException(
+            status_code=400,
+            detail="This product is currently unavailable or the seller is inactive."
+        )
 
     # Check if item with SAME product AND same size AND same variant already in cart
     result = await db.execute(
@@ -109,7 +122,7 @@ async def add_to_cart(
 
     await db.commit()
 
-    # Re-fetch with eager loading — MUST match size as well to stay unique
+    # Re-fetch with eager loading
     res = await db.execute(
         select(CartItemModel)
         .where(
@@ -125,13 +138,9 @@ async def add_to_cart(
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
-
-
     )
-    # Use first() instead of scalar_one() to be safer during high-concurrency duplicates
     cart_item = res.scalar_one_or_none()
     if not cart_item:
-        # Fallback if somehow missing
         res = await db.execute(
             select(CartItemModel)
             .where(CartItemModel.customer_id == customer_id, CartItemModel.product_id == product_id)
@@ -142,7 +151,6 @@ async def add_to_cart(
                     selectinload(ProductModel.children).selectinload(ProductModel.children)
                 )
             )
-
             .limit(1)
         )
         cart_item = res.scalar_one()
@@ -165,8 +173,6 @@ async def get_cart(
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
-
-
     )
     items = result.scalars().all()
     return items
@@ -179,7 +185,6 @@ async def update_cart_item(
     db: AsyncSession = Depends(get_db)
 ):
     """Update cart item quantity"""
-    # Verify ownership with a lightweight query
     result = await db.execute(
         select(CartItemModel.id)
         .where(CartItemModel.id == item_id, CartItemModel.customer_id == current_user.id)
@@ -189,7 +194,6 @@ async def update_cart_item(
     if update_in.quantity <= 0:
         raise HTTPException(status_code=400, detail="Quantity must be at least 1")
 
-    # Update using SQL — no ORM attribute access after commit
     await db.execute(
         update(CartItemModel)
         .where(CartItemModel.id == item_id)
@@ -208,8 +212,6 @@ async def update_cart_item(
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
             )
         )
-
-
     )
     return res.scalar_one()
 
@@ -241,50 +243,15 @@ async def create_order(
     current_user: CustomerUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Create order from cart items (checkout)"""
-    # Capture user attrs NOW before any db writes expire the ORM object
+    """Create order (Supports both Cart Checkout and Buy Now)"""
     customer_id = int(current_user.id)
     user_email = str(current_user.email)
 
-    result = await db.execute(
-        select(CartItemModel)
-        .join(ProductModel, CartItemModel.product_id == ProductModel.id)
-        .join(DealerModel, ProductModel.dealer_id == DealerModel.id)
-        .where(
-            CartItemModel.customer_id == customer_id,
-            DealerModel.access_status == 'active',
-            DealerModel.is_active == True, DealerModel.is_deleted == False,
-            ProductModel.is_approved == True
-        )
-        .options(
-            joinedload(CartItemModel.product).options(
-                joinedload(ProductModel.dealer).selectinload(DealerModel.state_rel),
-                selectinload(ProductModel.children).selectinload(ProductModel.children)
-            )
-        )
-
-
-
-    )
-    cart_items = result.scalars().all()
-    
-    # Check if some items were filtered out due to dealer status
-    from sqlalchemy import func
-    all_cart_res = await db.execute(select(func.count(CartItemModel.id)).where(CartItemModel.customer_id == customer_id))
-    if cart_items and len(cart_items) < all_cart_res.scalar():
-         raise HTTPException(
-             status_code=400, 
-             detail="Some items in your cart are no longer available as the seller is currently inactive. Please update your cart."
-         )
-    
-    if not cart_items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
-    
     total_amount = 0.0
     total_delivery_charge = 0.0
     order_items_data = []
-    stock_updates = []  # (product_id, deduct_qty)
-    dealer_subtotals: dict[int, float] = {}  # dealer_id -> subtotal of their items
+    stock_updates = []
+    dealer_subtotals: dict[int, float] = {}
 
     # Fetch buyer state_id from shipping address
     shipping_address_state_id = None
@@ -297,118 +264,186 @@ async def create_order(
         if shipping_addr and shipping_addr.state_rel:
             shipping_address_state_id = shipping_addr.state_rel.id
             shipping_address = shipping_addr
-            
-            print(f"\n{'=' * 80}")
-            print(f"[GST DEBUG] STAGE 1: GST Checkout Flow - Input Values")
-            print(f"{'=' * 80}")
-            print(f"[GST DEBUG] STAGE 1: buyer_state_id = {shipping_address_state_id}")
-            print(f"[GST DEBUG] STAGE 1: seller_state_id = NULL (will be set from product/dealer)")
-            print(f"[GST DEBUG] STAGE 1: dealer.state_id = NULL (will be set from product/dealer)")
-            print(f"[GST DEBUG] STAGE 1: shipping_address.state_id = {shipping_address_state_id}")
-            print(f"{'=' * 80}\n")
-            print(f"[DEBUG] STAGE 1: BEFORE TAX SERVICE CALCULATION")
-            print(f"[DEBUG] STAGE 1: buyer_state_id = {shipping_address_state_id}")
-            print(f"[DEBUG] STAGE 1: seller_state_id = NULL (will be set per product)")
-            print(f"[DEBUG] STAGE 1: shipping_address.state_id = {shipping_address_state_id}")
-            print()
 
-    for cart_item in cart_items:
-        product = cart_item.product
+    if order_request and order_request.is_buy_now:
+        # ── PATH B: BUY NOW FLOW (Direct Purchase - Does NOT query or clear Cart) ──
+        if not order_request.product_id:
+            raise HTTPException(status_code=400, detail="product_id is required for Buy Now order.")
+
+        qty = max(1, int(order_request.quantity or 1))
+
+        # Load product directly
+        prod_res = await db.execute(
+            select(ProductModel)
+            .where(ProductModel.id == order_request.product_id)
+            .options(
+                joinedload(ProductModel.dealer).selectinload(DealerModel.state_rel),
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
+            )
+        )
+        product = prod_res.scalar_one_or_none()
 
         if not product:
-            raise HTTPException(status_code=404, detail=f"Product {cart_item.product_id} not found")
+            raise HTTPException(status_code=404, detail="Product not found.")
+        if not product.is_approved:
+            raise HTTPException(status_code=400, detail="This product is currently pending approval.")
+        if product.is_deleted:
+            raise HTTPException(status_code=400, detail="This product is no longer available.")
+        if not product.dealer or not product.dealer.is_active or product.dealer.access_status != 'active' or getattr(product.dealer, 'is_deleted', False):
+            raise HTTPException(status_code=400, detail="The seller for this product is currently inactive.")
 
-        # Check stock - if variant is selected, check variant stock
-        if cart_item.variant_id:
-            variant = next((v for v in (product.children or []) if v.id == cart_item.variant_id), None)
-            if not variant:
-                # If variant not loaded, fetch it
-                res = await db.execute(select(ProductModel).where(ProductModel.id == cart_item.variant_id))
-                variant = res.scalar_one_or_none()
-            
-            if not variant:
-                 raise HTTPException(status_code=404, detail=f"Variant {cart_item.variant_id} not found")
-            
-            if variant.stock < cart_item.quantity:
-                raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name} (Size: {variant.sizes[0] if variant.sizes else 'Unknown'})")
+        # Check stock
+        if order_request.variant_id:
+            target_variant = next((v for v in (product.children or []) if v.id == order_request.variant_id), None)
+            if not target_variant:
+                res_v = await db.execute(select(ProductModel).where(ProductModel.id == order_request.variant_id))
+                target_variant = res_v.scalar_one_or_none()
+            if not target_variant:
+                raise HTTPException(status_code=404, detail="Selected variant not found.")
+            if target_variant.stock < qty:
+                raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
         else:
-            # Check main stock for simple product
-            if product.stock < cart_item.quantity:
+            if product.stock < qty:
                 raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
 
         price = float(product.selling_price if product.selling_price else (product.mrp or product.dealer_price))
-        line_total = price * cart_item.quantity
-        total_amount += line_total
+        total_amount = price * qty
+        if product.dealer_id:
+            dealer_subtotals[product.dealer_id] = total_amount
 
-        # Track per-dealer subtotal for delivery fee calc
-        d_id = product.dealer_id
-        if d_id:
-            dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + line_total
-
-        # --- FINANCIAL SPLITS (Tax & Platform Commission) ---
-        # 1. Tax Calculation (from inclusive price)
-        # Resolve buyer/seller GST state codes (e.g. '33') from the address/dealer.
         buyer_state = shipping_address.state_rel.state_code if (shipping_address and shipping_address.state_rel) else None
         seller_state = product.dealer.state_code if product.dealer else None
-        
-        print(f"[DEBUG] STAGE 2: BEFORE TaxService.calculate_item_tax()")
-        print(f"[DEBUG] STAGE 2: buyer_state = {buyer_state}")
-        print(f"[DEBUG] STAGE 2: seller_state = {seller_state}")
-        print(f"[DEBUG] STAGE 2: dealer.state_code = {seller_state}")
-        print(f"[DEBUG] STAGE 2: shipping_address.state_code = {buyer_state}")
-        print()
-        
+
         tax_res = await TaxService.calculate_item_tax(
             db=db,
             base_price=price,
-            qty=cart_item.quantity,
+            qty=qty,
             product_id=product.id,
             buyer_state=buyer_state,
             seller_state=seller_state
         )
-        
-        print(f"[DEBUG] STAGE 2: AFTER TaxService.calculate_item_tax()")
-        print(f"[DEBUG] STAGE 2: tax_data = {tax_res}")
-        print(f"[DEBUG] STAGE 2: is_inter_state = {tax_res.get('is_inter_state')}")
-        print(f"[DEBUG] STAGE 2: cgst_rate = {tax_res.get('cgst_rate')}")
-        print(f"[DEBUG] STAGE 2: sgst_rate = {tax_res.get('sgst_rate')}")
-        print(f"[DEBUG] STAGE 2: igst_rate = {tax_res.get('igst_rate')}")
-        print(f"[DEBUG] STAGE 2: cgst_amount = {tax_res.get('cgst_amount')}")
-        print(f"[DEBUG] STAGE 2: sgst_amount = {tax_res.get('sgst_amount')}")
-        print(f"[DEBUG] STAGE 2: igst_amount = {tax_res.get('igst_amount')}")
-        print()
-        
-        # 2. Platform Commission Calculation (EXTRACTED from the bundled price)
-        # Using Hidden Markup Strategy: Platform Fee is added on top of (Base + Tax).
-        # To extract: Fee = Total * (Fee% / (100 + Fee%))
+
         fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
-        # Platform fee is a flat amount per unit
-        platform_fee = fee_amount * cart_item.quantity
+        platform_fee = fee_amount * qty
 
         order_items_data.append({
-            "product_id": cart_item.product_id,
+            "product_id": product.id,
             "product_name": product.name,
-            "variant_id": cart_item.variant_id,
+            "variant_id": order_request.variant_id,
             "category_id": product.category_id,
-            "quantity": int(cart_item.quantity),
+            "quantity": qty,
             "price": price,
-            "size": cart_item.size,
-            "variant_attributes": cart_item.variant_attributes,
-            "dealer_id": d_id,
-            # Tax and fee data
+            "size": order_request.size,
+            "variant_attributes": None,
+            "dealer_id": product.dealer_id,
             "tax_data": tax_res,
             "platform_fee": platform_fee,
             "referral_commission_rate": product.referral_commission_rate
         })
-        # For stock updates, we'll handle variant stock deduction too
         stock_updates.append({
             "product_id": product.id,
-            "variant_id": cart_item.variant_id,
-            "quantity": int(cart_item.quantity)
+            "variant_id": order_request.variant_id,
+            "quantity": qty
         })
+    else:
+        # ── PATH A: CART CHECKOUT FLOW ──
+        result = await db.execute(
+            select(CartItemModel)
+            .join(ProductModel, CartItemModel.product_id == ProductModel.id)
+            .join(DealerModel, ProductModel.dealer_id == DealerModel.id)
+            .where(
+                CartItemModel.customer_id == customer_id,
+                DealerModel.access_status == 'active',
+                DealerModel.is_active == True, DealerModel.is_deleted == False,
+                ProductModel.is_approved == True
+            )
+            .options(
+                joinedload(CartItemModel.product).options(
+                    joinedload(ProductModel.dealer).selectinload(DealerModel.state_rel),
+                    selectinload(ProductModel.children).selectinload(ProductModel.children)
+                )
+            )
+        )
+        cart_items = result.scalars().all()
+        
+        # Clean up any orphaned/unapproved/inactive cart items for this customer
+        all_cart_ids_res = await db.execute(select(CartItemModel.id).where(CartItemModel.customer_id == customer_id))
+        all_cart_ids = {row[0] for row in all_cart_ids_res.fetchall()}
+        valid_cart_ids = {ci.id for ci in cart_items}
+        invalid_cart_ids = list(all_cart_ids - valid_cart_ids)
+
+        if invalid_cart_ids:
+            await db.execute(delete(CartItemModel).where(CartItemModel.id.in_(invalid_cart_ids)))
+            await db.commit()
+
+        if not cart_items:
+            raise HTTPException(status_code=400, detail="The items in your cart are no longer available. Please update your cart.")
+        
+        for cart_item in cart_items:
+            product = cart_item.product
+
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Product {cart_item.product_id} not found")
+
+            if cart_item.variant_id:
+                variant = next((v for v in (product.children or []) if v.id == cart_item.variant_id), None)
+                if not variant:
+                    res = await db.execute(select(ProductModel).where(ProductModel.id == cart_item.variant_id))
+                    variant = res.scalar_one_or_none()
+                
+                if not variant:
+                     raise HTTPException(status_code=404, detail=f"Variant {cart_item.variant_id} not found")
+                
+                if variant.stock < cart_item.quantity:
+                    raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name} (Size: {variant.sizes[0] if variant.sizes else 'Unknown'})")
+            else:
+                if product.stock < cart_item.quantity:
+                    raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
+
+            price = float(product.selling_price if product.selling_price else (product.mrp or product.dealer_price))
+            line_total = price * cart_item.quantity
+            total_amount += line_total
+
+            d_id = product.dealer_id
+            if d_id:
+                dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + line_total
+
+            buyer_state = shipping_address.state_rel.state_code if (shipping_address and shipping_address.state_rel) else None
+            seller_state = product.dealer.state_code if product.dealer else None
+            
+            tax_res = await TaxService.calculate_item_tax(
+                db=db,
+                base_price=price,
+                qty=cart_item.quantity,
+                product_id=product.id,
+                buyer_state=buyer_state,
+                seller_state=seller_state
+            )
+            
+            fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
+            platform_fee = fee_amount * cart_item.quantity
+
+            order_items_data.append({
+                "product_id": cart_item.product_id,
+                "product_name": product.name,
+                "variant_id": cart_item.variant_id,
+                "category_id": product.category_id,
+                "quantity": int(cart_item.quantity),
+                "price": price,
+                "size": cart_item.size,
+                "variant_attributes": cart_item.variant_attributes,
+                "dealer_id": d_id,
+                "tax_data": tax_res,
+                "platform_fee": platform_fee,
+                "referral_commission_rate": product.referral_commission_rate
+            })
+            stock_updates.append({
+                "product_id": product.id,
+                "variant_id": cart_item.variant_id,
+                "quantity": int(cart_item.quantity)
+            })
 
     # ── Delivery Charge Breakdown ──────────────────────────────────────────────
-    # Map dealer_id -> (fee, threshold, dealer_items_total)
     dealer_fees_map: dict[int, dict] = {}
     if dealer_subtotals:
         dealers_res = await db.execute(
@@ -439,9 +474,7 @@ async def create_order(
         
         target_id = v_id if v_id else p_id
         
-        # Deduct from ProductInventory
         from models.inventory import ProductInventory
-        # Naive deduction from the hub with the most stock
         inv_result = await db.execute(select(ProductInventory).where(ProductInventory.product_id == target_id).order_by(ProductInventory.stock.desc()))
         inv = inv_result.scalars().first()
         if inv:
@@ -494,7 +527,6 @@ async def create_order(
 
         applied_coupon = coupon_obj
 
-    # If coupon applied: increment usage
     if applied_coupon:
         await db.execute(
             update(CouponModel)
@@ -526,17 +558,14 @@ async def create_order(
     for item_data in order_items_data:
         item_subtotal = round(item_data["price"] * item_data["quantity"], 2)
         
-        # Pro-rata discount
         item_discount = 0.0
         if total_amount > 0:
             item_discount = round((item_subtotal / total_amount) * total_discount_amount, 2)
             
-        # Pro-rata wallet discount
         item_wallet_discount = 0.0
         if total_amount > 0 and total_wallet_discount > 0:
             item_wallet_discount = round((item_subtotal / total_amount) * total_wallet_discount, 2)
             
-        # Pro-rata delivery charge (for same dealer grouping)
         item_delivery = 0.0
         dealer_info = dealer_fees_map.get(item_data["dealer_id"], {"fee": 0.0, "total_dealer_subtotal": 0.0})
         if dealer_info["total_dealer_subtotal"] > 0:
@@ -546,13 +575,6 @@ async def create_order(
         final_item_total = round(max(0.0, item_subtotal - total_item_discount) + item_delivery + item_data["platform_fee"], 2)
         
         tax_data = item_data["tax_data"]
-        
-        print(f"[DEBUG] STAGE 3: BEFORE creating Order model")
-        print(f"[DEBUG] STAGE 3: Order.is_inter_state = {tax_data.get('is_inter_state')}")
-        print(f"[DEBUG] STAGE 3: Order.cgst_amount = {tax_data.get('cgst_amount')}")
-        print(f"[DEBUG] STAGE 3: Order.sgst_amount = {tax_data.get('sgst_amount')}")
-        print(f"[DEBUG] STAGE 3: Order.igst_amount = {tax_data.get('igst_amount')}")
-        print()
         
         order_result = await db.execute(
             sql_insert(OrderModel).values(
@@ -568,14 +590,12 @@ async def create_order(
                 coupon_code=applied_coupon.code if applied_coupon else None,
                 payment_method=order_request.payment_method if order_request else "COD",
                 shipping_address_id=order_request.address_id if order_request else None,
-                # Tax Fields
                 tax_amount=tax_data["total_tax"],
                 cgst_amount=tax_data["cgst_amount"],
                 sgst_amount=tax_data["sgst_amount"],
                 igst_amount=tax_data["igst_amount"],
                 is_inter_state=tax_data["is_inter_state"],
                 billing_address_id=order_request.billing_address_id if order_request else None,
-                # Platform Revenue
                 platform_fee_amount=item_data["platform_fee"]
             ).returning(OrderModel.id)
         )
@@ -594,16 +614,6 @@ async def create_order(
                 )
             )
         
-        print(f"[DEBUG] STAGE 4: BEFORE creating OrderItem")
-        print(f"[DEBUG] STAGE 4: OrderItem.cgst_rate = {tax_data.get('cgst_rate')}")
-        print(f"[DEBUG] STAGE 4: OrderItem.sgst_rate = {tax_data.get('sgst_rate')}")
-        print(f"[DEBUG] STAGE 4: OrderItem.igst_rate = {tax_data.get('igst_rate')}")
-        print(f"[DEBUG] STAGE 4: OrderItem.cgst_amount = {tax_data.get('cgst_amount')}")
-        print(f"[DEBUG] STAGE 4: OrderItem.sgst_amount = {tax_data.get('sgst_amount')}")
-        print(f"[DEBUG] STAGE 4: OrderItem.igst_amount = {tax_data.get('igst_amount')}")
-        print()
-        
-        # Insert matching OrderItem
         item_result = await db.execute(
             sql_insert(OrderItemModel).values(
                 order_id=new_order_id,
@@ -627,7 +637,6 @@ async def create_order(
         new_item_id = item_result.scalar_one()
         created_order_items_list.append((new_order_id, new_item_id, item_data))
 
-        # Checkout GST logging
         source = "tax_category_id" if tax_data.get("tax_category_id") else "Legacy tax_rule_id fallback"
         prod_name = item_data.get('product_name', '')
         gst_logger.info(
@@ -652,8 +661,7 @@ async def create_order(
             source
         )
         
-        # Insert OrderInvoice
-        invoice_result = await db.execute(
+        await db.execute(
             sql_insert(OrderInvoiceModel).values(
                 order_id=new_order_id,
                 dealer_id=item_data["dealer_id"],
@@ -664,7 +672,6 @@ async def create_order(
             )
         )
         
-        # Insert into Tax Ledger for audit trail
         if tax_data["tax_category_id"]:
             await db.execute(
                 sql_insert(TaxLedger).values(
@@ -679,7 +686,6 @@ async def create_order(
                 )
             )
 
-    # Track Category-Specific Lifetime Referral Commission if customer was referred
     try:
         from models.referral import (
             CustomerReferralProfile,
@@ -726,81 +732,20 @@ async def create_order(
     except Exception as e:
         print(f"DEBUG: Referral commission creation error: {e}")
 
-    # Clear cart
-    await db.execute(
-        delete(CartItemModel).where(CartItemModel.customer_id == customer_id)
-    )
-    
-    print(f"\n[DEBUG] STAGE 5: BEFORE session.commit()")
-    print(f"[DEBUG] STAGE 5: About to commit the transaction...")
-    print()
+    # Clear cart only for normal Cart Checkout (Path A)
+    if not (order_request and order_request.is_buy_now):
+        await db.execute(
+            delete(CartItemModel).where(CartItemModel.customer_id == customer_id)
+        )
     
     await db.commit()
-    
-    print(f"\n[DEBUG] STAGE 5: AFTER session.commit()")
-    print(f"[DEBUG] STAGE 5: Querying database for the created order...")
-    print()
-    
-    # Query the database for the SAME order that was just created
-    # Get the most recent order for this customer
-    import sqlalchemy as sql
-    
-    # Get the orders that were just created
-    if created_order_ids:
-        # Query Orders table
-        orders_query = sql.select(
-            OrderModel.id,
-            OrderModel.is_inter_state,
-            OrderModel.cgst_amount,
-            OrderModel.sgst_amount,
-            OrderModel.igst_amount
-        ).where(OrderModel.id.in_(created_order_ids))
-        
-        orders_result = await db.execute(orders_query)
-        orders = orders_result.mappings().all()
-        
-        print(f"[DEBUG] STAGE 5: Orders table values:")
-        for order in orders:
-            print(f"[DEBUG] STAGE 5:   Order ID: {order['id']}")
-            print(f"[DEBUG] STAGE 5:   is_inter_state: {order['is_inter_state']}")
-            print(f"[DEBUG] STAGE 5:   cgst_amount: {order['cgst_amount']}")
-            print(f"[DEBUG] STAGE 5:   sgst_amount: {order['sgst_amount']}")
-            print(f"[DEBUG] STAGE 5:   igst_amount: {order['igst_amount']}")
-            print()
-            
-            # Query OrderItems table for this order
-            items_query = sql.select(
-                OrderItemModel.order_id,
-                OrderItemModel.cgst_rate,
-                OrderItemModel.sgst_rate,
-                OrderItemModel.igst_rate,
-                OrderItemModel.cgst_amount,
-                OrderItemModel.sgst_amount,
-                OrderItemModel.igst_amount
-            ).where(OrderItemModel.order_id == order['id'])
-            
-            items_result = await db.execute(items_query)
-            items = items_result.mappings().all()
-            
-            print(f"[DEBUG] STAGE 5: OrderItems table values:")
-            for item in items:
-                print(f"[DEBUG] STAGE 5:   Order ID: {item['order_id']}")
-                print(f"[DEBUG] STAGE 5:   cgst_rate: {item['cgst_rate']}")
-                print(f"[DEBUG] STAGE 5:   sgst_rate: {item['sgst_rate']}")
-                print(f"[DEBUG] STAGE 5:   igst_rate: {item['igst_rate']}")
-                print(f"[DEBUG] STAGE 5:   cgst_amount: {item['cgst_amount']}")
-                print(f"[DEBUG] STAGE 5:   sgst_amount: {item['sgst_amount']}")
-                print(f"[DEBUG] STAGE 5:   igst_amount: {item['igst_amount']}")
-                print()
-    
-    # Send confirmation for each (or just once)
+
     background_tasks.add_task(
         EmailService.send_order_confirmation,
         to_email=user_email,
         order_data={"ids": created_order_ids, "total": total_amount}
     )
 
-    # SEND IN-APP NOTIFICATION
     try:
         from services.notification import AppNotificationService
         from models import NotificationType
@@ -816,7 +761,6 @@ async def create_order(
     except Exception as e:
         print(f"Error sending in-app notification: {e}")
     
-    # Re-fetch all created orders with eager loading
     res = await db.execute(
         select(OrderModel)
         .where(OrderModel.id.in_(created_order_ids))
@@ -826,9 +770,10 @@ async def create_order(
                 selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
             ),
-
             selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
-            selectinload(OrderModel.returns)
+            selectinload(OrderModel.returns),
+            selectinload(OrderModel.shipping_address).selectinload(AddressModel.state_rel),
+            selectinload(OrderModel.billing_address).selectinload(AddressModel.state_rel)
         )
         .order_by(OrderModel.created_at.desc())
     )
@@ -854,47 +799,21 @@ async def checkout_pending_order(
         raise HTTPException(status_code=404, detail="Order not found")
         
     if order.status != OrderStatus.PENDING:
-        raise HTTPException(status_code=400, detail=f"Order is not pending. Current status: {order.status}")
+        raise HTTPException(status_code=400, detail="Order is not in pending status")
         
-    if not order_request.address_id:
-        raise HTTPException(status_code=400, detail="Shipping address is required")
+    if order_request.address_id:
+        order.shipping_address_id = order_request.address_id
+    if order_request.billing_address_id:
+        order.billing_address_id = order_request.billing_address_id
+    if order_request.payment_method:
+        order.payment_method = order_request.payment_method
         
-    order.shipping_address_id = order_request.address_id
-    order.payment_method = order_request.payment_method or "COD"
-    order.status = OrderStatus.ORDER_PLACED
-    
-    for item in order.items:
-        item.status = "order_placed"
-        
-    user_email = current_user.email
-    order_id_val = order.id
-    order_total = order.total_amount
-    
+    order.status = OrderStatus.ORDER_PLACED.value
     await db.commit()
     
-    background_tasks.add_task(
-        EmailService.send_order_confirmation,
-        to_email=user_email,
-        order_data={"ids": [order_id_val], "total": order_total}
-    )
-    
-    try:
-        from services.notification import AppNotificationService
-        from models import NotificationType
-        await AppNotificationService.create_notification(
-            db,
-            customer_id=current_user.id,
-            type=NotificationType.ORDER_PLACED,
-            title="Order Placed!",
-            message=f"Your order ID {order_id_val} has been placed successfully. Thank you for shopping!"
-        )
-        await db.commit()
-    except Exception as e:
-        print(f"Error sending in-app notification: {e}")
-        
     res = await db.execute(
         select(OrderModel)
-        .where(OrderModel.id == order.id)
+        .where(OrderModel.id == order_id)
         .options(
             selectinload(OrderModel.items).joinedload(OrderItemModel.product).options(
                 joinedload(ProductModel.dealer),
@@ -902,134 +821,124 @@ async def checkout_pending_order(
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
             ),
             selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
-            selectinload(OrderModel.returns)
+            selectinload(OrderModel.returns),
+            selectinload(OrderModel.shipping_address).selectinload(AddressModel.state_rel),
+            selectinload(OrderModel.billing_address).selectinload(AddressModel.state_rel)
         )
     )
-    return res.scalars().all()
+    return [res.scalar_one()]
 
-@router.get("/orders", response_model=list, tags=["orders"])
+@router.get("/orders", response_model=List[Order], tags=["orders"])
 async def get_orders(
     current_user: CustomerUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all orders for the current user, newest first"""
+    """Get all orders for current user"""
     result = await db.execute(
         select(OrderModel)
         .where(OrderModel.customer_id == current_user.id)
         .options(
-            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.children).selectinload(ProductModel.children),
-            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.dealer),
-            selectinload(OrderModel.items).selectinload(OrderItemModel.product).selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
-            selectinload(OrderModel.items).selectinload(OrderItemModel.variant),
-            selectinload(OrderModel.items).selectinload(OrderItemModel.hub),
-            selectinload(OrderModel.returns).selectinload(OrderReturnModel.exchange_variant),
-            selectinload(OrderModel.shipping_address),
-            selectinload(OrderModel.payment)
+            selectinload(OrderModel.items).joinedload(OrderItemModel.product).options(
+                joinedload(ProductModel.dealer),
+                selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
+            ),
+            selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
+            selectinload(OrderModel.returns),
+            selectinload(OrderModel.shipping_address).selectinload(AddressModel.state_rel),
+            selectinload(OrderModel.billing_address).selectinload(AddressModel.state_rel)
         )
         .order_by(OrderModel.created_at.desc())
     )
-    orders = result.scalars().all()
-    
-    from schemas.cart import Order as OrderSchema
-    
-    response_list = []
-    for o in orders:
-        if hasattr(OrderSchema, 'model_validate'):
-            o_dict = OrderSchema.model_validate(o).model_dump()
-        else:
-            o_dict = OrderSchema.from_orm(o).dict()
-            
-        addr_str = "Home Address"
-        if o.shipping_address:
-            addr = o.shipping_address
-            street = getattr(addr, 'address_line1', getattr(addr, 'street_address', ''))
-            city = getattr(addr, 'city', '')
-            state = getattr(addr, 'state', '')
-            zip_code = getattr(addr, 'pincode', getattr(addr, 'postal_code', ''))
-            parts = [p for p in [street, city, state, zip_code] if p]
-            if parts:
-                addr_str = ", ".join(parts[:3]) + (f" - {zip_code}" if zip_code else "")
-        
-        o_dict["shipping_address"] = addr_str
-        response_list.append(o_dict)
-    
-    return response_list
+    return result.scalars().all()
 
-@router.get("/orders/{order_id}/invoice", tags=["orders"])
-async def download_invoice(
+@router.get("/orders/{order_id}", response_model=Order, tags=["orders"])
+async def get_order(
     order_id: int,
     current_user: CustomerUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Download PDF invoice for an order"""
+    """Get specific order details"""
     result = await db.execute(
         select(OrderModel)
         .where(OrderModel.id == order_id, OrderModel.customer_id == current_user.id)
         .options(
-            selectinload(OrderModel.items).selectinload(OrderItemModel.product),
+            selectinload(OrderModel.items).joinedload(OrderItemModel.product).options(
+                joinedload(ProductModel.dealer),
+                selectinload(ProductModel.category).selectinload(CategoryModel.attributes),
+                selectinload(ProductModel.children).selectinload(ProductModel.children)
+            ),
+            selectinload(OrderModel.items).joinedload(OrderItemModel.hub),
+            selectinload(OrderModel.returns),
             selectinload(OrderModel.shipping_address).selectinload(AddressModel.state_rel),
-            selectinload(OrderModel.billing_address).selectinload(AddressModel.state_rel),
-            selectinload(OrderModel.invoices).selectinload(OrderInvoiceModel.dealer).selectinload(DealerModel.state_rel)
+            selectinload(OrderModel.billing_address).selectinload(AddressModel.state_rel)
         )
     )
     order = result.scalar_one_or_none()
-    
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-        
-    if not order.invoices:
-        # Auto-create invoice on the fly if missing
-        dealer_id = None
-        if order.items and order.items[0].product:
-            dealer_id = order.items[0].product.dealer_id
-            
-        if not dealer_id:
-            # Try loading product dealer_id
-            prod_res = await db.execute(select(ProductModel).where(ProductModel.id == order.items[0].product_id))
-            prod = prod_res.scalar_one_or_none()
-            if prod:
-                dealer_id = prod.dealer_id
+    return order
 
-        if not dealer_id:
-            raise HTTPException(status_code=404, detail="Dealer information not found for this order")
+@router.get("/orders/{order_id}/invoice", tags=["orders"])
+async def download_order_invoice(
+    order_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate and download order invoice PDF"""
+    result = await db.execute(
+        select(OrderModel)
+        .where(OrderModel.id == order_id)
+        .options(
+            selectinload(OrderModel.items).joinedload(OrderItemModel.product).joinedload(ProductModel.dealer),
+            selectinload(OrderModel.invoices),
+            joinedload(OrderModel.shipping_address),
+            joinedload(OrderModel.billing_address)
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
+    invoice = order.invoices[0] if order.invoices else None
+    if not invoice:
         from services.tax_service import TaxService
-        inv_number = await TaxService.generate_tax_invoice_number(db)
-        new_inv = OrderInvoiceModel(
+        invoice = OrderInvoiceModel(
             order_id=order.id,
-            dealer_id=dealer_id,
-            invoice_number=inv_number,
-            total_amount=order.total_amount or 0.0,
-            tax_amount=order.tax_amount or 0.0,
-            is_reverse_charge=False
+            invoice_number=await TaxService.generate_tax_invoice_number(db),
+            taxable_amount=getattr(order, 'subtotal', 0.0) or 0.0,
+            cgst_amount=getattr(order, 'cgst_amount', 0.0) or 0.0,
+            sgst_amount=getattr(order, 'sgst_amount', 0.0) or 0.0,
+            igst_amount=getattr(order, 'igst_amount', 0.0) or 0.0,
+            total_tax=getattr(order, 'tax_amount', 0.0) or 0.0,
+            total_amount=getattr(order, 'total_amount', 0.0) or 0.0,
+            pdf_url=None
         )
-        db.add(new_inv)
+        db.add(invoice)
         await db.commit()
-        await db.refresh(new_inv)
-        
-        dealer_res = await db.execute(
-            select(DealerModel).where(DealerModel.id == dealer_id).options(selectinload(DealerModel.state_rel))
-        )
-        dealer = dealer_res.scalar_one_or_none()
-        invoice = new_inv
-    else:
-        invoice = order.invoices[0]
-        dealer = invoice.dealer
-    
+        await db.refresh(invoice)
+
+    dealer = None
+    if order.items and order.items[0].product:
+        dealer = order.items[0].product.dealer
+
     from services.invoice_pdf import generate_invoice_pdf
     pdf_buffer = generate_invoice_pdf(
         invoice=invoice,
         dealer=dealer,
         order=order,
         order_items=order.items,
-        billing_address=order.billing_address,
+        billing_address=order.billing_address or order.shipping_address,
         shipping_address=order.shipping_address
     )
-    
-    filename = f"Invoice_{invoice.invoice_number}.pdf"
-    
-    return StreamingResponse(
-        pdf_buffer, 
+
+    pdf_bytes = pdf_buffer.getvalue()
+    filename = f"Invoice_{order.order_number or order.id}.pdf"
+
+    return Response(
+        content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
     )

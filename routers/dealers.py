@@ -488,7 +488,7 @@ async def get_dealer_orders(
             pass
 
     # To get total count (distinct orders)
-    count_query = select(func.count(Order.id)).select_from(base_query.alias("sub"))
+    count_query = select(func.count()).select_from(base_query.subquery())
     total_count_result = await db.execute(count_query)
     total_count = total_count_result.scalar() or 0
     print(f"DEBUG: Found total_count={total_count} matching orders")
@@ -2096,31 +2096,42 @@ async def update_delivery_settings(
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @router.get("/delivery-preview")
 async def delivery_preview(
+    product_id: Optional[UUID] = None,
+    quantity: int = 1,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Customer: Real-time delivery charge breakdown for items currently in cart.
+    Customer: Real-time delivery charge breakdown for items currently in cart or single buy-now product.
     Returns per-dealer fees + total, so checkout can display them before placing order.
     """
     from models.cart import CartItem as CartItemModel
     from models.product import Product as ProductModel
 
-    # Fetch cart items with their products
-    res = await db.execute(
-        select(CartItemModel)
-        .where(CartItemModel.customer_id == current_user.id)
-        .options(__import__('sqlalchemy.orm', fromlist=['selectinload']).selectinload(CartItemModel.product))
-    )
-    cart_items = res.scalars().all()
-
-    # Group by dealer
     dealer_subtotals: dict[int, float] = {}
-    for ci in cart_items:
-        if ci.product and ci.product.dealer_id:
-            d_id = ci.product.dealer_id
-            price = float(ci.product.selling_price or ci.product.mrp or ci.product.dealer_price)
-            dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + price * ci.quantity
+
+    cart_items = []
+    if product_id:
+        # Buy Now mode: preview for single product
+        prod_res = await db.execute(select(ProductModel).where(ProductModel.id == product_id))
+        p = prod_res.scalar_one_or_none()
+        if p and p.dealer_id:
+            price = float(p.selling_price or p.mrp or p.dealer_price)
+            dealer_subtotals[p.dealer_id] = price * max(1, quantity)
+    else:
+        # Cart mode: preview for cart items
+        res = await db.execute(
+            select(CartItemModel)
+            .where(CartItemModel.customer_id == current_user.id)
+            .options(__import__('sqlalchemy.orm', fromlist=['selectinload']).selectinload(CartItemModel.product))
+        )
+        cart_items = res.scalars().all()
+
+        for ci in cart_items:
+            if ci.product and ci.product.dealer_id:
+                d_id = ci.product.dealer_id
+                price = float(ci.product.selling_price or ci.product.mrp or ci.product.dealer_price)
+                dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + price * ci.quantity
 
     if not dealer_subtotals:
         return {"dealers": [], "total_delivery_charge": 0.0}
@@ -2143,12 +2154,16 @@ async def delivery_preview(
         # Estimate delivery
         from datetime import datetime, timedelta
         
-        # Find maximum delivery days for this dealer's items in the cart
-        dealer_items = [ci for ci in cart_items if ci.product and ci.product.dealer_id == d.id]
+        # Find maximum delivery days for this dealer's items
         max_days = d.estimated_delivery_days or 7
-        for ci in dealer_items:
-            if ci.product.estimated_delivery_days and ci.product.estimated_delivery_days > max_days:
-                max_days = ci.product.estimated_delivery_days
+        if product_id and p and p.dealer_id == d.id:
+            if p.estimated_delivery_days and p.estimated_delivery_days > max_days:
+                max_days = p.estimated_delivery_days
+        else:
+            dealer_items = [ci for ci in cart_items if ci.product and ci.product.dealer_id == d.id]
+            for ci in dealer_items:
+                if ci.product.estimated_delivery_days and ci.product.estimated_delivery_days > max_days:
+                    max_days = ci.product.estimated_delivery_days
         
         est_date = datetime.now() + timedelta(days=max_days)
         formatted_date = est_date.strftime("%d %b %Y")

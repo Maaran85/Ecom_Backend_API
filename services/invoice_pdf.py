@@ -1,7 +1,11 @@
 import io
 import os
 from datetime import datetime
-from num2words import num2words
+try:
+    from num2words import num2words
+except ImportError:
+    def num2words(num, **kwargs):
+        return str(num)
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -130,8 +134,16 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     dealer_name = getattr(dealer, 'business_name', '') if dealer else 'SELLER'
     dealer_addr = getattr(dealer, 'business_address', '') if dealer else ''
     dealer_city = getattr(dealer, 'city', '') if dealer else ''
-    dealer_state_name = dealer.state_rel.name if (dealer and getattr(dealer, 'state_rel', None)) else ''
-    dealer_state_code = dealer.state_rel.state_code if (dealer and getattr(dealer, 'state_rel', None) and hasattr(dealer.state_rel, 'state_code')) else '29'
+    def _get_state_info(obj):
+        try:
+            rel = obj.__dict__.get('state_rel') if obj else None
+            if rel:
+                return str(getattr(rel, 'name', '') or ''), str(getattr(rel, 'state_code', '29') or '29')
+        except Exception:
+            pass
+        return '', '29'
+
+    dealer_state_name, dealer_state_code = _get_state_info(dealer)
     dealer_pin = getattr(dealer, 'pincode', '') if dealer else ''
     pan_no = getattr(dealer, 'pan_number', '') if dealer else ''
     gst_no = getattr(dealer, 'gst_number', '') if dealer else ''
@@ -155,8 +167,9 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     b_addr2 = getattr(billing_address, 'address_line2', '') if billing_address else ''
     b_city = getattr(billing_address, 'city', '') if billing_address else ''
     b_pin = getattr(billing_address, 'pincode', '') if billing_address else ''
-    b_state_name = billing_address.state_rel.name if (billing_address and getattr(billing_address, 'state_rel', None)) else dealer_state_name
-    b_state_code = billing_address.state_rel.state_code if (billing_address and getattr(billing_address, 'state_rel', None) and hasattr(billing_address.state_rel, 'state_code')) else dealer_state_code
+    b_state_name, b_state_code = _get_state_info(billing_address)
+    if not b_state_name: b_state_name = dealer_state_name
+    if not b_state_code: b_state_code = dealer_state_code
 
     b_lines = [b_addr1, b_addr2, f"{b_city or ''}, {b_state_name or ''}, {b_pin or ''}", "IN"]
     b_html = f"<b>Billing Address :</b><br/>{b_name}<br/>" + "<br/>".join([str(l).strip() for l in b_lines if l and str(l).strip()])
@@ -168,8 +181,9 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     s_addr2 = getattr(shipping_address, 'address_line2', '') if shipping_address else b_addr2
     s_city = getattr(shipping_address, 'city', '') if shipping_address else b_city
     s_pin = getattr(shipping_address, 'pincode', '') if shipping_address else b_pin
-    s_state_name = shipping_address.state_rel.name if (shipping_address and getattr(shipping_address, 'state_rel', None)) else b_state_name
-    s_state_code = shipping_address.state_rel.state_code if (shipping_address and getattr(shipping_address, 'state_rel', None) and hasattr(shipping_address.state_rel, 'state_code')) else b_state_code
+    s_state_name, s_state_code = _get_state_info(shipping_address)
+    if not s_state_name: s_state_name = b_state_name
+    if not s_state_code: s_state_code = b_state_code
 
     s_lines = [s_addr1, s_addr2, f"{s_city or ''}, {s_state_name or ''}, {s_pin or ''}", "IN"]
     s_html = f"<b>Shipping Address :</b><br/>{s_name}<br/>" + "<br/>".join([str(l).strip() for l in s_lines if l and str(l).strip()])
@@ -261,26 +275,32 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         item_price = getattr(item, 'price', 0.0) or 0.0
         item_total = item_price * item_qty
 
-        if cgst_rate > 0 or sgst_rate > 0:
+        is_inter_state_order = getattr(order, 'is_inter_state', False) if order else False
+
+        if (is_inter_state_order and igst_rate > 0) or igst_amt > 0:
+            total_rate = igst_rate if igst_rate > 0 else (cgst_rate + sgst_rate)
+        elif cgst_rate > 0 or sgst_rate > 0:
             total_rate = cgst_rate + sgst_rate
         elif igst_rate > 0:
             total_rate = igst_rate
         else:
             total_rate = 0
+
         unit_price_excl = item_price / (1 + (total_rate / 100)) if total_rate else item_price
         net_amt = unit_price_excl * item_qty
         item_tax_amt = cgst_amt + sgst_amt + igst_amt
         if not item_tax_amt and total_rate:
             item_tax_amt = item_total - net_amt
 
-        if cgst_rate > 0 or sgst_rate > 0:
+        if (is_inter_state_order and (igst_rate > 0 or igst_amt > 0)) or igst_amt > 0:
+            display_rate = igst_rate if igst_rate > 0 else (cgst_rate + sgst_rate)
+            tax_rates_html = f"{display_rate:.0f}%"
+            tax_types_html = "IGST"
+            tax_amts_html = f"₹{igst_amt:.2f}"
+        elif cgst_amt > 0 or sgst_amt > 0 or (cgst_rate > 0 or sgst_rate > 0):
             tax_rates_html = f"{cgst_rate:.0f}%<br/>{sgst_rate:.0f}%"
             tax_types_html = "CGST<br/>SGST"
             tax_amts_html = f"₹{cgst_amt:.2f}<br/>₹{sgst_amt:.2f}"
-        elif igst_rate > 0:
-            tax_rates_html = f"{igst_rate:.0f}%"
-            tax_types_html = "IGST"
-            tax_amts_html = f"₹{igst_amt:.2f}"
         else:
             tax_rates_html = "0%"
             tax_types_html = "GST"

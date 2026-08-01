@@ -480,14 +480,25 @@ async def get_tds_payout_report(
     total_tds = 0.0
     total_net = 0.0
 
+    # Resolve dealers once so TDS uses the configuration-driven rate (Sec 194-O).
+    from services.tds_resolver import resolve_tds_rate
+    tds_rates = {}
+    for d_id in dealer_stats.keys():
+        dealer = await db.get(Dealer, d_id)
+        if dealer:
+            try:
+                tds_rates[d_id] = float(await resolve_tds_rate(db, dealer))
+            except Exception:
+                tds_rates[d_id] = 0.001  # safe default; never blocks the report
+
     for d_id, stats in dealer_stats.items():
         gov = stats["gross_order_value"]
         comm = stats["platform_commission"]
         taxable = stats["taxable_value"]
-        
+
         # Amazon style deductions
         tcs = taxable * 0.01  # 1% under GST
-        tds = gov * 0.01      # 1% under Sec 194-O (Gross value)
+        tds = gov * tds_rates.get(d_id, 0.001)  # Sec 194-O (Gross value), config-driven rate
         
         # The platform fee (comm) is collected from the customer at checkout, 
         # so it is not deducted from the dealer's gross order value.
@@ -936,6 +947,13 @@ async def get_dealer_tax_reports(
     result = await db.execute(query)
     rows = result.all()
 
+    # Configuration-driven TDS rate for this dealer (Sec 194-O, replaces hardcoded 1%)
+    from services.tds_resolver import resolve_tds_rate
+    try:
+        tds_rate = float(await resolve_tds_rate(db, dealer))
+    except Exception:
+        tds_rate = 0.001
+
     gst_dict = {}
     tds_dict = {}
 
@@ -998,9 +1016,9 @@ async def get_dealer_tax_reports(
             "date": dt.isoformat()
         })
 
-        # TDS/TCS calculation (1% TDS on gross, 1% TCS on taxable)
+        # TDS/TCS calculation (TDS on gross at config-driven rate, 1% TCS on taxable)
         taxable_value = gross_value - tax_amount
-        tds_amount = gross_value * 0.01
+        tds_amount = gross_value * tds_rate
         tcs_amount = taxable_value * 0.01
         
         if quarter not in tds_dict:

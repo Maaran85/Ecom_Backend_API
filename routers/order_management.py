@@ -203,13 +203,16 @@ async def request_return(
     if not order_item:
         raise HTTPException(status_code=400, detail="Specified item does not belong to this order")
     
-    # Check return window (e.g., 7 days from delivery)
+    # Check return window (config-driven; see settlement_configurations.return_window_days)
     if order.delivered_at:
+        from services.configuration_service import get_settlement_configuration
+        settlement_config = await get_settlement_configuration(db)
+        return_window_days = settlement_config.return_window_days
         days_since_delivery = (datetime.now(timezone.utc) - order.delivered_at).days
-        if days_since_delivery > 7:
+        if days_since_delivery > return_window_days:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Return window (7 days) has expired"
+                detail=f"Return window ({return_window_days} days) has expired"
             )
     
     # Create return or exchange request

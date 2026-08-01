@@ -29,6 +29,10 @@ from .recharge import router as recharge_router
 from .rewards import router as rewards_router
 from .partners import router as partners_router
 from .referrals import router as referrals_router
+from .tds import router as tds_router
+from .settlement import router as settlement_router
+from .financial_year import router as financial_year_router
+from .reports import router as reports_router
 
 __all__ = [
     "auth_router", "products_router", "cart_router",
@@ -41,5 +45,6 @@ __all__ = [
     "riders_router", "rider_reviews_router", "locations_router",
     "showroom_router", "dealer_docs_router", "payment_settings_router",
     "finance_router", "logistics_router",
-    "rewards_router", "partners_router", "referrals_router"
+    "rewards_router", "partners_router", "referrals_router",
+    "tds_router", "settlement_router", "financial_year_router", "reports_router"
 ]

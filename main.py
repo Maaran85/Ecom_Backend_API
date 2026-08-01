@@ -21,7 +21,8 @@ from routers import (
     riders_router, rider_reviews_router, locations_router,
     showroom_router, dealer_docs_router, payment_settings_router,
     finance_router, logistics_router, recharge_router, rewards_router,
-    partners_router, referrals_router
+    partners_router, referrals_router,
+    tds_router, settlement_router, financial_year_router, reports_router
 )
 from auction.routers import auction_router
 from b2b_auction.routers import router as b2b_auction_router, product_router as b2b_products_router, order_router as b2b_orders_router
@@ -88,6 +89,7 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(products_router, prefix="/api/v1")
 app.include_router(cart_router, prefix="/api/v1")
+app.include_router(settlement_router, prefix="/api/v1", tags=["settlements"])
 app.include_router(dealers_router, prefix="/api/v1/dealers", tags=["dealers"])
 app.include_router(admin_router, prefix="/api/v1/admin", tags=["admin"])
 app.include_router(wishlist_router, prefix="/api/v1/wishlist", tags=["wishlist"])
@@ -117,6 +119,9 @@ app.include_router(rewards_router, prefix="/api/v1/rewards", tags=["rewards"])
 app.include_router(partners_router, prefix="/api/v1/superadmin/partners", tags=["superadmin-partners"])
 app.include_router(auction_router, prefix="/api/v1", tags=["auction"])
 app.include_router(referrals_router, prefix="/api/v1")
+app.include_router(tds_router, prefix="/api/v1", tags=["tds"])
+app.include_router(financial_year_router, prefix="/api/v1", tags=["financial-year"])
+app.include_router(reports_router, prefix="/api/v1", tags=["settlement-reports"])
 app.include_router(b2b_products_router, prefix="/api/v1", tags=["B2B Products"])
 app.include_router(b2b_auction_router, prefix="/api/v1", tags=["B2B Auctions"])
 app.include_router(b2b_orders_router, prefix="/api/v1", tags=["B2B Orders"])
@@ -143,13 +148,45 @@ async def startup_event():
         async with engine.begin() as conn:
             await conn.execute(text("ALTER TABLE categories ADD COLUMN IF NOT EXISTS referral_commission_rate DOUBLE PRECISION;"))
             await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet_amount_used DOUBLE PRECISION DEFAULT 0.0;"))
+            await conn.execute(text("ALTER TABLE dealers ADD COLUMN IF NOT EXISTS organization_type VARCHAR;"))
             await conn.run_sync(Base.metadata.create_all)
-        print("INFO: Successfully verified/created referral tables, wallet_transactions, and orders.wallet_amount_used column.")
+        print("INFO: Successfully verified/created referral tables, wallet_transactions, orders.wallet_amount_used and dealers.organization_type columns.")
     except Exception as e:
         print(f"WARNING: Schema auto-migration on startup encountered: {e}")
 
+    # Seed TDS / fee / settlement default configurations (idempotent)
+    try:
+        from core.database import SessionLocal
+        from services.configuration_service import ensure_default_configurations
+        async with SessionLocal() as seed_session:
+            await ensure_default_configurations(seed_session)
+            await seed_session.commit()
+        print("INFO: Settlement/TDS default configurations ensured.")
+    except Exception as e:
+        print(f"WARNING: Could not seed default configurations: {e}")
+
+    # Extend the native notificationtype enum with settlement types (separate transaction
+    # because ADD VALUE cannot run in the same transaction that has used the type).
+    try:
+        from core.database import engine
+        from sqlalchemy import text
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TYPE notificationtype ADD VALUE IF NOT EXISTS 'settlement_generated';"))
+            await conn.execute(text("ALTER TYPE notificationtype ADD VALUE IF NOT EXISTS 'settlement_approved';"))
+            await conn.execute(text("ALTER TYPE notificationtype ADD VALUE IF NOT EXISTS 'settlement_paid';"))
+        print("INFO: notificationtype enum extended with settlement notification types.")
+    except Exception as e:
+        print(f"WARNING: Could not extend notificationtype enum: {e}")
+
     # Start the support escalation background loop
     asyncio.create_task(start_support_escalation_loop())
+
+    # Start the daily settlement scheduler
+    try:
+        from core.settlement_scheduler import start_settlement_scheduler
+        asyncio.create_task(start_settlement_scheduler())
+    except Exception as e:
+        print(f"WARNING: Could not start settlement scheduler: {e}")
 
     # GST configuration startup log
     import logging

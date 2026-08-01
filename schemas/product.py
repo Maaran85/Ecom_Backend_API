@@ -103,7 +103,7 @@ class ProductBase(BaseModel):
     subcategory_id: Optional[int] = None
     brand_id: Optional[int] = None
     hsn_code: str
-    tax_category_id: int
+    tax_category_id: Optional[int] = None
     discount_percentage: Optional[int] = None
     average_rating: Optional[float] = None
     reject_reasons: Optional[List[dict]] = []

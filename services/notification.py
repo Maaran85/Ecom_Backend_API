@@ -305,6 +305,35 @@ class AppNotificationService:
         return None
 
     @staticmethod
+    async def notify_settlement(db: AsyncSession, dealer_user_ids: List[int], status: str, settlement_number: str, data: Dict[str, Any] = None):
+        """Notify dealer users about their settlement status."""
+        status_map = {
+            "generated": (
+                NotificationType.SETTLEMENT_GENERATED,
+                "Settlement Generated",
+                f"Settlement {settlement_number} has been generated and is awaiting admin approval.",
+            ),
+            "approved": (
+                NotificationType.SETTLEMENT_APPROVED,
+                "Settlement Approved",
+                f"Settlement {settlement_number} has been approved. Payout will be processed shortly.",
+            ),
+            "paid": (
+                NotificationType.SETTLEMENT_PAID,
+                "Payout Completed",
+                f"Settlement {settlement_number} has been paid out. Check your bank account for the transfer.",
+            ),
+        }
+        if status.lower() not in status_map:
+            return None
+        type_, title, message = status_map[status.lower()]
+        for user_id in dealer_user_ids:
+            await AppNotificationService.create_notification(
+                db, user_id=user_id, type=type_, title=title, message=message, data=data
+            )
+        return True
+
+    @staticmethod
     async def notify_rider_status(db: AsyncSession, user_id: int, status: str, data: Dict[str, Any] = None):
         """Standard rider application status updates"""
         status_map = {
