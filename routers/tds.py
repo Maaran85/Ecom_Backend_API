@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
-from core.permissions import require_admin
+from core.permissions import require_admin, require_super_admin
 from models import User
 from models.tds_configuration import TDSConfiguration
 from models.fee_configuration import FeeConfiguration
@@ -70,18 +70,18 @@ async def update_tds_configuration(
     config_id: int,
     data: TDSConfigurationUpdate,
     db: AsyncSession = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_super_admin),
 ):
     config = await db.get(TDSConfiguration, config_id)
     if not config:
         raise HTTPException(status_code=404, detail="TDS configuration not found")
 
-    old = {c.name: getattr(config, c.name) for c in config.__table__.columns}
+    old = {c.name: getattr(config, c.name).isoformat() if hasattr(getattr(config, c.name), "isoformat") else getattr(config, c.name) for c in config.__table__.columns}
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(config, field, value)
+    new = {c.name: getattr(config, c.name).isoformat() if hasattr(getattr(config, c.name), "isoformat") else getattr(config, c.name) for c in config.__table__.columns}
 
     await db.flush()
-    new = {c.name: getattr(config, c.name) for c in config.__table__.columns}
     await log_audit(
         db, admin, "UPDATE", "tds_configuration",
         resource_id=str(config.id),
@@ -130,18 +130,18 @@ async def update_fee_configuration(
     config_id: int,
     data: FeeConfigurationUpdate,
     db: AsyncSession = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_super_admin),
 ):
     config = await db.get(FeeConfiguration, config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Fee configuration not found")
 
-    old = {c.name: getattr(config, c.name) for c in config.__table__.columns}
+    old = {c.name: getattr(config, c.name).isoformat() if hasattr(getattr(config, c.name), "isoformat") else getattr(config, c.name) for c in config.__table__.columns}
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(config, field, value)
+    new = {c.name: getattr(config, c.name).isoformat() if hasattr(getattr(config, c.name), "isoformat") else getattr(config, c.name) for c in config.__table__.columns}
 
     await db.flush()
-    new = {c.name: getattr(config, c.name) for c in config.__table__.columns}
     await log_audit(db, admin, "UPDATE", "fee_configuration", resource_id=str(config.id), old_values=old, new_values=new)
     await db.commit()
     await db.refresh(config)
@@ -170,7 +170,7 @@ async def get_settlement_config(
 async def update_settlement_config(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_super_admin),
 ):
     allowed = {
         "return_window_days", "settlement_version",
@@ -181,13 +181,14 @@ async def update_settlement_config(
         raise HTTPException(status_code=400, detail=f"Unknown fields: {sorted(unknown)}")
 
     config = await get_settlement_configuration(db)
-    old = {c.name: getattr(config, c.name) for c in config.__table__.columns if c.name != "id"}
+    old = {c.name: getattr(config, c.name).isoformat() if hasattr(getattr(config, c.name), "isoformat") else getattr(config, c.name) for c in config.__table__.columns if c.name != "id"}
     for key, value in payload.items():
         setattr(config, key, value)
 
     await db.flush()
     await log_audit(db, admin, "UPDATE", "settlement_configuration", resource_id="1", old_values=old, new_values=payload)
     await db.commit()
+    await db.refresh(config)
 
     return {
         "return_window_days": config.return_window_days,
