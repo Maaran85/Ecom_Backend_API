@@ -1541,8 +1541,35 @@ async def update_dealer_order_item(
                 detail=f"Insufficient stock to confirm this order. Required: {item.quantity}, Available: {current_stock}"
             )
         item.accepted_at = datetime.now(timezone.utc)
-    elif payload.status.lower() == "packaging":
-        item.hub_arrived_at = datetime.now(timezone.utc)
+    # State transition validation for OrderItem status
+    current_st = (item.status or "placed").lower()
+    target_st = payload.status.lower()
+
+    valid_next_states = {
+        "pending": ["placed", "confirmed", "cancelled"],
+        "order_placed": ["placed", "confirmed", "cancelled"],
+        "placed": ["confirmed", "cancelled"],
+        "confirmed": ["packaging", "packed", "shipped", "at_hub", "cancelled"],
+        "packaging": ["packed", "at_hub", "shipped", "cancelled"],
+        "packed": ["shipped", "at_hub", "dispatched", "cancelled"],
+        "at_hub": ["packed", "shipped", "dispatched", "cancelled"],
+        "dispatched": ["shipped", "out_for_delivery", "delivered", "undelivered", "cancelled"],
+        "shipped": ["out_for_delivery", "delivered", "undelivered", "cancelled"],
+        "out_for_delivery": ["delivered", "undelivered", "cancelled"],
+        "undelivered": ["out_for_delivery", "shipped", "returned", "cancelled"],
+        "delivered": ["returning"],
+        "returning": ["returned"],
+        "returned": [],
+        "cancelled": []
+    }
+
+    if current_st != target_st and not is_admin:
+        allowed = valid_next_states.get(current_st, [])
+        if target_st not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status transition from '{item.status}' to '{payload.status}'"
+            )
 
     item.status = payload.status
 

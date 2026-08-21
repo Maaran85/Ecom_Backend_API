@@ -35,10 +35,7 @@ from .reward import SpinConfig, SpinToken, SpinResult, RewardPrize, MonthlyLeade
 from .partner import Partner
 from .tds_configuration import TDSConfiguration
 from .fee_configuration import FeeConfiguration
-from .financial_year_summary import DealerFinancialYearSummary
-from .settlement import Settlement, SettlementItem, SettlementAdjustment
-from .pending_settlement_adjustment import PendingSettlementAdjustment
-from .settlement_configuration import SettlementConfiguration
+from .billing_slab import BillingSlab
 from auction.models import AuctionItem, AuctionBid
 
 __all__ = [
@@ -77,7 +74,8 @@ __all__ = [
     "DealerFinancialYearSummary",
     "Settlement", "SettlementItem", "SettlementAdjustment",
     "PendingSettlementAdjustment",
-    "SettlementConfiguration"
+    "SettlementConfiguration",
+    "BillingSlab"
 ]
 
 # Dynamically calculate stock from ProductInventory to avoid circular imports and premature mapper initialization

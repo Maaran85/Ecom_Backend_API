@@ -43,20 +43,12 @@ async def _load_settlement(db: AsyncSession, settlement_id: int) -> Settlement:
     return result.scalar_one_or_none()
 
 
-async def _dealer_ids_with_eligible_items(db: AsyncSession) -> List[UUID]:
+async def _dealer_ids_with_eligible_items(db: AsyncSession, as_of: Optional[datetime] = None) -> List[UUID]:
     """Dealers who currently have eligible (matured) order items."""
-    from sqlalchemy import select as sel
-    from models import OrderItem as OI, Order as O, Product as P
-    from models.cart import OrderStatus
-
-    rows = await db.execute(
-        sel(P.dealer_id)
-        .join(O, O.id == OI.order_id)
-        .join(P, P.id == OI.product_id)
-        .where(O.status == OrderStatus.DELIVERED, O.delivered_at.isnot(None))
-        .distinct()
-    )
-    return [r[0] for r in rows.all()]
+    from services.settlement_eligibility_service import get_eligible_order_items
+    items = await get_eligible_order_items(db, as_of=as_of)
+    dealers = {dealer.id for _, _, _, dealer in items}
+    return list(dealers)
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +67,13 @@ async def generate_settlements(
     settled. dry_run=true returns a preview without persisting anything.
     """
     settlement_date = req.period_end or date.today()
+    as_of = datetime.now(timezone.utc) if req.period_end is None or req.period_end == date.today() else datetime.combine(settlement_date, datetime.max.time(), timezone.utc)
 
     dealer_ids: List[UUID]
     if req.dealer_id:
         dealer_ids = [req.dealer_id]
     else:
-        dealer_ids = await _dealer_ids_with_eligible_items(db)
+        dealer_ids = await _dealer_ids_with_eligible_items(db, as_of=as_of)
 
     if not dealer_ids:
         raise HTTPException(status_code=400, detail="No eligible order items found")
@@ -91,7 +84,7 @@ async def generate_settlements(
         if not dealer:
             continue
         eligible = await get_eligible_order_items(
-            db, dealer_id=dealer_id, as_of=datetime.combine(settlement_date, datetime.min.time(), timezone.utc)
+            db, dealer_id=dealer_id, as_of=as_of, for_update=not req.dry_run
         )
         if not eligible:
             continue
@@ -387,3 +380,58 @@ async def get_my_settlement(
     if settlement.dealer_id != user.dealer_id:
         raise HTTPException(status_code=403, detail="Access denied")
     return settlement
+
+
+@router.get("/dealers/settlements/{settlement_id}/pdf")
+async def download_dealer_settlement_pdf(
+    settlement_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    from fastapi.responses import StreamingResponse
+    from services.invoice_pdf import generate_dealer_settlement_pdf
+
+    if not user.dealer_id and user.role.value not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="User is not associated with a dealer")
+    
+    settlement = await _load_settlement(db, settlement_id)
+    if not settlement:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+    if user.role.value not in ["admin", "super_admin"] and settlement.dealer_id != user.dealer_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    dealer = await db.get(Dealer, settlement.dealer_id)
+    pdf_buffer = generate_dealer_settlement_pdf(settlement, dealer, settlement.items)
+    
+    filename = f"Dealer_Settlement_{settlement.settlement_number or settlement.id}.pdf"
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
+
+
+@router.get("/admin/settlements/{settlement_id}/pdf")
+async def download_admin_settlement_pdf(
+    settlement_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    from fastapi.responses import StreamingResponse
+    from services.invoice_pdf import generate_dealer_settlement_pdf
+
+    settlement = await _load_settlement(db, settlement_id)
+    if not settlement:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+    
+    dealer = await db.get(Dealer, settlement.dealer_id)
+    pdf_buffer = generate_dealer_settlement_pdf(settlement, dealer, settlement.items)
+    
+    filename = f"Dealer_Settlement_{settlement.settlement_number or settlement.id}.pdf"
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
+
+

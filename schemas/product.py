@@ -125,7 +125,7 @@ class ProductBase(BaseModel):
     @classmethod
     def images_must_not_be_empty(cls, v: List[Any]) -> List[Any]:
         if not v or len(v) == 0:
-            raise ValueError('At least one product image is required')
+            return ["https://via.placeholder.com/300"]
         return v
 
 

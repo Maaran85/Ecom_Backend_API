@@ -203,16 +203,28 @@ async def request_return(
     if not order_item:
         raise HTTPException(status_code=400, detail="Specified item does not belong to this order")
     
-    # Check return window (config-driven; see settlement_configurations.return_window_days)
-    if order.delivered_at:
+    # Validate Return / Exchange eligibility via Central Policy Service
+    deliv_dt = order_item.delivered_at or order.delivered_at
+    if deliv_dt:
         from services.configuration_service import get_settlement_configuration
+        from services.return_policy_service import validate_customer_request
+        from models.product import Product
+        
+        prod_res = await db.execute(select(Product).where(Product.id == order_item.product_id))
+        prod_obj = prod_res.scalar_one_or_none()
         settlement_config = await get_settlement_configuration(db)
-        return_window_days = settlement_config.return_window_days
-        days_since_delivery = (datetime.now(timezone.utc) - order.delivered_at).days
-        if days_since_delivery > return_window_days:
+        
+        is_valid, err_detail = validate_customer_request(
+            item=order_item,
+            delivered_at=deliv_dt,
+            is_exchange=bool(return_data.is_exchange),
+            product=prod_obj,
+            global_config=settlement_config
+        )
+        if not is_valid:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Return window ({return_window_days} days) has expired"
+                detail=err_detail
             )
     
     # Create return or exchange request

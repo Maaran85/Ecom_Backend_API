@@ -33,6 +33,7 @@ from .tds import router as tds_router
 from .settlement import router as settlement_router
 from .financial_year import router as financial_year_router
 from .reports import router as reports_router
+from .billing_slabs import router as billing_slabs_router
 
 __all__ = [
     "auth_router", "products_router", "cart_router",
@@ -46,5 +47,6 @@ __all__ = [
     "showroom_router", "dealer_docs_router", "payment_settings_router",
     "finance_router", "logistics_router",
     "rewards_router", "partners_router", "referrals_router",
-    "tds_router", "settlement_router", "financial_year_router", "reports_router"
+    "tds_router", "settlement_router", "financial_year_router", "reports_router",
+    "billing_slabs_router"
 ]

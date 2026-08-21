@@ -21,9 +21,20 @@ def financial_year_for(dt: date) -> Tuple[str, date, date]:
     return fy_label, start, end
 
 
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    IST_TZ = ZoneInfo("Asia/Kolkata")
+except (ImportError, ZoneInfoNotFoundError):
+    from datetime import timezone, timedelta
+    IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
+
 def as_date(dt: datetime) -> date:
-    if dt.tzinfo is not None and hasattr(dt, "astimezone"):
-        return dt.astimezone(timezone.utc).date()
+    if hasattr(dt, "tzinfo"):
+        if dt.tzinfo is not None and hasattr(dt, "astimezone"):
+            return dt.astimezone(IST_TZ).date()
+        elif isinstance(dt, datetime):
+            return dt.replace(tzinfo=timezone.utc).astimezone(IST_TZ).date()
     return dt.date() if hasattr(dt, "date") else dt
 
 

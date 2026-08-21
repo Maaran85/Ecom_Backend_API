@@ -17,3 +17,5 @@ htmlcov/
 *.log
 .DS_Store
 plan/
+scratch/
+tests/

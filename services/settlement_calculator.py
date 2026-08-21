@@ -105,43 +105,53 @@ async def calculate_settlement(
     result_lines: List[SettlementLineResult] = []
     for idx, (item, order, gross_sale, fees) in enumerate(lines):
         tds = tds_batch["items"][idx]
+        
+        gross_sale_2dp = money_2dp(gross_sale)
+        mp_fee_2dp = money_2dp(fees["marketplace_fee"])
+        mkt_fee_2dp = money_2dp(fees["marketing_fee"])
+        ship_rec_2dp = money_2dp(fees["shipping_received"])
+        log_chg_2dp = money_2dp(fees["logistics_charge"])
+        tds_amt_2dp = money_2dp(tds["tds_amount"])
+
         raw_net = (
-            gross_sale
-            - fees["marketplace_fee"]
-            - fees["marketing_fee"]
-            + fees["shipping_received"]
-            - fees["logistics_charge"]
-            - tds["tds_amount"]
+            gross_sale_2dp
+            - mp_fee_2dp
+            - mkt_fee_2dp
+            + ship_rec_2dp
+            - log_chg_2dp
+            - tds_amt_2dp
         )
+        net_payable_2dp = money_2dp(raw_net)
+
         result_lines.append(
             SettlementLineResult(
                 item=item,
                 order=order,
-                gross_sale=gross_sale,
-                marketplace_fee=fees["marketplace_fee"],
-                marketing_fee=fees["marketing_fee"],
-                shipping_received=fees["shipping_received"],
-                logistics_charge=fees["logistics_charge"],
-                gst_on_fees=fees["gst_on_fees"],
+                gross_sale=gross_sale_2dp,
+                marketplace_fee=mp_fee_2dp,
+                marketing_fee=mkt_fee_2dp,
+                shipping_received=ship_rec_2dp,
+                logistics_charge=log_chg_2dp,
+                gst_on_fees=money_2dp(fees["gst_on_fees"]),
                 tds_rate=tds["rate"],
-                tds_exempt_portion=tds["tds_exempt_portion"],
-                tds_base=tds["tds_base"],
-                tds_amount=tds["tds_amount"],
-                net_payable=money_2dp(raw_net),
+                tds_exempt_portion=money_2dp(tds["tds_exempt_portion"]),
+                tds_base=money_2dp(tds["tds_base"]),
+                tds_amount=tds_amt_2dp,
+                net_payable=net_payable_2dp,
                 delivery_type=fees["delivery_type"],
                 precise={
-                    "gross_sale": str(gross_sale),
-                    "marketplace_fee": str(fees["marketplace_fee"]),
-                    "marketing_fee": str(fees["marketing_fee"]),
-                    "shipping_received": str(fees["shipping_received"]),
-                    "logistics_charge": str(fees["logistics_charge"]),
-                    "gst_on_fees": str(fees["gst_on_fees"]),
-                    "tds_exempt_portion": str(tds["tds_exempt_portion"]),
-                    "tds_base": str(tds["tds_base"]),
+                    "gross_sale": str(gross_sale_2dp),
+                    "marketplace_fee": str(mp_fee_2dp),
+                    "marketing_fee": str(mkt_fee_2dp),
+                    "shipping_received": str(ship_rec_2dp),
+                    "logistics_charge": str(log_chg_2dp),
+                    "gst_on_fees": str(money_2dp(fees["gst_on_fees"])),
+                    "tds_exempt_portion": str(money_2dp(tds["tds_exempt_portion"])),
+                    "tds_base": str(money_2dp(tds["tds_base"])),
                     "tds_rate": str(tds["rate"]),
-                    "tds_amount": str(tds["tds_amount"]),
+                    "tds_amount": str(tds_amt_2dp),
                     "net_raw": str(raw_net),
-                    "net_rounded": str(money_2dp(raw_net)),
+                    "net_rounded": str(net_payable_2dp),
                 },
             )
         )
@@ -152,15 +162,15 @@ async def calculate_settlement(
         tds_rate=result_lines[0].tds_rate if result_lines else Decimal("0"),
         has_pan=has_pan,
         organization_type=dealer.organization_type,
-        gross_sale_total=sum((l.gross_sale for l in result_lines), Decimal("0")),
-        marketplace_fee_total=sum((l.marketplace_fee for l in result_lines), Decimal("0")),
-        marketing_fee_total=sum((l.marketing_fee for l in result_lines), Decimal("0")),
-        shipping_received_total=sum((l.shipping_received for l in result_lines), Decimal("0")),
-        logistics_charge_total=sum((l.logistics_charge for l in result_lines), Decimal("0")),
-        gst_on_fees_total=sum((l.gst_on_fees for l in result_lines), Decimal("0")),
-        tds_exempt_total=tds_batch["total_exempt"],
-        tds_base_total=tds_batch["total_base"],
-        tds_total=tds_batch["total_tds"],
+        gross_sale_total=money_2dp(sum((l.gross_sale for l in result_lines), Decimal("0"))),
+        marketplace_fee_total=money_2dp(sum((l.marketplace_fee for l in result_lines), Decimal("0"))),
+        marketing_fee_total=money_2dp(sum((l.marketing_fee for l in result_lines), Decimal("0"))),
+        shipping_received_total=money_2dp(sum((l.shipping_received for l in result_lines), Decimal("0"))),
+        logistics_charge_total=money_2dp(sum((l.logistics_charge for l in result_lines), Decimal("0"))),
+        gst_on_fees_total=money_2dp(sum((l.gst_on_fees for l in result_lines), Decimal("0"))),
+        tds_exempt_total=money_2dp(tds_batch["total_exempt"]),
+        tds_base_total=money_2dp(tds_batch["total_base"]),
+        tds_total=money_2dp(sum((l.tds_amount for l in result_lines), Decimal("0"))),
     )
     result.finalize(adjustment_total)
 

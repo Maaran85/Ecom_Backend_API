@@ -40,6 +40,7 @@ async def get_eligible_order_items(
     db: AsyncSession,
     dealer_id: Optional[UUID] = None,
     as_of: Optional[datetime] = None,
+    for_update: bool = False,
 ) -> List[Tuple[OrderItem, Order, Product, Dealer]]:
     """
     Returns (OrderItem, Order, Product, Dealer) tuples for order items eligible
@@ -76,7 +77,6 @@ async def get_eligible_order_items(
         .where(
             Order.status == OrderStatus.DELIVERED,
             Order.delivered_at.isnot(None),
-            Order.delivered_at <= matured_before,
             OrderItem.status == OrderStatus.DELIVERED.value,
             OrderItem.id.not_in(claimed),
             OrderItem.id.not_in(returned_item_ids),
@@ -87,8 +87,29 @@ async def get_eligible_order_items(
 
     query = query.order_by(Order.delivered_at.asc())
 
+    if for_update:
+        query = query.with_for_update(of=OrderItem)
+
     result = await db.execute(query)
-    return result.all()
+    rows = result.all()
+
+    from services.return_policy_service import is_item_settlement_matured
+
+    eligible_tuples = []
+    for item, order, product, dealer in rows:
+        deliv_dt = item.delivered_at or order.delivered_at
+        if not deliv_dt:
+            continue
+        if is_item_settlement_matured(
+            item=item,
+            delivered_at=deliv_dt,
+            as_of=as_of,
+            product=product,
+            global_config=config,
+        ):
+            eligible_tuples.append((item, order, product, dealer))
+
+    return eligible_tuples
 
 
 async def is_delivery_self_logistics(item: OrderItem) -> bool:

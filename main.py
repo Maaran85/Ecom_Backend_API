@@ -22,7 +22,8 @@ from routers import (
     showroom_router, dealer_docs_router, payment_settings_router,
     finance_router, logistics_router, recharge_router, rewards_router,
     partners_router, referrals_router,
-    tds_router, settlement_router, financial_year_router, reports_router
+    tds_router, settlement_router, financial_year_router, reports_router,
+    billing_slabs_router
 )
 from auction.routers import auction_router
 from b2b_auction.routers import router as b2b_auction_router, product_router as b2b_products_router, order_router as b2b_orders_router
@@ -120,6 +121,7 @@ app.include_router(partners_router, prefix="/api/v1/superadmin/partners", tags=[
 app.include_router(auction_router, prefix="/api/v1", tags=["auction"])
 app.include_router(referrals_router, prefix="/api/v1")
 app.include_router(tds_router, prefix="/api/v1", tags=["tds"])
+app.include_router(billing_slabs_router)
 app.include_router(financial_year_router, prefix="/api/v1", tags=["financial-year"])
 app.include_router(reports_router, prefix="/api/v1", tags=["settlement-reports"])
 app.include_router(b2b_products_router, prefix="/api/v1", tags=["B2B Products"])

@@ -13,3 +13,4 @@ slowapi
 fastapi-mail
 sqlalchemy-utils
 cryptography
+tzdata

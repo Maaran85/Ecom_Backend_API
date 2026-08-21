@@ -62,6 +62,7 @@ async def preview_settlement(
             "tds_amount": float(money_2dp(line.tds_amount)),
             "tds_exempt_portion": float(money_2dp(line.tds_exempt_portion)),
             "net_payable": float(line.net_payable),
+            "delivery_type": line.delivery_type,
         }
         for line in calc.lines
     ]

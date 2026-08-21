@@ -146,6 +146,7 @@ class SettlementPreviewItem(BaseModel):
     tds_amount: float
     tds_exempt_portion: float
     net_payable: float
+    delivery_type: Optional[str] = None
 
 
 class SettlementPreviewOut(BaseModel):

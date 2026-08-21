@@ -107,8 +107,12 @@ def monkeypatch_config(monkeypatch):
     async def fake_get_active_tds_config(db, org_type):
         return tds
 
+    async def fake_get_applicable_slab(db, category_key, net_basic_amount):
+        return None
+
     monkeypatch.setattr(fee_service, "get_fee_config", fake_get_fee_config)
     monkeypatch.setattr(fee_service, "get_fee_config_required", fake_get_fee_config_required)
+    monkeypatch.setattr(fee_service, "get_applicable_slab", fake_get_applicable_slab)
     monkeypatch.setattr(calculator, "get_active_tds_config_required", fake_get_active_tds_config)
 
 
@@ -136,13 +140,13 @@ async def test_self_logistics_golden(monkeypatch_config):
     )
 
     line = calc.lines[0]
-    assert line.gross_sale == Decimal("560.5")
-    assert line.marketplace_fee == Decimal("29.5")
-    assert line.marketing_fee == Decimal("11.8")
+    assert line.gross_sale == Decimal("560.50")
+    assert line.marketplace_fee == Decimal("29.50")
+    assert line.marketing_fee == Decimal("11.80")
     assert line.shipping_received == Decimal("21.24")
-    assert line.logistics_charge == Decimal("0")
-    assert line.tds_amount == Decimal("0.5605")
-    assert line.net_payable == Decimal("539.88")  # 539.8795 rounded to paise
+    assert line.logistics_charge == Decimal("0.00")
+    assert line.tds_amount == Decimal("0.56")
+    assert line.net_payable == Decimal("539.88")  # 560.50 - 29.50 - 11.80 + 21.24 - 0.56 = 539.88
     assert calc.net_payable == Decimal("539.88")
 
 
@@ -157,11 +161,48 @@ async def test_partner_logistics_golden(monkeypatch_config):
     )
 
     line = calc.lines[0]
-    assert line.shipping_received == Decimal("0")
-    assert line.logistics_charge == Decimal("17.7")
-    assert line.tds_amount == Decimal("0.5605")
-    assert line.net_payable == Decimal("500.94")  # 500.9395 rounded to paise
+    assert line.shipping_received == Decimal("0.00")
+    assert line.logistics_charge == Decimal("17.70")
+    assert line.tds_amount == Decimal("0.56")
+    assert line.net_payable == Decimal("500.94")  # 560.50 - 29.50 - 11.80 - 17.70 - 0.56 = 500.94
     assert calc.net_payable == Decimal("500.94")
+
+
+@pytest.mark.asyncio
+async def test_order_8712519463_self_logistics_golden(monkeypatch_config):
+    """Specific test for Order #8712519463 Excel model matching ₹662.03."""
+    item = SimpleNamespace(
+        id=66,
+        price=650.0,
+        quantity=1,
+        platform_fee=0.0,
+        delivery_type="own_rider",
+        logistics_partner_id=None,
+        marketplace_dealer_fee=9.75, # Basic 1.5% snapshot
+        marketing_fee_amount=19.50, # Basic 3.0% snapshot
+    )
+    order = SimpleNamespace(
+        id=123,
+        order_number="8712519463",
+        subtotal=650.0,
+        discount_amount=0.0,
+        delivery_charge=40.0, # Basic 40 + 18% GST = 47.20
+        created_at=None,
+    )
+    dealer = _dealer()
+    calc = await calculate_settlement(
+        FakeDB(), dealer, [(item, order, None, dealer)],
+        fy_summary=_crossed_threshold_fy_summary(),
+    )
+
+    line = calc.lines[0]
+    assert line.gross_sale == Decimal("650.00")
+    assert line.marketing_fee == Decimal("23.01") # 19.50 * 1.18
+    assert line.marketplace_fee == Decimal("11.51") # 9.75 * 1.18 = 11.505 -> 11.51
+    assert line.shipping_received == Decimal("47.20") # 40.00 * 1.18
+    assert line.tds_amount == Decimal("0.65") # 0.1% of 650
+    assert line.net_payable == Decimal("662.03") # 650.00 - 23.01 - 11.51 + 47.20 - 0.65 = 662.03
+    assert calc.net_payable == Decimal("662.03")
 
 
 @pytest.mark.asyncio
@@ -176,10 +217,10 @@ async def test_fresh_fy_exemption_shields_sales(monkeypatch_config):
     )
 
     line = calc.lines[0]
-    assert line.tds_exempt_portion == Decimal("560.5")
-    assert line.tds_base == Decimal("0")
-    assert line.tds_amount == Decimal("0")
-    assert calc.net_payable == Decimal("540.44")  # 560.5 - 29.5 - 11.8 + 21.24
+    assert line.tds_exempt_portion == Decimal("560.50")
+    assert line.tds_base == Decimal("0.00")
+    assert line.tds_amount == Decimal("0.00")
+    assert calc.net_payable == Decimal("540.44")  # 560.50 - 29.50 - 11.80 + 21.24
 
 
 @pytest.mark.asyncio
@@ -201,4 +242,4 @@ async def test_gross_sale_is_net_selling_price_after_discount():
     item = _item(delivery_type="own_rider")
     item.price = 600.0
     gross = compute_gross_sale(item, order)
-    assert gross == Decimal("560.5")
+    assert gross == Decimal("560.50")

@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update
@@ -338,7 +339,10 @@ async def create_order(
             "dealer_id": product.dealer_id,
             "tax_data": tax_res,
             "platform_fee": platform_fee,
-            "referral_commission_rate": product.referral_commission_rate
+            "referral_commission_rate": product.referral_commission_rate,
+            "return_window_days": getattr(product, "return_window_days", None),
+            "is_returnable": getattr(product, "is_returnable", True),
+            "is_exchangeable": getattr(product, "is_exchangeable", True),
         })
         stock_updates.append({
             "product_id": product.id,
@@ -435,7 +439,10 @@ async def create_order(
                 "dealer_id": d_id,
                 "tax_data": tax_res,
                 "platform_fee": platform_fee,
-                "referral_commission_rate": product.referral_commission_rate
+                "referral_commission_rate": product.referral_commission_rate,
+                "return_window_days": getattr(product, "return_window_days", None),
+                "is_returnable": getattr(product, "is_returnable", True),
+                "is_exchangeable": getattr(product, "is_exchangeable", True),
             })
             stock_updates.append({
                 "product_id": product.id,
@@ -475,15 +482,24 @@ async def create_order(
         target_id = v_id if v_id else p_id
         
         from models.inventory import ProductInventory
-        inv_result = await db.execute(select(ProductInventory).where(ProductInventory.product_id == target_id).order_by(ProductInventory.stock.desc()))
+        inv_result = await db.execute(
+            select(ProductInventory)
+            .where(ProductInventory.product_id == target_id)
+            .order_by(ProductInventory.stock.desc())
+            .with_for_update()
+        )
         inv = inv_result.scalars().first()
-        if inv:
-            await db.execute(
-                update(ProductInventory)
-                .where(ProductInventory.id == inv.id)
-                .values(stock=ProductInventory.stock - qty)
-                .execution_options(synchronize_session=False)
+        if not inv or inv.stock < qty:
+            raise HTTPException(
+                status_code=400,
+                detail="Not enough stock available to complete this order."
             )
+        await db.execute(
+            update(ProductInventory)
+            .where(ProductInventory.id == inv.id)
+            .values(stock=ProductInventory.stock - qty)
+            .execution_options(synchronize_session=False)
+        )
     
     # ── Coupon Validation (Global) ─────────────────────────────────────────────
     coupon_code_str = order_request.coupon_code.strip().upper() if (order_request and order_request.coupon_code) else None
@@ -614,6 +630,19 @@ async def create_order(
                 )
             )
         
+        # Compute transaction-time billing slab snapshot values
+        gross_sale_val = Decimal(str(max(0.0, item_subtotal - total_item_discount)))
+        from services.fee_service import get_applicable_slab
+        mp_slab = await get_applicable_slab(db, "marketplace", gross_sale_val)
+        mkt_slab = await get_applicable_slab(db, "marketing", gross_sale_val)
+        log_slab = await get_applicable_slab(db, "logistics", gross_sale_val)
+
+        snap_mp_cust = round(float(gross_sale_val * Decimal(str(mp_slab.customer_percentage))), 2) if (mp_slab and mp_slab.customer_percentage) else 0.0
+        snap_mp_dealer = round(float(gross_sale_val * Decimal(str(mp_slab.dealer_percentage))), 2) if mp_slab else 0.0
+        snap_mkt = round(float(gross_sale_val * Decimal(str(mkt_slab.dealer_percentage))), 2) if mkt_slab else 0.0
+        snap_log_dealer = round(float(gross_sale_val * Decimal(str(log_slab.dealer_percentage))), 2) if log_slab else 0.0
+        snap_log_cust = round(float(gross_sale_val * Decimal(str(log_slab.customer_percentage))), 2) if (log_slab and log_slab.customer_percentage) else item_delivery
+
         item_result = await db.execute(
             sql_insert(OrderItemModel).values(
                 order_id=new_order_id,
@@ -631,7 +660,15 @@ async def create_order(
                 cgst_amount=tax_data["cgst_amount"],
                 sgst_amount=tax_data["sgst_amount"],
                 igst_amount=tax_data["igst_amount"],
-                platform_fee=item_data["platform_fee"]
+                platform_fee=item_data["platform_fee"],
+                marketplace_customer_charge=snap_mp_cust,
+                marketplace_dealer_fee=snap_mp_dealer,
+                marketing_fee_amount=snap_mkt,
+                logistics_charge_amount=snap_log_dealer,
+                logistics_customer_charge=snap_log_cust,
+                return_window_days=item_data.get("return_window_days"),
+                is_returnable=item_data.get("is_returnable"),
+                is_exchangeable=item_data.get("is_exchangeable"),
             ).returning(OrderItemModel.id)
         )
         new_item_id = item_result.scalar_one()
@@ -921,6 +958,20 @@ async def download_order_invoice(
     if order.items and order.items[0].product:
         dealer = order.items[0].product.dealer
 
+    mkt_sac = "998314"
+    log_sac = "996812"
+    try:
+        from models.billing_slab import BillingSlab
+        res_mkt = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'marketplace', BillingSlab.is_active == True).limit(1))
+        found_mkt = res_mkt.scalars().first()
+        if found_mkt: mkt_sac = found_mkt
+
+        res_log = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'logistics', BillingSlab.is_active == True).limit(1))
+        found_log = res_log.scalars().first()
+        if found_log: log_sac = found_log
+    except Exception as e:
+        logger.warning(f"Error resolving SAC codes for invoice PDF: {e}")
+
     from services.invoice_pdf import generate_invoice_pdf
     pdf_buffer = generate_invoice_pdf(
         invoice=invoice,
@@ -928,7 +979,9 @@ async def download_order_invoice(
         order=order,
         order_items=order.items,
         billing_address=order.billing_address or order.shipping_address,
-        shipping_address=order.shipping_address
+        shipping_address=order.shipping_address,
+        marketplace_sac=mkt_sac,
+        logistics_sac=log_sac
     )
 
     pdf_bytes = pdf_buffer.getvalue()

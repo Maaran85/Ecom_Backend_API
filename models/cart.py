@@ -135,6 +135,13 @@ class OrderItem(Base):
     igst_amount      = Column(Float, default=0.0)
     hsn_code         = Column(String, nullable=True)
     platform_fee     = Column(Float, default=0.0)
+
+    # Billing Slab fee snapshots (calculated at checkout for historical immutability)
+    marketplace_customer_charge = Column(Float, default=0.0)
+    marketplace_dealer_fee      = Column(Float, default=0.0)
+    marketing_fee_amount         = Column(Float, default=0.0)
+    logistics_charge_amount      = Column(Float, default=0.0)
+    logistics_customer_charge   = Column(Float, default=0.0)
     
     # Item-specific tracking
     status = Column(String, default="pending")  # PENDING, PACKAGING, DISPATCHED, DELIVERED, REJECTED, UNDELIVERED
@@ -172,6 +179,11 @@ class OrderItem(Base):
     # Settlement tracking
     logistics_remittance_id = Column(Integer, ForeignKey("logistics_remittances.id", ondelete="SET NULL"), nullable=True)
     dealer_remittance_id = Column(Integer, ForeignKey("dealer_remittances.id", ondelete="SET NULL"), nullable=True)
+
+    # Return & Exchange Policy Snapshot at Checkout
+    return_window_days = Column(Integer, nullable=True)
+    is_returnable      = Column(Boolean, nullable=True)
+    is_exchangeable    = Column(Boolean, nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
