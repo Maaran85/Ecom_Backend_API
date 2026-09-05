@@ -1034,6 +1034,103 @@ async def get_dealer_order_detail(
         customer_long=customer_long
     )
 
+
+@router.get("/orders/{order_id}/admin-invoice/pdf")
+async def download_order_admin_fee_invoice_pdf(
+    order_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Generate and download the B2B Platform Service Tax Invoice (Admin to Dealer)
+    for this order, covering Marketplace Fees (SAC 996111) and Shipping Services (SAC 996812).
+    """
+    from fastapi.responses import StreamingResponse
+    from services.invoice_pdf import generate_dealer_fee_invoice_pdf
+    from models.partner import Partner
+    from models.billing_slab import BillingSlab
+
+    is_admin = current_user.role in [UserRole.ADMIN, UserRole.SUPER_ADMIN]
+    dealer = await get_current_dealer(current_user, db)
+
+    if not is_admin and not dealer:
+        raise HTTPException(status_code=403, detail="Not authorized as a dealer or admin")
+
+    query = (
+        select(Order)
+        .where(Order.id == order_id)
+        .options(
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+            selectinload(Order.items).selectinload(OrderItem.logistics_partner),
+            selectinload(Order.shipping_address)
+        )
+    )
+    result = await db.execute(query)
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if is_admin and not dealer:
+        if order.items and order.items[0].product and order.items[0].product.dealer:
+            dealer = order.items[0].product.dealer
+        else:
+            raise HTTPException(status_code=400, detail="Could not resolve dealer for this order")
+
+    # Filter items belonging to this dealer
+    dealer_items = [
+        it for it in order.items
+        if it.product and it.product.dealer_id == dealer.id
+    ]
+    if not dealer_items and not is_admin:
+        raise HTTPException(status_code=403, detail="No items belonging to your dealership in this order")
+    elif not dealer_items and is_admin:
+        dealer_items = order.items
+
+    # Fetch platform partner details
+    partner_res = await db.execute(select(Partner).where(Partner.is_active == True).limit(1))
+    partner = partner_res.scalars().first()
+
+    # Resolve SAC codes
+    mkt_sac = "996111"
+    log_sac = "996812"
+    try:
+        res_mkt = await db.execute(
+            select(BillingSlab.sac_hsn_code)
+            .where(BillingSlab.category_key == 'marketplace', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None))
+            .limit(1)
+        )
+        found_mkt = res_mkt.scalars().first()
+        if found_mkt:
+            mkt_sac = found_mkt
+
+        res_log = await db.execute(
+            select(BillingSlab.sac_hsn_code)
+            .where(BillingSlab.category_key == 'logistics', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None))
+            .limit(1)
+        )
+        found_log = res_log.scalars().first()
+        if found_log:
+            log_sac = found_log
+    except Exception:
+        pass
+
+    pdf_buffer = generate_dealer_fee_invoice_pdf(
+        order=order,
+        dealer=dealer,
+        items=dealer_items,
+        partner=partner,
+        marketplace_sac=mkt_sac,
+        logistics_sac=log_sac
+    )
+
+    filename = f"Admin_Fee_Invoice_{order.order_number or order.id}.pdf"
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
+
+
 @router.put("/orders/{order_id}/status", response_model=DealerOrderResponse)
 async def update_dealer_order_status(
     order_id: int,

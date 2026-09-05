@@ -37,6 +37,7 @@ async def build_and_persist_settlement(
     fy_start: date,
     fy_end: date,
     settlement_date: date,
+    mature_date: Optional[date] = None,
     adjustment_rows: Optional[List[Tuple[SettlementAdjustment, str]]] = None,
     notes: Optional[str] = None,
 ) -> Settlement:
@@ -62,6 +63,7 @@ async def build_and_persist_settlement(
         period_start=period_start,
         period_end=period_end,
         settlement_date=settlement_date,
+        mature_date=mature_date,
         gross_sale_amount=float(money_2dp(calc.gross_sale_total)),
         total_marketplace_fee=float(money_2dp(calc.marketplace_fee_total)),
         total_marketing_fee=float(money_2dp(calc.marketing_fee_total)),
@@ -95,6 +97,7 @@ async def build_and_persist_settlement(
                 order_number=line.order.order_number,
                 order_date=_to_date(line.order.created_at),
                 settlement_date=settlement_date,
+                mature_date=mature_date,
                 item_price=float(line.item.price),
                 quantity=line.item.quantity,
                 gross_sale_amount=float(money_2dp(line.gross_sale)),

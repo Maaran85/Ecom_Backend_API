@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
@@ -21,13 +21,30 @@ from services.financial_year_service import (
     revert_from_fy_summary,
 )
 from services.configuration_service import get_active_tds_config_required, ConfigurationError
+from sqlalchemy import inspect
+
+
+def _get_user_id(user: Optional[User]) -> Optional[int]:
+    if not user:
+        return None
+    try:
+        ins = inspect(user)
+        if ins and ins.identity:
+            return ins.identity[0]
+    except Exception:
+        pass
+    return getattr(user, "id", None)
 
 
 async def preview_settlement(
     db: AsyncSession,
     dealer: Dealer,
     eligible_items: List[Tuple[OrderItem, Order, Product, Dealer]],
+    *,
     settlement_date: date,
+    mature_date: Optional[date] = None,
+    period_start: Optional[date] = None,
+    period_end: Optional[date] = None,
 ) -> dict:
     """
     Non-persisting preview of a settlement (dry-run). Returns data shaped for
@@ -46,6 +63,9 @@ async def preview_settlement(
         fy_summary=fy_summary,
         adjustment_total=adjustment_total,
     )
+
+    resolved_period_start = period_start or (min(as_date(o.created_at) for _, o, _, _ in eligible_items) if eligible_items else None)
+    resolved_period_end = period_end or (max(as_date(o.created_at) for _, o, _, _ in eligible_items) if eligible_items else None)
 
     items = [
         {
@@ -67,9 +87,32 @@ async def preview_settlement(
         for line in calc.lines
     ]
 
+    matures = []
+    deliveries = []
+    for itm, ord, prod, dlr in eligible_items:
+        deliv = itm.delivered_at or ord.delivered_at
+        if deliv:
+            is_ret = itm.is_returnable if itm.is_returnable is not None else getattr(prod, 'is_returnable', True)
+            is_exc = getattr(prod, 'is_exchangeable', True)
+            if is_ret is None: is_ret = True
+            if is_exc is None: is_exc = True
+            eff_win = 0 if (not is_ret and not is_exc) else (getattr(itm, 'return_window_days', None) or getattr(prod, 'return_window_days', None) or 15)
+            mat = (deliv + timedelta(days=eff_win)).date()
+            matures.append(mat)
+            deliveries.append(deliv.date())
+
+    mature_date = mature_date or (max(matures) if matures else settlement_date)
+    delivery_date = min(deliveries) if deliveries else resolved_period_start
+
     return {
         "dealer_id": dealer.id,
+        "dealer_name": dealer.business_name,
         "financial_year": fy_label,
+        "settlement_date": settlement_date,
+        "mature_date": mature_date,
+        "delivery_date": delivery_date,
+        "period_start": resolved_period_start,
+        "period_end": resolved_period_end,
         "item_count": len(calc.lines),
         "gross_sale_amount": float(money_2dp(calc.gross_sale_total)),
         "total_marketplace_fee": float(money_2dp(calc.marketplace_fee_total)),
@@ -109,6 +152,7 @@ async def generate_settlement(
     eligible_items: List[Tuple[OrderItem, Order, Product, Dealer]],
     *,
     settlement_date: date,
+    mature_date: Optional[date] = None,
     period_start: Optional[date] = None,
     period_end: Optional[date] = None,
     notes: Optional[str] = None,
@@ -163,6 +207,7 @@ async def generate_settlement(
         fy_start=fy_start,
         fy_end=fy_end,
         settlement_date=settlement_date,
+        mature_date=mature_date,
         adjustment_rows=adjustment_rows,
         notes=notes,
     )
@@ -171,6 +216,28 @@ async def generate_settlement(
     if pending:
         for p in pending:
             p.applied_to_settlement_id = settlement.id
+
+    # Calculate mature_date and delivery_date for the batch
+    matures = []
+    deliveries = []
+    for itm, ord, prod, dlr in eligible_items:
+        deliv = itm.delivered_at or ord.delivered_at
+        if deliv:
+            is_ret = itm.is_returnable if itm.is_returnable is not None else getattr(prod, 'is_returnable', True)
+            is_exc = getattr(prod, 'is_exchangeable', True)
+            if is_ret is None: is_ret = True
+            if is_exc is None: is_exc = True
+            eff_win = 0 if (not is_ret and not is_exc) else (getattr(itm, 'return_window_days', None) or getattr(prod, 'return_window_days', None) or 15)
+            mat = (deliv + timedelta(days=eff_win)).date()
+            matures.append(mat)
+            deliveries.append(deliv.date())
+
+    resolved_mature_date = mature_date or (max(matures) if matures else settlement_date)
+    settlement.mature_date = resolved_mature_date
+    snap = dict(settlement.calculation_snapshot or {})
+    snap["mature_date"] = str(resolved_mature_date)
+    snap["delivery_date"] = str(min(deliveries)) if deliveries else str(period_start)
+    settlement.calculation_snapshot = snap
 
     # Transition DRAFT -> GENERATED
     assert_transition(settlement.status, SettlementStatus.GENERATED)
@@ -242,7 +309,7 @@ async def approve_settlement(
 
     settlement.status = SettlementStatus.APPROVED
     settlement.approved_at = datetime.now(timezone.utc)
-    settlement.approved_by = admin.id
+    settlement.approved_by = _get_user_id(admin)
     if notes:
         settlement.notes = notes
 
@@ -281,13 +348,13 @@ async def mark_settlement_paid(
     remittance.payment_method = payment_method or remittance.payment_method
     remittance.payment_date = payment_date
     remittance.confirmed_at = datetime.now(timezone.utc)
-    remittance.confirmed_by_admin_id = admin.id
+    remittance.confirmed_by_admin_id = _get_user_id(admin)
     if notes:
         remittance.notes = notes
 
     settlement.status = SettlementStatus.PAID
     settlement.paid_at = datetime.now(timezone.utc)
-    settlement.paid_by = admin.id
+    settlement.paid_by = _get_user_id(admin)
 
     await _notify_dealer_users(
         db, settlement.dealer_id, "paid",
@@ -325,7 +392,7 @@ async def cancel_settlement(
 
     settlement.status = SettlementStatus.CANCELLED
     settlement.cancelled_at = datetime.now(timezone.utc)
-    settlement.cancelled_by = admin.id
+    settlement.cancelled_by = _get_user_id(admin)
     settlement.cancel_reason = reason
     
     # Mark all items as is_cancelled = True to release unique constraints,

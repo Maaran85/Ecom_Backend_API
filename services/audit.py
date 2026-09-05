@@ -17,9 +17,23 @@ async def log_audit(
     """
     Utility to create an audit log entry.
     """
+    user_id = None
+    dealer_id = None
+    if user:
+        from sqlalchemy import inspect
+        try:
+            ins = inspect(user)
+            if ins.identity:
+                user_id = ins.identity[0]
+            if "dealer_id" in ins.dict:
+                dealer_id = ins.dict["dealer_id"]
+        except Exception:
+            user_id = getattr(user, "id", None)
+            dealer_id = getattr(user, "dealer_id", None)
+
     audit = AuditLog(
-        user_id=user.id if user else None,
-        dealer_id=user.dealer_id if user and hasattr(user, 'dealer_id') else None,
+        user_id=user_id,
+        dealer_id=dealer_id,
         action=action,
         resource_type=resource_type,
         resource_id=str(resource_id) if resource_id else None,

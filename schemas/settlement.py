@@ -15,6 +15,7 @@ class SettlementItemOut(BaseModel):
     order_number: Optional[str]
     order_date: Optional[date]
     settlement_date: date
+    mature_date: Optional[date] = None
     delivery_date: Optional[date] = None
     product_id: Optional[str] = None
     product_name: Optional[str] = None
@@ -74,6 +75,9 @@ class SettlementOut(BaseModel):
     financial_year: str
     fy_start_date: date
     fy_end_date: date
+    settlement_date: Optional[date] = None
+    mature_date: Optional[date] = None
+    delivery_date: Optional[date] = None
     period_start: date
     period_end: date
     gross_sale_amount: float
@@ -115,6 +119,9 @@ class SettlementSummaryOut(BaseModel):
     dealer_name: Optional[str] = None
     status: SettlementStatus
     financial_year: str
+    settlement_date: Optional[date] = None
+    mature_date: Optional[date] = None
+    delivery_date: Optional[date] = None
     period_start: date
     period_end: date
     gross_sale_amount: float
@@ -130,8 +137,10 @@ class SettlementSummaryOut(BaseModel):
 
 class GenerateSettlementRequest(BaseModel):
     dealer_id: Optional[UUID] = None  # None = run for all eligible dealers
+    settlement_date: Optional[date] = None  # Cutoff settlement date (defaults to yesterday)
     period_start: Optional[date] = None
     period_end: Optional[date] = None
+    date_basis: Optional[str] = "delivery_date"  # "order_date" or "delivery_date"
     dry_run: bool = False              # preview without persisting
 
 
@@ -154,7 +163,13 @@ class SettlementPreviewItem(BaseModel):
 
 class SettlementPreviewOut(BaseModel):
     dealer_id: UUID
+    dealer_name: Optional[str] = None
     financial_year: str
+    settlement_date: Optional[date] = None
+    mature_date: Optional[date] = None
+    delivery_date: Optional[date] = None
+    period_start: Optional[date] = None
+    period_end: Optional[date] = None
     item_count: int
     gross_sale_amount: float
     total_marketplace_fee: float

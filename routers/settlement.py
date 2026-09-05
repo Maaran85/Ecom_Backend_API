@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from uuid import UUID
+from collections import defaultdict
 from services.financial_year_service import IST_TZ
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,13 +16,15 @@ from core.permissions import (
 from core.enums import SettlementStatus, AdjustmentType
 from models import User, Dealer, OrderItem
 from models.settlement import Settlement, SettlementItem
+from models.settlement_configuration import SettlementConfiguration
+from services.return_policy_service import get_effective_protection_window
 from schemas.settlement import (
     GenerateSettlementRequest, SettlementPreviewOut,
     SettlementOut, SettlementSummaryOut,
     SettlementApproveRequest, SettlementPaidRequest, SettlementCancelRequest,
     SettlementAdjustmentCreate,
 )
-from services.settlement_eligibility_service import get_eligible_order_items
+from services.settlement_eligibility_service import get_eligible_order_items, _extract_item_date
 from services.settlement_workflow import (
     preview_settlement,
     generate_settlement,
@@ -33,6 +36,39 @@ from services.settlement_workflow import (
 from services.audit import log_audit
 
 router = APIRouter()
+
+
+def _extract_settlement_dates(s: Settlement) -> Tuple[Optional[date], Optional[date]]:
+    mature_date = getattr(s, "mature_date", None)
+    calc = s.calculation_snapshot or {}
+    if not mature_date:
+        mature_date = calc.get("mature_date")
+    delivery_date = calc.get("delivery_date")
+    if not delivery_date:
+        delivery_date = s.period_start
+    elif isinstance(delivery_date, str):
+        try:
+            delivery_date = date.fromisoformat(delivery_date)
+        except Exception:
+            delivery_date = s.period_start
+
+    if not mature_date:
+        mature_date = s.settlement_date or s.period_end or s.period_start
+    elif isinstance(mature_date, str):
+        try:
+            mature_date = date.fromisoformat(mature_date)
+        except Exception:
+            mature_date = s.settlement_date
+    return mature_date, delivery_date
+
+
+def _extract_item_mature_date(item, order, product, config=None) -> date:
+    deliv = item.delivered_at or order.delivered_at
+    if not deliv:
+        return _extract_item_date(item, order, date_basis="delivery_date")
+    eff_win = get_effective_protection_window(item, product=product, global_config=config)
+    mat = deliv + timedelta(days=eff_win)
+    return mat.date() if hasattr(mat, 'date') else mat
 
 
 async def _load_settlement(db: AsyncSession, settlement_id: int) -> Settlement:
@@ -48,10 +84,22 @@ async def _load_settlement(db: AsyncSession, settlement_id: int) -> Settlement:
     return result.scalar_one_or_none()
 
 
-async def _dealer_ids_with_eligible_items(db: AsyncSession, as_of: Optional[datetime] = None) -> List[UUID]:
-    """Dealers who currently have eligible (matured) order items."""
+async def _dealer_ids_with_eligible_items(
+    db: AsyncSession,
+    as_of: Optional[datetime] = None,
+    period_start: Optional[date] = None,
+    period_end: Optional[date] = None,
+    date_basis: str = "delivery_date",
+) -> List[UUID]:
+    """Dealers who currently have eligible (matured) order items in this date cycle."""
     from services.settlement_eligibility_service import get_eligible_order_items
-    items = await get_eligible_order_items(db, as_of=as_of)
+    items = await get_eligible_order_items(
+        db,
+        as_of=as_of,
+        period_start=period_start,
+        period_end=period_end,
+        date_basis=date_basis,
+    )
     dealers = {dealer.id for _, _, _, dealer in items}
     return list(dealers)
 
@@ -71,21 +119,31 @@ async def generate_settlements(
 ):
     """
     Generates settlements for one (or all) dealer(s). Eligible order items are
-    those delivered whose return window has matured and which aren't already
-    settled. dry_run=true returns a preview without persisting anything.
+    those delivered whose return window has matured, aren't already settled,
+    and fall within the optional [period_start, period_end] cycle.
+    Eligible items are grouped by distinct cycle date (delivery_date) so that
+    each date gets a separate settlement statement.
+    dry_run=true returns a preview without persisting anything.
     """
     current_ist = datetime.now(timezone.utc).astimezone(IST_TZ)
-    settlement_date = req.period_end or (current_ist.date() - timedelta(days=1))
+    settlement_date = req.settlement_date or req.period_end or (current_ist.date() - timedelta(days=1))
 
     naive_eod = datetime.combine(settlement_date, datetime.max.time())
     localized_eod = naive_eod.replace(tzinfo=IST_TZ)
     as_of = localized_eod.astimezone(timezone.utc)
+    date_basis = req.date_basis or "delivery_date"
 
     dealer_ids: List[UUID]
     if req.dealer_id:
         dealer_ids = [req.dealer_id]
     else:
-        dealer_ids = await _dealer_ids_with_eligible_items(db, as_of=as_of)
+        dealer_ids = await _dealer_ids_with_eligible_items(
+            db,
+            as_of=as_of,
+            period_start=req.period_start,
+            period_end=req.period_end,
+            date_basis=date_basis,
+        )
 
     if not dealer_ids:
         # dry_run with zero eligible items is a normal / expected state (all items are
@@ -98,7 +156,7 @@ async def generate_settlements(
         raise HTTPException(status_code=400, detail="No eligible order items found")
 
     results = []
-    generated_settlements: List[Settlement] = []  # collect ORM objects for real generation
+    generated_settlements: List[Tuple[Settlement, UUID, str]] = []  # collect (ORM, dealer_id, dealer_name)
     dealer_map: dict = {}  # dealer_id → Dealer, reused for response building
 
     for dealer_id in dealer_ids:
@@ -108,7 +166,13 @@ async def generate_settlements(
         dealer_map[dealer_id] = dealer
 
         eligible = await get_eligible_order_items(
-            db, dealer_id=dealer_id, as_of=as_of, for_update=not req.dry_run
+            db,
+            dealer_id=dealer_id,
+            as_of=as_of,
+            period_start=req.period_start,
+            period_end=req.period_end,
+            date_basis=date_basis,
+            for_update=not req.dry_run,
         )
         if not eligible:
             if req.dealer_id and not req.dry_run:
@@ -118,49 +182,107 @@ async def generate_settlements(
                 )
             continue
 
-        if req.dry_run:
-            preview = await preview_settlement(db, dealer, eligible, settlement_date)
-            results.append(SettlementPreviewOut(**preview))
-            continue
+        # Fetch global settlement configuration for fallback window
+        config_res = await db.execute(select(SettlementConfiguration).limit(1))
+        global_config = config_res.scalar_one_or_none()
 
-        settlement = await generate_settlement(
-            db,
-            dealer,
-            eligible,
-            settlement_date=settlement_date,
-            period_start=req.period_start,
-            period_end=req.period_end,
-        )
-        await log_audit(
-            db, admin, "GENERATE", "settlement",
-            resource_id=str(settlement.id),
-            new_values={"dealer_id": str(dealer.id), "net_payable": settlement.net_payable},
-        )
-        await db.flush()
-        generated_settlements.append((settlement, dealer))
+        # Group eligible items by Maturity Date (Delivered Date + Return Window)
+        groups_by_mature = defaultdict(list)
+        for item, order, product, d in eligible:
+            mat_dt = _extract_item_mature_date(item, order, product, config=global_config)
+            if not mat_dt:
+                mat_dt = settlement_date
+            groups_by_mature[mat_dt].append((item, order, product, d))
 
-    await db.commit()
+        # Sort mature dates chronologically so FY summaries accumulate progressively and accurately
+        for mature_date in sorted(groups_by_mature.keys()):
+            group_items = groups_by_mature[mature_date]
+
+            # Check if an active (non-cancelled) settlement already exists for this dealer on mature_date
+            active_exist = await db.execute(
+                select(Settlement).where(
+                    Settlement.dealer_id == dealer_id,
+                    Settlement.mature_date == mature_date,
+                    Settlement.status != SettlementStatus.CANCELLED,
+                )
+            )
+            existing_settlement = active_exist.scalars().first()
+            if existing_settlement:
+                # If this specific mature date is already actively settled, skip it so other dates still generate
+                continue
+
+            deliv_dates = [_extract_item_date(i, o, "delivery_date") for i, o, _, _ in group_items]
+            deliv_dates = [d for d in deliv_dates if d is not None]
+            p_start = min(deliv_dates) if deliv_dates else mature_date
+            p_end = max(deliv_dates) if deliv_dates else mature_date
+
+            if req.dry_run:
+                preview = await preview_settlement(
+                    db,
+                    dealer,
+                    group_items,
+                    settlement_date=settlement_date,
+                    mature_date=mature_date,
+                    period_start=p_start,
+                    period_end=p_end,
+                )
+                results.append(SettlementPreviewOut(**preview))
+                continue
+
+            settlement = await generate_settlement(
+                db,
+                dealer,
+                group_items,
+                settlement_date=settlement_date,
+                mature_date=mature_date,
+                period_start=p_start,
+                period_end=p_end,
+            )
+            await log_audit(
+                db, admin, "GENERATE", "settlement",
+                resource_id=str(settlement.id),
+                new_values={
+                    "dealer_id": str(dealer.id),
+                    "net_payable": settlement.net_payable,
+                    "settlement_date": str(settlement_date),
+                    "mature_date": str(mature_date),
+                },
+            )
+            await db.flush()
+            generated_settlements.append((settlement, dealer.id, dealer.business_name))
 
     if req.dry_run:
         return {"dry_run": True, "previews": [r.model_dump() for r in results]}
 
+    if not generated_settlements:
+        raise HTTPException(
+            status_code=400,
+            detail="No new settlements could be generated. All eligible items are either already settled or still within return window.",
+        )
+
+    await db.commit()
+
     # Build SettlementSummaryOut for each generated settlement.
     # Refresh each settlement after commit so item counts reflect persisted rows.
     summary_results = []
-    for settlement, dealer in generated_settlements:
+    for settlement, d_id, d_name in generated_settlements:
         await db.refresh(settlement)
         # Load items count via fresh query (settlement.items may be unloaded after flush/commit)
         items_res = await db.execute(
             select(SettlementItem).where(SettlementItem.settlement_id == settlement.id)
         )
         items = items_res.scalars().all()
+        mat_dt, deliv_dt = _extract_settlement_dates(settlement)
         summary_results.append(SettlementSummaryOut(
             id=settlement.id,
             settlement_number=settlement.settlement_number,
             dealer_id=settlement.dealer_id,
-            dealer_name=dealer.business_name,
+            dealer_name=d_name,
             status=settlement.status,
             financial_year=settlement.financial_year,
+            settlement_date=settlement.settlement_date,
+            mature_date=mat_dt,
+            delivery_date=deliv_dt,
             period_start=settlement.period_start,
             period_end=settlement.period_end,
             gross_sale_amount=settlement.gross_sale_amount,
@@ -187,9 +309,9 @@ async def list_admin_settlements(
     admin: User = Depends(require_admin),
 ):
     query = select(Settlement).options(selectinload(Settlement.items))
-    if status_filter:
+    if status_filter and isinstance(status_filter, str):
         try:
-            query = query.where(Settlement.status == SettlementStatus(status_filter))
+            query = query.where(Settlement.status == SettlementStatus(status_filter.lower()))
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid status: {status_filter}")
     if dealer_id:
@@ -197,7 +319,9 @@ async def list_admin_settlements(
     if financial_year:
         query = query.where(Settlement.financial_year == financial_year)
 
-    query = query.order_by(Settlement.created_at.desc()).offset(offset).limit(limit)
+    offset_val = offset if isinstance(offset, int) else 0
+    limit_val = limit if isinstance(limit, int) else 50
+    query = query.order_by(Settlement.id.desc()).offset(offset_val).limit(limit_val)
     result = await db.execute(query)
     settlements = result.scalars().all()
 
@@ -207,26 +331,32 @@ async def list_admin_settlements(
         dealer_rows = await db.execute(select(Dealer).where(Dealer.id.in_(dealer_ids)))
         dealers = {d.id: d for d in dealer_rows.scalars().all()}
 
-    return [
-        SettlementSummaryOut(
-            id=s.id,
-            settlement_number=s.settlement_number,
-            dealer_id=s.dealer_id,
-            dealer_name=dealers[s.dealer_id].business_name if s.dealer_id in dealers else None,
-            status=s.status,
-            financial_year=s.financial_year,
-            period_start=s.period_start,
-            period_end=s.period_end,
-            gross_sale_amount=s.gross_sale_amount,
-            total_tds=s.total_tds,
-            net_payable=s.net_payable,
-            item_count=len(s.items) if s.items else 0,
-            generated_at=s.generated_at,
-            paid_at=s.paid_at,
-            created_at=s.created_at,
+    summary_list = []
+    for s in settlements:
+        mat_dt, deliv_dt = _extract_settlement_dates(s)
+        summary_list.append(
+            SettlementSummaryOut(
+                id=s.id,
+                settlement_number=s.settlement_number,
+                dealer_id=s.dealer_id,
+                dealer_name=dealers[s.dealer_id].business_name if s.dealer_id in dealers else None,
+                status=s.status,
+                financial_year=s.financial_year,
+                settlement_date=s.settlement_date,
+                mature_date=mat_dt,
+                delivery_date=deliv_dt,
+                period_start=s.period_start,
+                period_end=s.period_end,
+                gross_sale_amount=s.gross_sale_amount,
+                total_tds=s.total_tds,
+                net_payable=s.net_payable,
+                item_count=len(s.items) if s.items else 0,
+                generated_at=s.generated_at,
+                paid_at=s.paid_at,
+                created_at=s.created_at,
+            )
         )
-        for s in settlements
-    ]
+    return summary_list
 
 
 @router.get("/admin/settlements/{settlement_id}", response_model=SettlementOut)
@@ -238,7 +368,13 @@ async def get_admin_settlement(
     settlement = await _load_settlement(db, settlement_id)
     if not settlement:
         raise HTTPException(status_code=404, detail="Settlement not found")
-    return settlement
+    mat_dt, deliv_dt = _extract_settlement_dates(settlement)
+    out = SettlementOut.model_validate(settlement)
+    out.mature_date = mat_dt
+    out.delivery_date = deliv_dt
+    for itm, itm_out in zip(settlement.items, out.items):
+        itm_out.mature_date = getattr(itm, 'mature_date', None) or mat_dt
+    return out
 
 
 @router.post("/admin/settlements/{settlement_id}/approve", response_model=SettlementOut)
@@ -404,25 +540,31 @@ async def list_my_settlements(
     query = query.order_by(Settlement.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(query)
     settlements = result.scalars().all()
-    return [
-        SettlementSummaryOut(
-            id=s.id,
-            settlement_number=s.settlement_number,
-            dealer_id=s.dealer_id,
-            status=s.status,
-            financial_year=s.financial_year,
-            period_start=s.period_start,
-            period_end=s.period_end,
-            gross_sale_amount=s.gross_sale_amount,
-            total_tds=s.total_tds,
-            net_payable=s.net_payable,
-            item_count=len(s.items) if s.items else 0,
-            generated_at=s.generated_at,
-            paid_at=s.paid_at,
-            created_at=s.created_at,
+    summary_list = []
+    for s in settlements:
+        mat_dt, deliv_dt = _extract_settlement_dates(s)
+        summary_list.append(
+            SettlementSummaryOut(
+                id=s.id,
+                settlement_number=s.settlement_number,
+                dealer_id=s.dealer_id,
+                status=s.status,
+                financial_year=s.financial_year,
+                settlement_date=s.settlement_date,
+                mature_date=mat_dt,
+                delivery_date=deliv_dt,
+                period_start=s.period_start,
+                period_end=s.period_end,
+                gross_sale_amount=s.gross_sale_amount,
+                total_tds=s.total_tds,
+                net_payable=s.net_payable,
+                item_count=len(s.items) if s.items else 0,
+                generated_at=s.generated_at,
+                paid_at=s.paid_at,
+                created_at=s.created_at,
+            )
         )
-        for s in settlements
-    ]
+    return summary_list
 
 
 @router.get("/dealers/settlements/{settlement_id}", response_model=SettlementOut)
@@ -438,7 +580,13 @@ async def get_my_settlement(
         raise HTTPException(status_code=404, detail="Settlement not found")
     if settlement.dealer_id != user.dealer_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    return settlement
+    mat_dt, deliv_dt = _extract_settlement_dates(settlement)
+    out = SettlementOut.model_validate(settlement)
+    out.mature_date = mat_dt
+    out.delivery_date = deliv_dt
+    for itm, itm_out in zip(settlement.items, out.items):
+        itm_out.mature_date = getattr(itm, 'mature_date', None) or mat_dt
+    return out
 
 
 @router.get("/dealers/settlements/{settlement_id}/pdf")

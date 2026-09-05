@@ -1182,3 +1182,81 @@ async def list_admin_recharge_transactions(
         }
         for t in transactions
     ]
+
+
+@router.get("/orders/{order_id}/dealer-fee-invoice/pdf")
+async def download_admin_order_fee_invoice_pdf(
+    order_id: int,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Admin endpoint to download the Platform Fee Tax Invoice issued to the dealer for an order."""
+    from fastapi.responses import StreamingResponse
+    from services.invoice_pdf import generate_dealer_fee_invoice_pdf
+    from models.partner import Partner
+    from models.billing_slab import BillingSlab
+    from models.order import Order
+    from models.order_item import OrderItem
+
+    query = (
+        select(Order)
+        .where(Order.id == order_id)
+        .options(
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+            selectinload(Order.items).selectinload(OrderItem.logistics_partner),
+            selectinload(Order.shipping_address)
+        )
+    )
+    result = await db.execute(query)
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    dealer = None
+    if order.items and order.items[0].product and order.items[0].product.dealer:
+        dealer = order.items[0].product.dealer
+    else:
+        raise HTTPException(status_code=400, detail="Could not resolve dealer for this order")
+
+    partner_res = await db.execute(select(Partner).where(Partner.is_active == True).limit(1))
+    partner = partner_res.scalars().first()
+
+    mkt_sac = "996111"
+    log_sac = "996812"
+    try:
+        res_mkt = await db.execute(
+            select(BillingSlab.sac_hsn_code)
+            .where(BillingSlab.category_key == 'marketplace', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None))
+            .limit(1)
+        )
+        found_mkt = res_mkt.scalars().first()
+        if found_mkt:
+            mkt_sac = found_mkt
+
+        res_log = await db.execute(
+            select(BillingSlab.sac_hsn_code)
+            .where(BillingSlab.category_key == 'logistics', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None))
+            .limit(1)
+        )
+        found_log = res_log.scalars().first()
+        if found_log:
+            log_sac = found_log
+    except Exception:
+        pass
+
+    pdf_buffer = generate_dealer_fee_invoice_pdf(
+        order=order,
+        dealer=dealer,
+        items=order.items,
+        partner=partner,
+        marketplace_sac=mkt_sac,
+        logistics_sac=log_sac
+    )
+
+    filename = f"Admin_Fee_Invoice_{order.order_number or order.id}.pdf"
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
+

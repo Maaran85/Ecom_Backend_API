@@ -29,6 +29,7 @@ class Settlement(Base):
     period_start = Column(Date, nullable=False)
     period_end = Column(Date, nullable=False)
     settlement_date = Column(Date, nullable=True, index=True)
+    mature_date = Column(Date, nullable=True, index=True)
 
     # --- Totals (rounded to paise) ---
     gross_sale_amount = Column(Float, default=0.0, nullable=False)
@@ -102,6 +103,7 @@ class SettlementItem(Base):
     order_number = Column(String, nullable=True)
     order_date = Column(Date, nullable=True)         # actual order placement date
     settlement_date = Column(Date, nullable=False)    # FY attribution date (official axis)
+    mature_date = Column(Date, nullable=True)        # order return maturity date
 
     # Item financials (precise)
     item_price = Column(Float, nullable=False)        # unit price at checkout (GST-inclusive)

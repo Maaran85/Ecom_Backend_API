@@ -55,10 +55,26 @@ async def _permanently_settled_item_ids_query():
     )
 
 
+def _extract_item_date(item: OrderItem, order: Order, date_basis: str = "order_date") -> Optional[date]:
+    """Extract date based on date_basis ('order_date' or 'delivery_date')."""
+    if date_basis == "delivery_date":
+        dt = item.delivered_at or order.delivered_at or order.created_at
+    else:
+        dt = order.created_at or item.delivered_at or order.delivered_at
+    if dt is None:
+        return None
+    if hasattr(dt, 'date'):
+        return dt.date()
+    return dt
+
+
 async def get_eligible_order_items(
     db: AsyncSession,
     dealer_id: Optional[UUID] = None,
     as_of: Optional[datetime] = None,
+    period_start: Optional[date] = None,
+    period_end: Optional[date] = None,
+    date_basis: str = "order_date",
     for_update: bool = False,
 ) -> List[Tuple[OrderItem, Order, Product, Dealer]]:
     """
@@ -68,6 +84,7 @@ async def get_eligible_order_items(
       - order delivered and return window (settlement_configurations.return_window_days) has matured
       - item not returned / not part of an active return
       - item not already claimed by a non-cancelled settlement or paid settlement
+      - item falls within [period_start, period_end] if specified
     """
     as_of = as_of or datetime.now(timezone.utc)
     if as_of.tzinfo is None:
@@ -119,14 +136,25 @@ async def get_eligible_order_items(
         deliv_dt = item.delivered_at or order.delivered_at
         if not deliv_dt:
             continue
-        if is_item_settlement_matured(
+        if not is_item_settlement_matured(
             item=item,
             delivered_at=deliv_dt,
             as_of=as_of,
             product=product,
             global_config=config,
         ):
-            eligible_tuples.append((item, order, product, dealer))
+            continue
+
+        # Period boundary filtering (billing cycle)
+        if period_start or period_end:
+            item_dt = _extract_item_date(item, order, date_basis)
+            if item_dt:
+                if period_start and item_dt < period_start:
+                    continue
+                if period_end and item_dt > period_end:
+                    continue
+
+        eligible_tuples.append((item, order, product, dealer))
 
     return eligible_tuples
 

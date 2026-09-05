@@ -1088,3 +1088,441 @@ def generate_dealer_settlement_pdf(settlement, dealer, items, marketplace_sac="9
     doc.build(story)
     buffer.seek(0)
     return buffer
+
+
+def generate_dealer_fee_invoice_pdf(
+    order,
+    dealer,
+    items,
+    partner=None,
+    marketplace_sac="996111",
+    logistics_sac="996812"
+):
+    """
+    Generates Official Platform Service Tax Invoice (Admin to Dealer) for an Order
+    following the exact 11-column dual-table pattern:
+    slno | Product ID | Description | Unit price | Qty | Discount | Net Amount | Tax Rate | GST type | Tax Amount | Total Amount
+
+    Table 1: Marketplace Fees (SAC 996111)
+    Table 2: Shipping Services (SAC 996812)
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=24,
+        rightMargin=24,
+        topMargin=24,
+        bottomMargin=24
+    )
+
+    styles = getSampleStyleSheet()
+
+    style_logo = ParagraphStyle(
+        'FeeLogo',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=16,
+        leading=18,
+        textColor=colors.HexColor('#1E1B4B')
+    )
+    style_title_right = ParagraphStyle(
+        'FeeTitleRight',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=11,
+        leading=13,
+        alignment=2
+    )
+    style_normal = ParagraphStyle(
+        'FeeNormal',
+        parent=styles['Normal'],
+        fontName=FONT_NORMAL,
+        fontSize=8,
+        leading=10.5
+    )
+    style_bold = ParagraphStyle(
+        'FeeBold',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=8,
+        leading=10.5
+    )
+    style_normal_right = ParagraphStyle(
+        'FeeNormalRight',
+        parent=style_normal,
+        alignment=2
+    )
+    style_bold_right = ParagraphStyle(
+        'FeeBoldRight',
+        parent=style_bold,
+        alignment=2
+    )
+    style_th = ParagraphStyle(
+        'FeeTh',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=7,
+        leading=8.5,
+        alignment=0
+    )
+    style_th_center = ParagraphStyle(
+        'FeeThCenter',
+        parent=style_th,
+        alignment=1
+    )
+    style_td = ParagraphStyle(
+        'FeeTd',
+        parent=styles['Normal'],
+        fontName=FONT_NORMAL,
+        fontSize=7.5,
+        leading=9.5
+    )
+    style_td_center = ParagraphStyle(
+        'FeeTdCenter',
+        parent=style_td,
+        alignment=1
+    )
+    style_td_right = ParagraphStyle(
+        'FeeTdRight',
+        parent=style_td,
+        alignment=2
+    )
+    style_table_title = ParagraphStyle(
+        'FeeTableTitle',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=9,
+        leading=11,
+        textColor=colors.HexColor('#1E1B4B')
+    )
+
+    story = []
+
+    # 1. PLATFORM OPERATOR & DEALER METADATA
+    p_name = getattr(partner, 'partner_name', None) or "MULTIKART CORP"
+    p_addr = getattr(partner, 'address', None) or "123 Fashion Street, Tech Park"
+    p_city = getattr(partner, 'city', None) or "Bangalore"
+    p_pin = getattr(partner, 'pincode', None) or "560025"
+    p_state = getattr(partner, 'state', None) or "KARNATAKA"
+    p_gst = getattr(partner, 'tax_id', None) or "GSTIN123456789"
+    p_phone = getattr(partner, 'support_phone', None) or "+91-1234567890"
+    p_email = getattr(partner, 'support_email', None) or "support@multikart.com"
+
+    d_name = getattr(dealer, 'business_name', '') or "DEALER"
+    d_addr = getattr(dealer, 'business_address', '') or ""
+    d_city = getattr(dealer, 'city', '') or ""
+    d_pin = getattr(dealer, 'pincode', '') or ""
+    
+    # State resolution
+    d_state = ""
+    if hasattr(dealer, 'state_rel') and dealer.state_rel:
+        d_state = getattr(dealer.state_rel, 'name', '') or ''
+    if not d_state:
+        d_state = getattr(dealer, 'state_name', '') or "KARNATAKA"
+    
+    d_gst = getattr(dealer, 'gst_number', '') or "UNREGISTERED"
+    d_pan = getattr(dealer, 'pan_number', '') or "NOT AVAILABLE"
+
+    order_num = getattr(order, 'order_number', '') or f"ORD-{getattr(order, 'id', '')}"
+    
+    def _fmt_dt(val):
+        if not val:
+            return datetime.now().strftime('%d.%m.%Y')
+        if hasattr(val, 'strftime'):
+            return val.strftime('%d.%m.%Y')
+        return str(val)[:10]
+
+    order_dt = _fmt_dt(getattr(order, 'created_at', None))
+    inv_num = f"ADM-INV-{order_num}"
+    inv_dt = datetime.now().strftime('%d.%m.%Y')
+
+    # Intra-state vs Inter-state
+    is_inter_state = False
+    if hasattr(order, 'is_inter_state') and order.is_inter_state is not None:
+        is_inter_state = bool(order.is_inter_state)
+    else:
+        is_inter_state = bool(d_state.strip().upper() != p_state.strip().upper())
+
+    # Header Bar
+    t_header = Table([
+        [
+            Paragraph(f"<b>{p_name.upper()}</b><br/><font size='7.5' color='#555'>{p_addr}, {p_city}, {p_state} - {p_pin}<br/>GSTIN: <b>{p_gst}</b> | Phone: {p_phone} | Email: {p_email}</font>", style_logo),
+            Paragraph(f"<b>TAX INVOICE</b><br/><font size='8' face='{FONT_NORMAL}' color='#444'>(Platform Commission & Logistics Fee)</font><br/><font size='7' color='#555'>Original for Recipient</font>", style_title_right)
+        ]
+    ], colWidths=[310, 237])
+    t_header.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'), ('BOTTOMPADDING', (0, 0), (-1, -1), 6)]))
+    story.append(t_header)
+    story.append(Spacer(1, 4))
+
+    # Meta Parties Block
+    dealer_box = (
+        f"<b>Billed To (Dealer / Recipient):</b><br/>"
+        f"<b>{d_name.upper()}</b><br/>"
+        f"{d_addr}<br/>"
+        f"{d_city} {d_pin} ({d_state})<br/>"
+        f"<b>GSTIN:</b> {d_gst} | <b>PAN:</b> {d_pan}"
+    )
+    inv_box = (
+        f"<b>Invoice Number:</b> {inv_num}<br/>"
+        f"<b>Invoice Date:</b> {inv_dt}<br/>"
+        f"<b>Order Reference:</b> #{order_num}<br/>"
+        f"<b>Order Date:</b> {order_dt}<br/>"
+        f"<b>Place of Supply:</b> {d_state} ({'INTER-STATE' if is_inter_state else 'INTRA-STATE'})"
+    )
+
+    t_meta = Table([[Paragraph(dealer_box, style_normal), Paragraph(inv_box, style_normal_right)]], colWidths=[270, 277])
+    t_meta.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F8FAFC')),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(t_meta)
+    story.append(Spacer(1, 8))
+
+    # Compute Fees from Items
+    # 1. Marketplace Fee
+    mp_basic = sum((getattr(it, 'marketplace_dealer_fee', 0.0) or 0.0) for it in items)
+    if mp_basic <= 0:
+        mp_basic = float(getattr(order, 'platform_fee_amount', 0.0) or 0.0)
+    if mp_basic <= 0:
+        mp_basic = 5.00  # standard baseline
+
+    mp_basic = round_curr(mp_basic)
+
+    # 2. Shipping Services Fee
+    is_partner_logistics = False
+    log_basic = 0.0
+    for it in items:
+        dt = (getattr(it, 'delivery_type', '') or '').strip().lower()
+        if getattr(it, 'logistics_partner_id', None) is not None or dt == 'logistics' or 'partner' in dt:
+            is_partner_logistics = True
+        log_basic += float(getattr(it, 'logistics_charge_amount', 0.0) or 0.0)
+
+    if log_basic <= 0 and is_partner_logistics:
+        log_basic = float(getattr(order, 'delivery_charge', 0.0) or 0.0)
+    if log_basic <= 0 and is_partner_logistics:
+        log_basic = 10.00  # standard baseline
+
+    log_basic = round_curr(log_basic)
+
+    # 11-column widths (sum = 547pt for A4)
+    # slno | Product ID | Description | Unit price | Qty | Discount | Net Amount | Tax Rate | GST type | Tax Amount | Total Amount
+    col_widths = [24, 52, 140, 44, 22, 36, 48, 40, 42, 45, 54]
+
+    def _make_table_header():
+        return [
+            Paragraph("slno", style_th_center),
+            Paragraph("Product ID", style_th_center),
+            Paragraph("Description", style_th),
+            Paragraph("Unit price", style_th_center),
+            Paragraph("Qty", style_th_center),
+            Paragraph("Discount", style_th_center),
+            Paragraph("Net Amount", style_th_center),
+            Paragraph("Tax Rate", style_th_center),
+            Paragraph("GST type", style_th_center),
+            Paragraph("Tax Amount", style_th_center),
+            Paragraph("Total Amount", style_th_center)
+        ]
+
+    # --- TABLE 1: MARKETPLACE FEES ---
+    story.append(Paragraph("<b>1. MARKETPLACE FEES</b>", style_table_title))
+    story.append(Spacer(1, 3))
+
+    t1_data = [_make_table_header()]
+
+    if is_inter_state:
+        # 18% IGST
+        mp_tax = round_curr(mp_basic * 0.18)
+        mp_total = round_curr(mp_basic + mp_tax)
+        t1_data.append([
+            Paragraph("1", style_td_center),
+            Paragraph(marketplace_sac, style_td_center),
+            Paragraph(f"Marketplace Fees SAC : {marketplace_sac}", style_td),
+            Paragraph(f"₹{mp_basic:.2f}", style_td_right),
+            Paragraph("1", style_td_center),
+            Paragraph("0", style_td_center),
+            Paragraph(f"₹{mp_basic:.2f}", style_td_right),
+            Paragraph("18%", style_td_center),
+            Paragraph("IGST", style_td_center),
+            Paragraph(f"₹{mp_tax:.2f}", style_td_right),
+            Paragraph(f"₹{mp_total:.2f}", style_td_right)
+        ])
+    else:
+        # 9% CGST + 9% SGST
+        mp_cgst = round_curr(mp_basic * 0.09)
+        mp_sgst = round_curr(mp_basic * 0.09)
+        mp_tax = round_curr(mp_cgst + mp_sgst)
+        mp_total = round_curr(mp_basic + mp_tax)
+
+        t1_data.append([
+            Paragraph("1", style_td_center),
+            Paragraph(marketplace_sac, style_td_center),
+            Paragraph(f"Marketplace Fees SAC : {marketplace_sac}", style_td),
+            Paragraph(f"₹{mp_basic:.2f}", style_td_right),
+            Paragraph("1", style_td_center),
+            Paragraph("0", style_td_center),
+            Paragraph(f"₹{mp_basic:.2f}", style_td_right),
+            Paragraph("9%", style_td_center),
+            Paragraph("Cgst", style_td_center),
+            Paragraph(f"₹{mp_cgst:.2f}", style_td_right),
+            Paragraph(f"₹{mp_total:.2f}", style_td_right)
+        ])
+        t1_data.append([
+            "", "", "", "", "", "", "",
+            Paragraph("9%", style_td_center),
+            Paragraph("Sgst", style_td_center),
+            Paragraph(f"₹{mp_sgst:.2f}", style_td_right),
+            ""
+        ])
+
+    # Table 1 Total Row
+    t1_data.append([
+        "", "",
+        Paragraph("<b>Total</b>", style_bold),
+        "", "", "", "", "", "",
+        Paragraph(f"<b>₹{mp_tax:.2f}</b>", style_bold_right),
+        Paragraph(f"<b>₹{mp_total:.2f}</b>", style_bold_right)
+    ])
+
+    t1 = Table(t1_data, colWidths=col_widths)
+    t1_style = [
+        ('BOX', (0, 0), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#EEF2FF')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('LINEABOVE', (0, -1), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
+        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#F8FAFC')),
+    ]
+    t1.setStyle(TableStyle(t1_style))
+    story.append(t1)
+    story.append(Spacer(1, 10))
+
+    # --- TABLE 2: SHIPPING SERVICES ---
+    story.append(Paragraph("<b>2. SHIPPING SERVICES</b>", style_table_title))
+    story.append(Spacer(1, 3))
+
+    t2_data = [_make_table_header()]
+
+    if log_basic > 0:
+        if is_inter_state:
+            log_tax = round_curr(log_basic * 0.18)
+            log_total = round_curr(log_basic + log_tax)
+            t2_data.append([
+                Paragraph("2", style_td_center),
+                Paragraph(logistics_sac, style_td_center),
+                Paragraph(f"Shipping services SAC : {logistics_sac}", style_td),
+                Paragraph(f"₹{log_basic:.2f}", style_td_right),
+                Paragraph("1", style_td_center),
+                Paragraph("0", style_td_center),
+                Paragraph(f"₹{log_basic:.2f}", style_td_right),
+                Paragraph("18%", style_td_center),
+                Paragraph("IGST", style_td_center),
+                Paragraph(f"₹{log_tax:.2f}", style_td_right),
+                Paragraph(f"₹{log_total:.2f}", style_td_right)
+            ])
+        else:
+            log_cgst = round_curr(log_basic * 0.09)
+            log_sgst = round_curr(log_basic * 0.09)
+            log_tax = round_curr(log_cgst + log_sgst)
+            log_total = round_curr(log_basic + log_tax)
+            t2_data.append([
+                Paragraph("2", style_td_center),
+                Paragraph(logistics_sac, style_td_center),
+                Paragraph(f"Shipping services SAC : {logistics_sac}", style_td),
+                Paragraph(f"₹{log_basic:.2f}", style_td_right),
+                Paragraph("1", style_td_center),
+                Paragraph("0", style_td_center),
+                Paragraph(f"₹{log_basic:.2f}", style_td_right),
+                Paragraph("9%", style_td_center),
+                Paragraph("Cgst", style_td_center),
+                Paragraph(f"₹{log_cgst:.2f}", style_td_right),
+                Paragraph(f"₹{log_total:.2f}", style_td_right)
+            ])
+            t2_data.append([
+                "", "", "", "", "", "", "",
+                Paragraph("9%", style_td_center),
+                Paragraph("Sgst", style_td_center),
+                Paragraph(f"₹{log_sgst:.2f}", style_td_right),
+                ""
+            ])
+
+        t2_data.append([
+            "", "",
+            Paragraph("<b>Total</b>", style_bold),
+            "", "", "", "", "", "",
+            Paragraph(f"<b>₹{log_tax:.2f}</b>", style_bold_right),
+            Paragraph(f"<b>₹{log_total:.2f}</b>", style_bold_right)
+        ])
+    else:
+        # Dealer self logistics - No shipping charges billed to dealer
+        log_tax = 0.0
+        log_total = 0.0
+        t2_data.append([
+            Paragraph("2", style_td_center),
+            Paragraph(logistics_sac, style_td_center),
+            Paragraph(f"Shipping services SAC : {logistics_sac} (Dealer Self Logistics)", style_td),
+            Paragraph("₹0.00", style_td_right),
+            Paragraph("1", style_td_center),
+            Paragraph("0", style_td_center),
+            Paragraph("₹0.00", style_td_right),
+            Paragraph("0%", style_td_center),
+            Paragraph("Exempt", style_td_center),
+            Paragraph("₹0.00", style_td_right),
+            Paragraph("₹0.00", style_td_right)
+        ])
+        t2_data.append([
+            "", "",
+            Paragraph("<b>Total</b>", style_bold),
+            "", "", "", "", "", "",
+            Paragraph("<b>₹0.00</b>", style_bold_right),
+            Paragraph("<b>₹0.00</b>", style_bold_right)
+        ])
+
+    t2 = Table(t2_data, colWidths=col_widths)
+    t2.setStyle(TableStyle(t1_style))
+    story.append(t2)
+    story.append(Spacer(1, 10))
+
+    # --- GRAND SUMMARY CARD ---
+    grand_net = round_curr(mp_basic + log_basic)
+    grand_tax = round_curr(mp_tax + log_tax)
+    grand_total = round_curr(mp_total + log_total)
+
+    words = ""
+    try:
+        words = num2words(grand_total, lang='en_IN').title() + " Rupees Only"
+    except Exception:
+        words = f"Rupees {grand_total:.2f} Only"
+
+    summary_rows = [
+        [
+            Paragraph(f"<b>Total Taxable Value (Net Amount):</b> ₹{grand_net:.2f}<br/>"
+                      f"<b>Total Tax Amount (GST):</b> ₹{grand_tax:.2f}<br/>"
+                      f"<font size='9' color='#1E1B4B'><b>INVOICE TOTAL: ₹{grand_total:.2f}</b></font><br/>"
+                      f"<font size='7' color='#555'>Amount in Words: {words}</font><br/>"
+                      f"<font size='7' color='#666'>Whether tax is payable on Reverse Charge basis: <b>NO</b></font>", style_normal),
+            Paragraph(f"<br/><br/><br/><b>For {p_name.upper()}</b><br/><font size='7' color='#555'>Authorized Signatory</font>", style_normal_right)
+        ]
+    ]
+    t_summary = Table(summary_rows, colWidths=[360, 187])
+    t_summary.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#1E1B4B')),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F8FAFC')),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(t_summary)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
