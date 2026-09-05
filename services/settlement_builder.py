@@ -61,6 +61,7 @@ async def build_and_persist_settlement(
         fy_end_date=fy_end,
         period_start=period_start,
         period_end=period_end,
+        settlement_date=settlement_date,
         gross_sale_amount=float(money_2dp(calc.gross_sale_total)),
         total_marketplace_fee=float(money_2dp(calc.marketplace_fee_total)),
         total_marketing_fee=float(money_2dp(calc.marketing_fee_total)),

@@ -81,7 +81,7 @@ async def calculate_settlement(
       net = gross_sale - marketplace_fee - marketing_fee
             + shipping_received (self-logistics) - logistics_charge (partner)
             - tds
-    TDS base = gross_sale (fees are NOT deducted before TDS).
+    TDS base = gross_sale + shipping_received (self-logistics reimbursement added to TDS base).
     """
     config = await get_active_tds_config_required(db, dealer.organization_type)
     has_pan = bool(getattr(dealer, "pan_number", None))
@@ -89,17 +89,18 @@ async def calculate_settlement(
     cumulative_before = money(fy_summary.cumulative_gross_sale) if fy_summary else Decimal("0")
 
     lines: List[SettlementLineResult] = []
-    gross_sales: List[Decimal] = []
+    tds_bases: List[Decimal] = []
 
     # Pass 1: compute gross sales + fees (fee resolution has no cross-line dependency)
     for item, order, product, _ in eligible_items:
         gross_sale = compute_gross_sale(item, order)
         fees = await compute_item_fees(db, item, order, gross_sale)
-        gross_sales.append(gross_sale)
+        line_tds_base = gross_sale + fees["shipping_received"]
+        tds_bases.append(line_tds_base)
         lines.append((item, order, gross_sale, fees))
 
     # Pass 2: resolve TDS across all lines (cumulative exemption consumption)
-    tds_batch = resolve_tds_batch(config, has_pan, cumulative_before, gross_sales)
+    tds_batch = resolve_tds_batch(config, has_pan, cumulative_before, tds_bases)
 
     # Pass 3: build results
     result_lines: List[SettlementLineResult] = []

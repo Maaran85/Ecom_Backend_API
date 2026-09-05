@@ -49,6 +49,7 @@ class DealerAdminCreate(BaseModel):
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
+    signature_image_url: Optional[str] = None
     is_auction_enabled: bool = False
 
 class DealerAdminUpdate(BaseModel):
@@ -80,6 +81,7 @@ class DealerAdminUpdate(BaseModel):
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
+    signature_image_url: Optional[str] = None
     is_auction_enabled: Optional[bool] = None
     platform_fee_amount: Optional[float] = None
 
@@ -896,6 +898,7 @@ async def create_dealer(
             cin_number=dealer_in.cin_number,
             cin_certificate_url=dealer_in.cin_certificate_url,
             company_logo_url=dealer_in.company_logo_url,
+            signature_image_url=dealer_in.signature_image_url,
             is_auction_enabled=dealer_in.is_auction_enabled,
             access_status='active', is_approved=True, profile_status='complete', is_active=True
         )

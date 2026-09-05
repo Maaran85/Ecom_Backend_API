@@ -65,42 +65,22 @@ class DealerProfileComplete(BaseModel):
     gst_certificate_url: Optional[str] = None
     incorporation_certificate_url: Optional[str] = None
     gst_number: Optional[str] = None
-    pan_number: str
+    pan_number: Optional[str] = None
     pan_photo_url: Optional[str] = None
     cin_number: Optional[str] = None
     cin_certificate_url: Optional[str] = None
     company_logo_url: Optional[str] = None
+    signature_image_url: Optional[str] = None
     aadhaar_number: Optional[str] = None
     aadhaar_photo_url: Optional[str] = None
     
     # Bank Details
-    bank_name: str
-    bank_address: str
-    bank_branch: str
-    ifsc_code: str
-    account_holder_name: str
-    account_number: str
-
-    @field_validator('aadhaar_number', mode='before')
-    @classmethod
-    def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:
-        if v and len(str(v)) >= 12:
-            return f"********{str(v)[-4:]}"
-        return v
-        
-    @field_validator('pan_number', mode='before')
-    @classmethod
-    def mask_pan(cls, v: Optional[str]) -> Optional[str]:
-        if v and len(str(v)) >= 10:
-            return f"******{str(v)[-4:]}"
-        return v
-
-    @field_validator('account_number', mode='before')
-    @classmethod
-    def mask_account(cls, v: Optional[str]) -> Optional[str]:
-        if v and len(str(v)) >= 4:
-            return f"******{str(v)[-4:]}"
-        return v
+    bank_name: Optional[str] = None
+    bank_address: Optional[str] = None
+    bank_branch: Optional[str] = None
+    ifsc_code: Optional[str] = None
+    account_holder_name: Optional[str] = None
+    account_number: Optional[str] = None
 
 class DealerUpdate(BaseModel):
     business_name: Optional[str] = None

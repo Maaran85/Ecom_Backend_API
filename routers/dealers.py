@@ -1273,6 +1273,131 @@ async def get_dealer_logistics_partners(
     return result.scalars().all()
 
 
+@router.get("/me/logistics-partners")
+async def get_my_available_logistics_partners(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List all active logistics partners available for selection by the authenticated dealer."""
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer profile not found")
+
+    query = select(LogisticsPartner).where(LogisticsPartner.is_active == True).order_by(LogisticsPartner.name)
+    result = await db.execute(query)
+    partners = result.scalars().all()
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "contact_person": p.contact_person,
+            "is_active": p.is_active
+        }
+        for p in partners
+    ]
+
+
+@router.get("/me/logistics")
+async def get_my_mapped_logistics_partners(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List logistics partners currently mapped to the authenticated dealer."""
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer profile not found")
+
+    res = await db.execute(
+        select(Dealer)
+        .where(Dealer.is_deleted == False)
+        .options(selectinload(Dealer.logistics_partners))
+        .where(Dealer.id == dealer.id)
+    )
+    d = res.scalar_one_or_none()
+    if not d:
+        return []
+
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "contact_person": p.contact_person,
+            "is_active": p.is_active
+        }
+        for p in d.logistics_partners
+    ]
+
+
+@router.post("/me/logistics/{partner_id}")
+async def map_logistics_to_my_dealer(
+    partner_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Map a logistics partner to the authenticated dealer."""
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer profile not found")
+
+    res_d = await db.execute(
+        select(Dealer)
+        .where(Dealer.is_deleted == False)
+        .options(selectinload(Dealer.logistics_partners))
+        .where(Dealer.id == dealer.id)
+    )
+    d = res_d.scalar_one_or_none()
+    if not d:
+        raise HTTPException(status_code=404, detail="Dealer not found")
+
+    res_p = await db.execute(
+        select(LogisticsPartner).where(LogisticsPartner.id == partner_id)
+    )
+    partner = res_p.scalar_one_or_none()
+    if not partner:
+        raise HTTPException(status_code=404, detail="Logistics partner not found")
+
+    if partner not in d.logistics_partners:
+        d.logistics_partners.append(partner)
+        await db.commit()
+
+    return {"detail": "Logistics partner mapped successfully"}
+
+
+@router.delete("/me/logistics/{partner_id}")
+async def unmap_logistics_from_my_dealer(
+    partner_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Unmap a logistics partner from the authenticated dealer."""
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer profile not found")
+
+    res_d = await db.execute(
+        select(Dealer)
+        .where(Dealer.is_deleted == False)
+        .options(selectinload(Dealer.logistics_partners))
+        .where(Dealer.id == dealer.id)
+    )
+    d = res_d.scalar_one_or_none()
+    if not d:
+        raise HTTPException(status_code=404, detail="Dealer not found")
+
+    res_p = await db.execute(
+        select(LogisticsPartner).where(LogisticsPartner.id == partner_id)
+    )
+    partner = res_p.scalar_one_or_none()
+    if not partner:
+        raise HTTPException(status_code=404, detail="Logistics partner not found")
+
+    if partner in d.logistics_partners:
+        d.logistics_partners.remove(partner)
+        await db.commit()
+
+    return {"detail": "Logistics partner unmapped successfully"}
+
+
 class AssignRiderPayload(BaseModel):
     rider_id: int
 
@@ -2306,18 +2431,47 @@ async def complete_dealer_profile(
             current_user.full_name = owner_name
             db.add(current_user)
             
+    # Foreign Key Validation
+    from models.location import Country, State
+    if "country_id" in data_dict and data_dict["country_id"] is not None:
+        c_res = await db.execute(select(Country).where(Country.id == data_dict["country_id"]))
+        if not c_res.scalar_one_or_none():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid country_id: country does not exist")
+
+    if "state_id" in data_dict and data_dict["state_id"] is not None:
+        st_res = await db.execute(select(State).where(State.id == data_dict["state_id"]))
+        state_obj = st_res.scalar_one_or_none()
+        if not state_obj:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state_id: state does not exist")
+        
+        target_country_id = data_dict.get("country_id") if "country_id" in data_dict else dealer.country_id
+        if target_country_id is not None and state_obj.country_id != target_country_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state_id: state does not belong to selected country")
+
     # Apply all fields from DealerProfileComplete
     for key, value in data_dict.items():
+        # Safeguard: Never overwrite DB with masked values containing '*'
+        if value is not None and isinstance(value, str) and '*' in value:
+            continue
         if hasattr(dealer, key):
             setattr(dealer, key, value)
         
-    # Mark profile as completed! 
-    # Access status remains whatever it was (usually pending admin approval)
-    dealer.profile_status = "pending"
-    dealer.access_status = "pending"
+    # Status handling: Preserve approval status for approved dealers
+    if not dealer.is_approved:
+        dealer.profile_status = "pending"
+        dealer.access_status = "pending"
     
+    dealer_id = dealer.id
+
     await db.commit()
-    await db.refresh(dealer)
+    
+    # Eagerly reload dealer with relationships to prevent MissingGreenlet during FastAPI response serialization
+    res = await db.execute(
+        select(Dealer)
+        .options(selectinload(Dealer.state_rel), selectinload(Dealer.country))
+        .where(Dealer.id == dealer_id)
+    )
+    dealer = res.scalar_one_or_none()
     return dealer
 
 

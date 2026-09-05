@@ -28,6 +28,7 @@ class Settlement(Base):
     # Period covered by this settlement
     period_start = Column(Date, nullable=False)
     period_end = Column(Date, nullable=False)
+    settlement_date = Column(Date, nullable=True, index=True)
 
     # --- Totals (rounded to paise) ---
     gross_sale_amount = Column(Float, default=0.0, nullable=False)
@@ -122,12 +123,38 @@ class SettlementItem(Base):
 
     delivery_type = Column(String, nullable=True)  # own_rider, courier, logistics (snapshot)
 
+    is_cancelled = Column(Boolean, default=False, nullable=False, index=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
     settlement = relationship("Settlement", back_populates="items")
     order_item = relationship("OrderItem")
     order = relationship("Order")
+
+    @property
+    def delivery_date(self):
+        if self.order_item and self.order_item.delivered_at:
+            if hasattr(self.order_item.delivered_at, 'date'):
+                return self.order_item.delivered_at.date()
+            return self.order_item.delivered_at
+        if self.order and hasattr(self.order, 'delivered_at') and self.order.delivered_at:
+            if hasattr(self.order.delivered_at, 'date'):
+                return self.order.delivered_at.date()
+            return self.order.delivered_at
+        return self.order_date
+
+    @property
+    def product_id(self):
+        if self.order_item and self.order_item.product_id:
+            return str(self.order_item.product_id)
+        return str(self.order_item_id) if self.order_item_id else None
+
+    @property
+    def product_name(self):
+        if self.order_item and self.order_item.product:
+            return getattr(self.order_item.product, 'name', None) or getattr(self.order_item.product, 'title', None)
+        return "Product Item"
 
     def __repr__(self) -> str:
         return f"<SettlementItem settlement={self.settlement_id} order_item={self.order_item_id} net={self.net_payable}>"

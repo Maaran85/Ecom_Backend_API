@@ -20,8 +20,11 @@ DOC_TYPE_MAPPING = {
     "aadhaar_photo": "aadhaar_photo_url",
     "company_photo": "company_photo_url",
     "cin_certificate": "cin_certificate_url",
-    "company_logo": "company_logo_url"
+    "company_logo": "company_logo_url",
+    "signature_image": "signature_image_url",
+    "signature": "signature_image_url",
 }
+
 
 @router.post("/{dealer_id}/documents/{doc_type}")
 async def upload_dealer_document(
@@ -29,13 +32,13 @@ async def upload_dealer_document(
     doc_type: str,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Specialized API for uploading dealer documents"""
     print(f"DEBUG: upload_dealer_document hit for dealer={dealer_id}, doc_type={doc_type}, file={file.filename}")
     if doc_type not in DOC_TYPE_MAPPING:
         raise HTTPException(status_code=400, detail=f"Invalid document type. Allowed: {list(DOC_TYPE_MAPPING.keys())}")
-        
+
     res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer:
@@ -44,11 +47,11 @@ async def upload_dealer_document(
     if current_user.role not in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
         if current_user.role != UserRole.DEALER or dealer.user_id != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to modify this dealer's documents")
-        
+
     try:
         print(f"DEBUG: Processing upload for {doc_type}...")
         folder = f"dealer_docs/{doc_type}"
-        optimize = doc_type in ["company_photo", "company_logo"] 
+        optimize = doc_type in ["company_photo", "company_logo", "signature_image", "signature"] 
         
         try:
             file_path = await FileUploadService.upload_image(file, folder, optimize=optimize)

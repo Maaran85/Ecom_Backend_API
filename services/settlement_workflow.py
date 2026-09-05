@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Dealer, User, OrderItem, Order, Product, DealerRemittance
-from models.settlement import Settlement, SettlementAdjustment
+from models.settlement import Settlement, SettlementAdjustment, SettlementItem
 from models.pending_settlement_adjustment import PendingSettlementAdjustment
 from core.enums import SettlementStatus, AdjustmentType
 from core.money import money, money_2dp
@@ -327,6 +327,30 @@ async def cancel_settlement(
     settlement.cancelled_at = datetime.now(timezone.utc)
     settlement.cancelled_by = admin.id
     settlement.cancel_reason = reason
+    
+    # Mark all items as is_cancelled = True to release unique constraints,
+    # EXCEPT if that order_item_id is already permanently settled in a PAID settlement
+    if settlement.items:
+        item_ids = [item.order_item_id for item in settlement.items if item.order_item_id is not None]
+        paid_item_ids = set()
+        if item_ids:
+            paid_res = await db.execute(
+                select(SettlementItem.order_item_id)
+                .join(Settlement, Settlement.id == SettlementItem.settlement_id)
+                .where(
+                    SettlementItem.order_item_id.in_(item_ids),
+                    Settlement.status == SettlementStatus.PAID
+                )
+            )
+            paid_item_ids = {r[0] for r in paid_res.all()}
+
+        for item in settlement.items:
+            if item.order_item_id not in paid_item_ids:
+                item.is_cancelled = True
+            else:
+                # Keep is_cancelled = False to lock it as claimed/paid
+                item.is_cancelled = False
+            
     return settlement
 
 

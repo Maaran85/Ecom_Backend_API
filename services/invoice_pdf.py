@@ -69,7 +69,35 @@ def calc_gst_pct(basic_amt: float, rate_pct: float) -> float:
     d_rate = Decimal(str(rate_pct)) / Decimal('100')
     return float((d_basic * d_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
-def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, shipping_address, marketplace_sac="998314", logistics_sac="996812"):
+def _resolve_image_local_path(url_or_path) -> getattr:
+    if not url_or_path:
+        return None
+
+    str_path = str(url_or_path).strip()
+    if os.path.exists(str_path) and os.path.isfile(str_path):
+        return str_path
+
+    cleaned = str_path
+    if "/uploads/" in cleaned:
+        cleaned = cleaned.split("/uploads/", 1)[1]
+    elif cleaned.startswith("/"):
+        cleaned = cleaned.lstrip("/")
+
+    candidates = [
+        cleaned,
+        os.path.join("uploads", cleaned),
+        os.path.join(os.getcwd(), cleaned),
+        os.path.join(os.getcwd(), "uploads", cleaned),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate) and os.path.isfile(candidate):
+            return candidate
+
+    return None
+
+
+def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, shipping_address, marketplace_sac="998314", marketing_sac="998314", logistics_sac="996812"):
     """
     Generates Customer Invoice PDF following exact multi-section format (STANDARDIZED GST-EXCLUSIVE ROUNDING MODEL):
     
@@ -537,18 +565,85 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
     ]))
     story.append(t_ship)
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 10))
 
-    grand_net = round_curr(total_prod_net + mkt_net_amt + ship_net_amt)
-    grand_tax = round_curr(total_prod_tax + mkt_tax_amt + ship_tax_amt)
-    grand_total = round_curr(total_prod_gross + mkt_total_amt + ship_total_amt)
+    # SECTION 4: MARKETING SERVICES (rendered when marketing_customer_charge > 0)
+    mktg_cust_charge = sum(getattr(item, 'marketing_customer_charge', 0.0) or 0.0 for item in order_items) if order_items else 0.0
+    mktg_net_amt = round_curr(mktg_cust_charge)
+    mktg_tax_amt = 0.0
+    mktg_total_amt = 0.0
 
-    summary_left_html = (
-        f"<b>GST-Exclusive Component Summary Breakdown:</b><br/>"
-        f"• Product Total: ₹{total_prod_gross:.2f} (Basic: ₹{total_prod_net:.2f} + GST: ₹{total_prod_tax:.2f})<br/>"
-        f"• Marketplace Fees: ₹{mkt_total_amt:.2f} (Basic: ₹{mkt_net_amt:.2f} + GST: ₹{mkt_tax_amt:.2f})<br/>"
-        f"• Shipping Services: ₹{ship_total_amt:.2f} (Basic: ₹{ship_net_amt:.2f} + GST: ₹{ship_tax_amt:.2f})"
-    )
+    if mktg_net_amt > 0:
+        story.append(Paragraph("<b>4. MARKETING SERVICES</b>", style_section_title))
+        story.append(Spacer(1, 4))
+        mktg_table_data = [make_table_header()]
+        mktg_sac_code = marketing_sac or "998314"
+        mktg_desc_html = f"<b>Marketing Platform Services</b><br/><font color='#333333'><b>SAC:</b> {mktg_sac_code}</font>"
+
+        if is_inter_state_order:
+            mktg_igst_amt = calc_gst_pct(mktg_net_amt, 18.0)
+            mktg_tax_amt = mktg_igst_amt
+            mktg_rate_html = "18%"
+            mktg_type_html = "IGST"
+            mktg_tax_amt_html = f"₹{mktg_igst_amt:.2f}"
+        else:
+            mktg_cgst_amt = calc_gst_pct(mktg_net_amt, 9.0)
+            mktg_sgst_amt = calc_gst_pct(mktg_net_amt, 9.0)
+            mktg_tax_amt = round_curr(mktg_cgst_amt + mktg_sgst_amt)
+            mktg_rate_html = "9%<br/>9%"
+            mktg_type_html = "CGST<br/>SGST"
+            mktg_tax_amt_html = f"₹{mktg_cgst_amt:.2f}<br/>₹{mktg_sgst_amt:.2f}"
+
+        mktg_total_amt = round_curr(mktg_net_amt + mktg_tax_amt)
+        mktg_table_data.append([
+            Paragraph("1", style_td_center),
+            Paragraph(mktg_sac_code, style_td_center),
+            Paragraph(mktg_desc_html, style_td),
+            Paragraph(f"₹{mktg_net_amt:.2f}", style_td_right),
+            Paragraph("1", style_td_center),
+            Paragraph("₹0.00", style_td_right),
+            Paragraph(f"₹{mktg_net_amt:.2f}", style_td_right),
+            Paragraph(mktg_rate_html, style_td_center),
+            Paragraph(mktg_type_html, style_td_center),
+            Paragraph(mktg_tax_amt_html, style_td_right),
+            Paragraph(f"₹{mktg_total_amt:.2f}", style_td_right)
+        ])
+        mktg_table_data.append([
+            Paragraph("<b>MARKETING SERVICES TOTAL:</b>", style_bold),
+            "", "", "", "", "",
+            Paragraph(f"<b>₹{mktg_net_amt:.2f}</b>", style_bold_right),
+            "", "",
+            Paragraph(f"<b>₹{mktg_tax_amt:.2f}</b>", style_bold_right),
+            Paragraph(f"<b>₹{mktg_total_amt:.2f}</b>", style_bold_right)
+        ])
+
+        t_mktg = Table(mktg_table_data, colWidths=col_widths, repeatRows=1)
+        t_mktg.setStyle(TableStyle([
+            ('BOX', (0, 0), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
+            ('INNERGRID', (0, 0), (-1, -2), 0.5, colors.HexColor('#E2E8F0')),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F5F3FF')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('SPAN', (0, -1), (5, -1)),
+            ('LINEABOVE', (0, -1), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(t_mktg)
+        story.append(Spacer(1, 10))
+
+    grand_net = round_curr(total_prod_net + mkt_net_amt + ship_net_amt + mktg_net_amt)
+    grand_tax = round_curr(total_prod_tax + mkt_tax_amt + ship_tax_amt + mktg_tax_amt)
+    grand_total = round_curr(total_prod_gross + mkt_total_amt + ship_total_amt + mktg_total_amt)
+
+    summary_bullets = [
+        f"• Product Total: ₹{total_prod_gross:.2f} (Basic: ₹{total_prod_net:.2f} + GST: ₹{total_prod_tax:.2f})",
+        f"• Marketplace Fees: ₹{mkt_total_amt:.2f} (Basic: ₹{mkt_net_amt:.2f} + GST: ₹{mkt_tax_amt:.2f})",
+        f"• Shipping Services: ₹{ship_total_amt:.2f} (Basic: ₹{ship_net_amt:.2f} + GST: ₹{ship_tax_amt:.2f})",
+    ]
+    if mktg_total_amt > 0:
+        summary_bullets.append(f"• Marketing Services: ₹{mktg_total_amt:.2f} (Basic: ₹{mktg_net_amt:.2f} + GST: ₹{mktg_tax_amt:.2f})")
+
+    summary_left_html = "<b>GST-Exclusive Component Summary Breakdown:</b><br/>" + "<br/>".join(summary_bullets)
 
     summary_right_html = (
         f"<b>Total Basic Amount:</b> ₹{grand_net:.2f}<br/>"
@@ -580,13 +675,14 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         amt_words = f"Rupees {grand_total:.2f} only"
 
     sig_url = getattr(dealer, 'signature_image_url', None) if dealer else None
+    local_sig_path = _resolve_image_local_path(sig_url)
     sig_cell_elements = [
         Paragraph(f"<b>For {str(dealer_name).upper()}:</b>", style_bold_right),
         Spacer(1, 10)
     ]
-    if sig_url and os.path.exists(sig_url):
+    if local_sig_path:
         try:
-            sig_cell_elements.append(Image(sig_url, width=1.2*inch, height=0.4*inch))
+            sig_cell_elements.append(Image(local_sig_path, width=1.2*inch, height=0.4*inch))
         except Exception:
             sig_cell_elements.append(Spacer(1, 10))
     else:

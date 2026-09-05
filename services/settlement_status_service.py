@@ -10,7 +10,7 @@ class InvalidTransitionError(Exception):
 ALLOWED_TRANSITIONS: dict[SettlementStatus, Set[SettlementStatus]] = {
     SettlementStatus.DRAFT: {SettlementStatus.GENERATED, SettlementStatus.CANCELLED},
     SettlementStatus.GENERATED: {SettlementStatus.APPROVED, SettlementStatus.CANCELLED},
-    SettlementStatus.APPROVED: {SettlementStatus.PAID},
+    SettlementStatus.APPROVED: {SettlementStatus.PAID, SettlementStatus.CANCELLED},
     SettlementStatus.PAID: set(),        # terminal
     SettlementStatus.CANCELLED: set(),   # terminal
 }

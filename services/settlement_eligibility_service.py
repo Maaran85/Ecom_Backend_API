@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
 
@@ -6,12 +6,13 @@ from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from models import OrderItem, Order, Product, Dealer, OrderReturn
+from models import OrderItem, Order, Product, Dealer, OrderReturn, DealerRemittance
 from models.cart import OrderStatus
 from models.order_return import ReturnStatus
 from models.settlement import Settlement, SettlementItem
 from core.enums import SettlementStatus
 from services.configuration_service import get_settlement_configuration
+from services.financial_year_service import IST_TZ
 
 # Return statuses that make an item unavailable for settlement.
 # REJECTED / PICKUP_FAILED mean no return actually happened.
@@ -25,13 +26,31 @@ RETURN_INELIGIBLE_STATUSES = [
 
 
 async def _claimed_item_ids_query():
-    """Order items already attached to a non-cancelled settlement."""
+    """Order items already attached to an active, non-cancelled settlement."""
     return (
         select(SettlementItem.order_item_id)
         .join(Settlement, Settlement.id == SettlementItem.settlement_id)
         .where(
             SettlementItem.order_item_id.isnot(None),
+            SettlementItem.is_cancelled == False,
             Settlement.status != SettlementStatus.CANCELLED,
+        )
+    )
+
+
+async def _permanently_settled_item_ids_query():
+    """Order items attached to a PAID settlement or completed remittance (defense-in-depth)."""
+    return (
+        select(SettlementItem.order_item_id)
+        .join(Settlement, Settlement.id == SettlementItem.settlement_id)
+        .outerjoin(DealerRemittance, DealerRemittance.id == Settlement.remittance_id)
+        .where(
+            SettlementItem.order_item_id.isnot(None),
+            or_(
+                Settlement.status == SettlementStatus.PAID,
+                DealerRemittance.status == "completed",
+                Settlement.paid_at.isnot(None),
+            ),
         )
     )
 
@@ -48,17 +67,16 @@ async def get_eligible_order_items(
 
       - order delivered and return window (settlement_configurations.return_window_days) has matured
       - item not returned / not part of an active return
-      - item not already claimed by a non-cancelled settlement
+      - item not already claimed by a non-cancelled settlement or paid settlement
     """
     as_of = as_of or datetime.now(timezone.utc)
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
 
     config = await get_settlement_configuration(db)
-    window = config.return_window_days
-    matured_before = as_of - timedelta(days=window)
 
     claimed = await _claimed_item_ids_query()
+    permanently_settled = await _permanently_settled_item_ids_query()
 
     # Items with a live return (not rejected/pickup-failed)
     returned_item_ids = (
@@ -79,6 +97,7 @@ async def get_eligible_order_items(
             Order.delivered_at.isnot(None),
             OrderItem.status == OrderStatus.DELIVERED.value,
             OrderItem.id.not_in(claimed),
+            OrderItem.id.not_in(permanently_settled),
             OrderItem.id.not_in(returned_item_ids),
         )
     )

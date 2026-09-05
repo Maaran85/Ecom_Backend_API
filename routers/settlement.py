@@ -1,6 +1,7 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import List, Optional
 from uuid import UUID
+from services.financial_year_service import IST_TZ
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, and_
@@ -12,8 +13,8 @@ from core.permissions import (
     require_admin, require_dealer_or_admin, get_current_active_user,
 )
 from core.enums import SettlementStatus, AdjustmentType
-from models import User, Dealer
-from models.settlement import Settlement
+from models import User, Dealer, OrderItem
+from models.settlement import Settlement, SettlementItem
 from schemas.settlement import (
     GenerateSettlementRequest, SettlementPreviewOut,
     SettlementOut, SettlementSummaryOut,
@@ -37,7 +38,11 @@ router = APIRouter()
 async def _load_settlement(db: AsyncSession, settlement_id: int) -> Settlement:
     result = await db.execute(
         select(Settlement)
-        .options(selectinload(Settlement.items), selectinload(Settlement.adjustments))
+        .options(
+            selectinload(Settlement.items).selectinload(SettlementItem.order_item).selectinload(OrderItem.product),
+            selectinload(Settlement.items).selectinload(SettlementItem.order),
+            selectinload(Settlement.adjustments),
+        )
         .where(Settlement.id == settlement_id)
     )
     return result.scalar_one_or_none()
@@ -55,7 +60,10 @@ async def _dealer_ids_with_eligible_items(db: AsyncSession, as_of: Optional[date
 # Admin: generate / list / detail / approve / pay / cancel
 # ---------------------------------------------------------------------------
 
-@router.post("/admin/settlements/generate")
+@router.post(
+    "/admin/settlements/generate",
+    response_model=None,  # handled manually: dry_run → dict, real → List[SettlementSummaryOut]
+)
 async def generate_settlements(
     req: GenerateSettlementRequest,
     db: AsyncSession = Depends(get_db),
@@ -66,8 +74,12 @@ async def generate_settlements(
     those delivered whose return window has matured and which aren't already
     settled. dry_run=true returns a preview without persisting anything.
     """
-    settlement_date = req.period_end or date.today()
-    as_of = datetime.now(timezone.utc) if req.period_end is None or req.period_end == date.today() else datetime.combine(settlement_date, datetime.max.time(), timezone.utc)
+    current_ist = datetime.now(timezone.utc).astimezone(IST_TZ)
+    settlement_date = req.period_end or (current_ist.date() - timedelta(days=1))
+
+    naive_eod = datetime.combine(settlement_date, datetime.max.time())
+    localized_eod = naive_eod.replace(tzinfo=IST_TZ)
+    as_of = localized_eod.astimezone(timezone.utc)
 
     dealer_ids: List[UUID]
     if req.dealer_id:
@@ -76,17 +88,34 @@ async def generate_settlements(
         dealer_ids = await _dealer_ids_with_eligible_items(db, as_of=as_of)
 
     if not dealer_ids:
+        # dry_run with zero eligible items is a normal / expected state (all items are
+        # already settled, in-progress, or returned).  Return 200 with an empty preview
+        # list so the frontend can display a friendly "nothing to settle" message.
+        # For actual generation (dry_run=false) we still raise 400 to prevent an
+        # accidental no-op confirmation.
+        if req.dry_run:
+            return {"dry_run": True, "previews": []}
         raise HTTPException(status_code=400, detail="No eligible order items found")
 
     results = []
+    generated_settlements: List[Settlement] = []  # collect ORM objects for real generation
+    dealer_map: dict = {}  # dealer_id → Dealer, reused for response building
+
     for dealer_id in dealer_ids:
         dealer = await db.get(Dealer, dealer_id)
         if not dealer:
             continue
+        dealer_map[dealer_id] = dealer
+
         eligible = await get_eligible_order_items(
             db, dealer_id=dealer_id, as_of=as_of, for_update=not req.dry_run
         )
         if not eligible:
+            if req.dealer_id and not req.dry_run:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No eligible order items found for dealer {dealer_id}."
+                )
             continue
 
         if req.dry_run:
@@ -108,13 +137,43 @@ async def generate_settlements(
             new_values={"dealer_id": str(dealer.id), "net_payable": settlement.net_payable},
         )
         await db.flush()
-        results.append(settlement)
+        generated_settlements.append((settlement, dealer))
 
     await db.commit()
 
     if req.dry_run:
-        return {"dry_run": True, "previews": results}
-    return results
+        return {"dry_run": True, "previews": [r.model_dump() for r in results]}
+
+    # Build SettlementSummaryOut for each generated settlement.
+    # Refresh each settlement after commit so item counts reflect persisted rows.
+    summary_results = []
+    for settlement, dealer in generated_settlements:
+        await db.refresh(settlement)
+        # Load items count via fresh query (settlement.items may be unloaded after flush/commit)
+        items_res = await db.execute(
+            select(SettlementItem).where(SettlementItem.settlement_id == settlement.id)
+        )
+        items = items_res.scalars().all()
+        summary_results.append(SettlementSummaryOut(
+            id=settlement.id,
+            settlement_number=settlement.settlement_number,
+            dealer_id=settlement.dealer_id,
+            dealer_name=dealer.business_name,
+            status=settlement.status,
+            financial_year=settlement.financial_year,
+            period_start=settlement.period_start,
+            period_end=settlement.period_end,
+            gross_sale_amount=settlement.gross_sale_amount,
+            total_tds=settlement.total_tds,
+            net_payable=settlement.net_payable,
+            item_count=len(items),
+            generated_at=settlement.generated_at,
+            paid_at=settlement.paid_at,
+            created_at=settlement.created_at,
+        ))
+
+    return [s.model_dump() for s in summary_results]
+
 
 
 @router.get("/admin/settlements", response_model=List[SettlementSummaryOut])

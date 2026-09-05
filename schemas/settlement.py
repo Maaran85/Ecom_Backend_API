@@ -15,6 +15,9 @@ class SettlementItemOut(BaseModel):
     order_number: Optional[str]
     order_date: Optional[date]
     settlement_date: date
+    delivery_date: Optional[date] = None
+    product_id: Optional[str] = None
+    product_name: Optional[str] = None
     item_price: float
     quantity: int
     gross_sale_amount: float

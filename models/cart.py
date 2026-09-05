@@ -140,6 +140,7 @@ class OrderItem(Base):
     marketplace_customer_charge = Column(Float, default=0.0)
     marketplace_dealer_fee      = Column(Float, default=0.0)
     marketing_fee_amount         = Column(Float, default=0.0)
+    marketing_customer_charge   = Column(Float, default=0.0)
     logistics_charge_amount      = Column(Float, default=0.0)
     logistics_customer_charge   = Column(Float, default=0.0)
     

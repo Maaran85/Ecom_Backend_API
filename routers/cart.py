@@ -640,6 +640,7 @@ async def create_order(
         snap_mp_cust = round(float(gross_sale_val * Decimal(str(mp_slab.customer_percentage))), 2) if (mp_slab and mp_slab.customer_percentage) else 0.0
         snap_mp_dealer = round(float(gross_sale_val * Decimal(str(mp_slab.dealer_percentage))), 2) if mp_slab else 0.0
         snap_mkt = round(float(gross_sale_val * Decimal(str(mkt_slab.dealer_percentage))), 2) if mkt_slab else 0.0
+        snap_mkt_cust = round(float(gross_sale_val * Decimal(str(mkt_slab.customer_percentage))), 2) if (mkt_slab and mkt_slab.customer_percentage) else 0.0
         snap_log_dealer = round(float(gross_sale_val * Decimal(str(log_slab.dealer_percentage))), 2) if log_slab else 0.0
         snap_log_cust = round(float(gross_sale_val * Decimal(str(log_slab.customer_percentage))), 2) if (log_slab and log_slab.customer_percentage) else item_delivery
 
@@ -664,6 +665,7 @@ async def create_order(
                 marketplace_customer_charge=snap_mp_cust,
                 marketplace_dealer_fee=snap_mp_dealer,
                 marketing_fee_amount=snap_mkt,
+                marketing_customer_charge=snap_mkt_cust,
                 logistics_charge_amount=snap_log_dealer,
                 logistics_customer_charge=snap_log_cust,
                 return_window_days=item_data.get("return_window_days"),
@@ -959,14 +961,19 @@ async def download_order_invoice(
         dealer = order.items[0].product.dealer
 
     mkt_sac = "998314"
+    mktg_sac = "998314"
     log_sac = "996812"
     try:
         from models.billing_slab import BillingSlab
-        res_mkt = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'marketplace', BillingSlab.is_active == True).limit(1))
+        res_mkt = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'marketplace', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None)).limit(1))
         found_mkt = res_mkt.scalars().first()
         if found_mkt: mkt_sac = found_mkt
 
-        res_log = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'logistics', BillingSlab.is_active == True).limit(1))
+        res_mktg = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'marketing', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None)).limit(1))
+        found_mktg = res_mktg.scalars().first()
+        if found_mktg: mktg_sac = found_mktg
+
+        res_log = await db.execute(select(BillingSlab.sac_hsn_code).where(BillingSlab.category_key == 'logistics', BillingSlab.is_active == True, BillingSlab.sac_hsn_code.isnot(None)).limit(1))
         found_log = res_log.scalars().first()
         if found_log: log_sac = found_log
     except Exception as e:
@@ -981,6 +988,7 @@ async def download_order_invoice(
         billing_address=order.billing_address or order.shipping_address,
         shipping_address=order.shipping_address,
         marketplace_sac=mkt_sac,
+        marketing_sac=mktg_sac,
         logistics_sac=log_sac
     )
 
