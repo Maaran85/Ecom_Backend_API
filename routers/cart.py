@@ -560,10 +560,15 @@ async def create_order(
         if wallet_obj and wallet_obj.available_balance > 0:
             max_payable = max(0.0, round(total_amount - total_discount_amount + total_delivery_charge, 2))
             total_wallet_discount = round(min(wallet_obj.available_balance, max_payable), 2)
-            if order_request.wallet_amount and order_request.wallet_amount > 0:
+            if order_request.wallet_amount is not None and order_request.wallet_amount > 0:
                 total_wallet_discount = round(min(total_wallet_discount, float(order_request.wallet_amount)), 2)
             if total_wallet_discount > 0:
                 wallet_obj.available_balance = round(max(0.0, wallet_obj.available_balance - total_wallet_discount), 2)
+                wallet_obj.available_amount = wallet_obj.available_balance
+                wallet_obj.available_points = round(wallet_obj.available_amount * 100.0, 2)
+                wallet_obj.redeemed_amount = round(getattr(wallet_obj, 'redeemed_amount', 0.0) + total_wallet_discount, 2)
+                wallet_obj.redeemed_points = round(getattr(wallet_obj, 'redeemed_points', 0.0) + (total_wallet_discount * 100.0), 2)
+                wallet_obj.updated_at = datetime.utcnow()
                 db.add(wallet_obj)
 
     # ── Create Separate Orders Per Item ────────────────────────────────────────
@@ -619,13 +624,16 @@ async def create_order(
         created_order_ids.append(new_order_id)
         
         if item_wallet_discount > 0:
-            from models.referral import WalletTransaction, WalletTransactionType
+            from models.referral import WalletTransaction, WalletTransactionType, CommissionStatus
+            points_debit = round(item_wallet_discount * 100.0, 2)
             await db.execute(
                 sql_insert(WalletTransaction).values(
                     customer_id=customer_id,
+                    points=points_debit,
                     amount=item_wallet_discount,
                     transaction_type=WalletTransactionType.DEBIT,
-                    description=f"Used wallet balance for Order #{new_order_id}",
+                    status=CommissionStatus.CREDITED,
+                    description=f"Redeemed wallet balance for Order #{new_order_id}",
                     order_id=new_order_id
                 )
             )

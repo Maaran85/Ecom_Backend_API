@@ -130,6 +130,15 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         leading=22,
         textColor=colors.HexColor('#1E1B4B')
     )
+    style_title_center = ParagraphStyle(
+        'TitleCenter',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=12,
+        leading=14.5,
+        alignment=1,
+        textColor=colors.HexColor('#1E1B4B')
+    )
     style_title_right = ParagraphStyle(
         'TitleRight',
         parent=styles['Normal'],
@@ -215,16 +224,24 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     dealer_brand = getattr(dealer, 'business_name', None) if dealer else None
     logo_text = str(dealer_brand).upper() if dealer_brand else "ONLINE SHOP"
     
-    header_data = [
+    # 1. Top Centered Invoice Title Block
+    t_title = Table([
         [
-            Paragraph(f"<b>{logo_text}</b>", style_logo),
-            Paragraph("<b>Tax Invoice / Bill of Supply / Cash Memo</b><br/><font size='8.5' face='Helvetica' color='#444'>(Original for Recipient)</font>", style_title_right)
+            Paragraph("<b>Tax Invoice / Bill of Supply / Cash Memo</b><br/><font size='8.5' face='Helvetica' color='#444'>(Original for Recipient)</font>", style_title_center)
         ]
-    ]
-    t_header = Table(header_data, colWidths=[240, 307])
+    ], colWidths=[547])
+    t_title.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t_title)
+    story.append(Spacer(1, 2))
+
+    # 2. Store / Seller Header Block
+    t_header = Table([[Paragraph(f"<b>{logo_text}</b>", style_logo)]], colWidths=[547])
     t_header.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
     ]))
     story.append(t_header)
     story.append(Spacer(1, 4))
@@ -349,12 +366,15 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     story.append(Spacer(1, 4))
     prod_table_data = [make_table_header()]
 
+    prod_ids = []
     total_prod_net = 0.0
     total_prod_tax = 0.0
     total_prod_gross = 0.0
 
     for idx, item in enumerate(order_items):
         prod_id_str = str(getattr(item, 'product_id', ''))[:8] if getattr(item, 'product_id', None) else f"PRD-{idx+1}"
+        if prod_id_str not in prod_ids:
+            prod_ids.append(prod_id_str)
         desc_name = item.product.name if getattr(item, 'product', None) else "Product Item"
         prod_desc = getattr(item.product, 'description', '') if getattr(item, 'product', None) else ''
         hsn = getattr(item, 'hsn_code', '') or getattr(item.product, 'hsn_code', '') if getattr(item, 'product', None) else ''
@@ -416,6 +436,8 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         total_prod_tax = round_curr(total_prod_tax + item_tax_amt)
         total_prod_gross = round_curr(total_prod_gross + item_total)
 
+    display_prod_id = ", ".join(prod_ids) if prod_ids else (str(getattr(order, 'id', ''))[:8] or "PRD-1")
+
     prod_table_data.append([
         Paragraph("<b>PRODUCT TOTAL:</b>", style_bold),
         "", "", "", "", "",
@@ -469,7 +491,7 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     mkt_total_amt = round_curr(mkt_net_amt + mkt_tax_amt)
     mkt_table_data.append([
         Paragraph("1", style_td_center),
-        Paragraph(mkt_sac_code, style_td_center),
+        Paragraph(display_prod_id, style_td_center),
         Paragraph(mkt_desc_html, style_td),
         Paragraph(f"₹{mkt_net_amt:.2f}", style_td_right),
         Paragraph("1", style_td_center),
@@ -533,7 +555,7 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     ship_total_amt = round_curr(ship_net_amt + ship_tax_amt)
     ship_table_data.append([
         Paragraph("1", style_td_center),
-        Paragraph(ship_sac_code, style_td_center),
+        Paragraph(display_prod_id, style_td_center),
         Paragraph(ship_desc_html, style_td),
         Paragraph(f"₹{ship_net_amt:.2f}", style_td_right),
         Paragraph("1", style_td_center),
@@ -597,7 +619,7 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         mktg_total_amt = round_curr(mktg_net_amt + mktg_tax_amt)
         mktg_table_data.append([
             Paragraph("1", style_td_center),
-            Paragraph(mktg_sac_code, style_td_center),
+            Paragraph(display_prod_id, style_td_center),
             Paragraph(mktg_desc_html, style_td),
             Paragraph(f"₹{mktg_net_amt:.2f}", style_td_right),
             Paragraph("1", style_td_center),
@@ -621,7 +643,7 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         t_mktg.setStyle(TableStyle([
             ('BOX', (0, 0), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
             ('INNERGRID', (0, 0), (-1, -2), 0.5, colors.HexColor('#E2E8F0')),
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F5F3FF')),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#FAF5FF')),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('SPAN', (0, -1), (5, -1)),
             ('LINEABOVE', (0, -1), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
@@ -633,10 +655,11 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
 
     grand_net = round_curr(total_prod_net + mkt_net_amt + ship_net_amt + mktg_net_amt)
     grand_tax = round_curr(total_prod_tax + mkt_tax_amt + ship_tax_amt + mktg_tax_amt)
-    grand_total = round_curr(total_prod_gross + mkt_total_amt + ship_total_amt + mktg_total_amt)
+    grand_total = round_curr(grand_net + grand_tax)
 
+    first_prod_label = order_items[0].product.name[:25] if order_items and getattr(order_items[0], 'product', None) else "Items"
     summary_bullets = [
-        f"• Product Total: ₹{total_prod_gross:.2f} (Basic: ₹{total_prod_net:.2f} + GST: ₹{total_prod_tax:.2f})",
+        f"• Product ({first_prod_label}): ₹{total_prod_gross:.2f} (Basic: ₹{total_prod_net:.2f} + GST: ₹{total_prod_tax:.2f})",
         f"• Marketplace Fees: ₹{mkt_total_amt:.2f} (Basic: ₹{mkt_net_amt:.2f} + GST: ₹{mkt_tax_amt:.2f})",
         f"• Shipping Services: ₹{ship_total_amt:.2f} (Basic: ₹{ship_net_amt:.2f} + GST: ₹{ship_tax_amt:.2f})",
     ]
@@ -678,15 +701,26 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     local_sig_path = _resolve_image_local_path(sig_url)
     sig_cell_elements = [
         Paragraph(f"<b>For {str(dealer_name).upper()}:</b>", style_bold_right),
-        Spacer(1, 10)
+        Spacer(1, 4)
     ]
     if local_sig_path:
         try:
-            sig_cell_elements.append(Image(local_sig_path, width=1.2*inch, height=0.4*inch))
+            sig_img = Image(local_sig_path, width=1.2*inch, height=0.4*inch)
+            sig_img.hAlign = 'RIGHT'
+            sig_table = Table([[sig_img]], colWidths=[255])
+            sig_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                ('TOPPADDING', (0, 0), (-1, -1), 0),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+            ]))
+            sig_cell_elements.append(sig_table)
         except Exception:
             sig_cell_elements.append(Spacer(1, 10))
     else:
         sig_cell_elements.append(Spacer(1, 10))
+    sig_cell_elements.append(Spacer(1, 4))
     sig_cell_elements.append(Paragraph("<b>Authorized Signatory</b>", style_bold_right))
 
     box_left = [
@@ -1031,18 +1065,32 @@ def generate_dealer_settlement_pdf(settlement, dealer, items, marketplace_sac="9
         # Line 18: TDS
         tds_val = round_curr(getattr(item, 'tds_amount', 0.0))
         tds_pct = round_curr(getattr(item, 'tds_rate', 0.001) * 100)
+        
+        if tds_val > 0:
+            tds_desc = f"<b>TDS @ {tds_pct:.1f}%</b>"
+            tds_rate_html = f"{tds_pct:.1f}%"
+            tds_type_html = "TDS"
+            tds_tax_html = f"₹{tds_val:.2f}"
+            tds_total_html = f"−₹{tds_val:.2f}"
+        else:
+            tds_desc = f"<b>TDS @ 0% (NIL - Below Limit)</b>"
+            tds_rate_html = "0%"
+            tds_type_html = "NIL"
+            tds_tax_html = "NIL"
+            tds_total_html = "₹0.00"
+
         table_data.append([
             Paragraph("18", style_td_center),
             Paragraph("—", style_td_center),
-            Paragraph(f"<b>TDS @ {tds_pct:.1f}%</b>", style_td),
+            Paragraph(tds_desc, style_td),
             Paragraph("—", style_td_center),
-            Paragraph("—", style_td_center),
-            Paragraph("—", style_td_center),
-            Paragraph("—", style_td_center),
-            Paragraph("—", style_td_center),
-            Paragraph("—", style_td_center),
-            Paragraph("—", style_td_center),
-            Paragraph(f"−₹{tds_val:.2f}", style_td_right)
+            Paragraph("1", style_td_center),
+            Paragraph("₹0.00", style_td_right),
+            Paragraph(f"₹{gross_sale:.2f}", style_td_right),
+            Paragraph(tds_rate_html, style_td_center),
+            Paragraph(tds_type_html, style_td_center),
+            Paragraph(tds_tax_html, style_td_right),
+            Paragraph(tds_total_html, style_td_right)
         ])
 
         # Final Line Net Payable
@@ -1124,6 +1172,15 @@ def generate_dealer_fee_invoice_pdf(
         fontName=FONT_BOLD,
         fontSize=16,
         leading=18,
+        textColor=colors.HexColor('#1E1B4B')
+    )
+    style_title_center = ParagraphStyle(
+        'FeeTitleCenter',
+        parent=styles['Normal'],
+        fontName=FONT_BOLD,
+        fontSize=12,
+        leading=14.5,
+        alignment=1,
         textColor=colors.HexColor('#1E1B4B')
     )
     style_title_right = ParagraphStyle(
@@ -1214,12 +1271,18 @@ def generate_dealer_fee_invoice_pdf(
     d_city = getattr(dealer, 'city', '') or ""
     d_pin = getattr(dealer, 'pincode', '') or ""
     
-    # State resolution
+    # State resolution (safely access without triggering async lazy loading)
     d_state = ""
-    if hasattr(dealer, 'state_rel') and dealer.state_rel:
-        d_state = getattr(dealer.state_rel, 'name', '') or ''
+    try:
+        d_state = getattr(dealer, 'state_name', '') or getattr(dealer, 'state', '') or ''
+        if not d_state and 'state_rel' in getattr(dealer, '__dict__', {}):
+            state_obj = dealer.__dict__.get('state_rel')
+            if state_obj:
+                d_state = getattr(state_obj, 'name', '') or ''
+    except Exception:
+        pass
     if not d_state:
-        d_state = getattr(dealer, 'state_name', '') or "KARNATAKA"
+        d_state = "KARNATAKA"
     
     d_gst = getattr(dealer, 'gst_number', '') or "UNREGISTERED"
     d_pan = getattr(dealer, 'pan_number', '') or "NOT AVAILABLE"
@@ -1244,15 +1307,30 @@ def generate_dealer_fee_invoice_pdf(
     else:
         is_inter_state = bool(d_state.strip().upper() != p_state.strip().upper())
 
-    # Header Bar
-    t_header = Table([
+    # 1. Top Centered Invoice Title
+    t_title = Table([
         [
-            Paragraph(f"<b>{p_name.upper()}</b><br/><font size='7.5' color='#555'>{p_addr}, {p_city}, {p_state} - {p_pin}<br/>GSTIN: <b>{p_gst}</b> | Phone: {p_phone} | Email: {p_email}</font>", style_logo),
-            Paragraph(f"<b>TAX INVOICE</b><br/><font size='8' face='{FONT_NORMAL}' color='#444'>(Platform Commission & Logistics Fee)</font><br/><font size='7' color='#555'>Original for Recipient</font>", style_title_right)
+            Paragraph(f"<b>TAX INVOICE</b><br/><font size='8.5' face='{FONT_NORMAL}' color='#444'>(Platform Commission & Logistics Fee)</font><br/><font size='7' color='#555'>Original for Recipient</font>", style_title_center)
         ]
-    ], colWidths=[310, 237])
-    t_header.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'), ('BOTTOMPADDING', (0, 0), (-1, -1), 6)]))
-    story.append(t_header)
+    ], colWidths=[547])
+    t_title.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t_title)
+    story.append(Spacer(1, 2))
+
+    # 2. Platform Company Details Bar
+    t_platform = Table([
+        [
+            Paragraph(f"<b>{p_name.upper()}</b><br/><font size='7.5' color='#555'>{p_addr}, {p_city}, {p_state} - {p_pin}<br/>GSTIN: <b>{p_gst}</b> | Phone: {p_phone} | Email: {p_email}</font>", style_logo)
+        ]
+    ], colWidths=[547])
+    t_platform.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t_platform)
     story.append(Spacer(1, 4))
 
     # Meta Parties Block
@@ -1312,7 +1390,34 @@ def generate_dealer_fee_invoice_pdf(
 
     # 11-column widths (sum = 547pt for A4)
     # slno | Product ID | Description | Unit price | Qty | Discount | Net Amount | Tax Rate | GST type | Tax Amount | Total Amount
-    col_widths = [24, 52, 140, 44, 22, 36, 48, 40, 42, 45, 54]
+    col_widths = [24, 56, 136, 44, 22, 36, 48, 40, 42, 45, 54]
+
+    # Resolve product IDs and names for the order items
+    prod_ids = []
+    prod_names = []
+    for it in items:
+        p_id = ""
+        if getattr(it, 'product_id', None):
+            p_id = str(it.product_id)[:8]
+        elif getattr(it, 'product', None) and getattr(it.product, 'id', None):
+            p_id = str(it.product.id)[:8]
+        
+        if p_id and p_id not in prod_ids:
+            prod_ids.append(p_id)
+            
+        p_name_val = ""
+        if getattr(it, 'product', None) and getattr(it.product, 'title', None):
+            p_name_val = it.product.title
+        elif getattr(it, 'product', None) and getattr(it.product, 'name', None):
+            p_name_val = it.product.name
+        elif getattr(it, 'product_name', None):
+            p_name_val = it.product_name
+            
+        if p_name_val and p_name_val not in prod_names:
+            prod_names.append(p_name_val)
+
+    display_prod_id = ", ".join(prod_ids) if prod_ids else (str(getattr(order, 'id', ''))[:8] or "N/A")
+    display_prod_name = ", ".join(prod_names) if prod_names else "General Merchandise"
 
     def _make_table_header():
         return [
@@ -1334,6 +1439,7 @@ def generate_dealer_fee_invoice_pdf(
     story.append(Spacer(1, 3))
 
     t1_data = [_make_table_header()]
+    mp_desc = f"<b>Marketplace Platform Services</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>Order Ref: #{order_num} • SAC: {marketplace_sac}</font>"
 
     if is_inter_state:
         # 18% IGST
@@ -1341,8 +1447,8 @@ def generate_dealer_fee_invoice_pdf(
         mp_total = round_curr(mp_basic + mp_tax)
         t1_data.append([
             Paragraph("1", style_td_center),
-            Paragraph(marketplace_sac, style_td_center),
-            Paragraph(f"Marketplace Fees SAC : {marketplace_sac}", style_td),
+            Paragraph(display_prod_id, style_td_center),
+            Paragraph(mp_desc, style_td),
             Paragraph(f"₹{mp_basic:.2f}", style_td_right),
             Paragraph("1", style_td_center),
             Paragraph("0", style_td_center),
@@ -1361,8 +1467,8 @@ def generate_dealer_fee_invoice_pdf(
 
         t1_data.append([
             Paragraph("1", style_td_center),
-            Paragraph(marketplace_sac, style_td_center),
-            Paragraph(f"Marketplace Fees SAC : {marketplace_sac}", style_td),
+            Paragraph(display_prod_id, style_td_center),
+            Paragraph(mp_desc, style_td),
             Paragraph(f"₹{mp_basic:.2f}", style_td_right),
             Paragraph("1", style_td_center),
             Paragraph("0", style_td_center),
@@ -1409,6 +1515,7 @@ def generate_dealer_fee_invoice_pdf(
     story.append(Spacer(1, 3))
 
     t2_data = [_make_table_header()]
+    log_desc = f"<b>Logistics & Shipping Services</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>Order Ref: #{order_num} • SAC: {logistics_sac}</font>"
 
     if log_basic > 0:
         if is_inter_state:
@@ -1416,8 +1523,8 @@ def generate_dealer_fee_invoice_pdf(
             log_total = round_curr(log_basic + log_tax)
             t2_data.append([
                 Paragraph("2", style_td_center),
-                Paragraph(logistics_sac, style_td_center),
-                Paragraph(f"Shipping services SAC : {logistics_sac}", style_td),
+                Paragraph(display_prod_id, style_td_center),
+                Paragraph(log_desc, style_td),
                 Paragraph(f"₹{log_basic:.2f}", style_td_right),
                 Paragraph("1", style_td_center),
                 Paragraph("0", style_td_center),
@@ -1434,8 +1541,8 @@ def generate_dealer_fee_invoice_pdf(
             log_total = round_curr(log_basic + log_tax)
             t2_data.append([
                 Paragraph("2", style_td_center),
-                Paragraph(logistics_sac, style_td_center),
-                Paragraph(f"Shipping services SAC : {logistics_sac}", style_td),
+                Paragraph(display_prod_id, style_td_center),
+                Paragraph(log_desc, style_td),
                 Paragraph(f"₹{log_basic:.2f}", style_td_right),
                 Paragraph("1", style_td_center),
                 Paragraph("0", style_td_center),
@@ -1464,10 +1571,11 @@ def generate_dealer_fee_invoice_pdf(
         # Dealer self logistics - No shipping charges billed to dealer
         log_tax = 0.0
         log_total = 0.0
+        log_self_desc = f"<b>Shipping Services (Dealer Self Logistics)</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>Order Ref: #{order_num} • SAC: {logistics_sac}</font>"
         t2_data.append([
             Paragraph("2", style_td_center),
-            Paragraph(logistics_sac, style_td_center),
-            Paragraph(f"Shipping services SAC : {logistics_sac} (Dealer Self Logistics)", style_td),
+            Paragraph(display_prod_id, style_td_center),
+            Paragraph(log_self_desc, style_td),
             Paragraph("₹0.00", style_td_right),
             Paragraph("1", style_td_center),
             Paragraph("0", style_td_center),
@@ -1490,6 +1598,66 @@ def generate_dealer_fee_invoice_pdf(
     story.append(t2)
     story.append(Spacer(1, 10))
 
+    # --- TABLE 3: TAX DEDUCTED AT SOURCE (TDS u/s 194-O) ---
+    story.append(Paragraph("<b>3. TAX DEDUCTED AT SOURCE (TDS u/s 194-O)</b>", style_table_title))
+    story.append(Spacer(1, 3))
+
+    t3_data = [_make_table_header()]
+    gross_sales_sum = sum(float(getattr(it, 'price', 0.0) or 0.0) * int(getattr(it, 'quantity', 1) or 1) for it in items)
+    tds_sum = sum(float(getattr(it, 'tds_amount', 0.0) or 0.0) for it in items)
+    has_pan = bool(getattr(dealer, 'pan_number', None))
+    tds_rate_pct = 0.1 if has_pan else 5.0
+
+    if tds_sum > 0:
+        tds_desc = f"<b>TDS Withheld u/s 194-O</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>PAN: {d_pan} • Section: 194-O ({tds_rate_pct:.1f}% Direct Tax)</font>"
+        t3_data.append([
+            Paragraph("3", style_td_center),
+            Paragraph(display_prod_id, style_td_center),
+            Paragraph(tds_desc, style_td),
+            Paragraph(f"₹{gross_sales_sum:.2f}", style_td_right),
+            Paragraph("1", style_td_center),
+            Paragraph("0", style_td_center),
+            Paragraph(f"₹{gross_sales_sum:.2f}", style_td_right),
+            Paragraph(f"{tds_rate_pct:.1f}%", style_td_center),
+            Paragraph("TDS", style_td_center),
+            Paragraph(f"₹{tds_sum:.2f}", style_td_right),
+            Paragraph(f"−₹{tds_sum:.2f}", style_td_right)
+        ])
+        t3_data.append([
+            "", "",
+            Paragraph("<b>Total TDS</b>", style_bold),
+            "", "", "", "", "", "",
+            Paragraph(f"<b>₹{tds_sum:.2f}</b>", style_bold_right),
+            Paragraph(f"<b>−₹{tds_sum:.2f}</b>", style_bold_right)
+        ])
+    else:
+        tds_nil_desc = f"<b>TDS u/s 194-O (NIL - Below Exemption Threshold)</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>PAN: {d_pan} • Section: 194-O (Threshold: ₹5,00,000)</font>"
+        t3_data.append([
+            Paragraph("3", style_td_center),
+            Paragraph(display_prod_id, style_td_center),
+            Paragraph(tds_nil_desc, style_td),
+            Paragraph(f"₹{gross_sales_sum:.2f}", style_td_right),
+            Paragraph("1", style_td_center),
+            Paragraph("0", style_td_center),
+            Paragraph(f"₹{gross_sales_sum:.2f}", style_td_right),
+            Paragraph("0%", style_td_center),
+            Paragraph("NIL", style_td_center),
+            Paragraph("NIL", style_td_center),
+            Paragraph("₹0.00", style_td_right)
+        ])
+        t3_data.append([
+            "", "",
+            Paragraph("<b>Total TDS</b>", style_bold),
+            "", "", "", "", "", "",
+            Paragraph("<b>NIL</b>", style_bold_right),
+            Paragraph("<b>₹0.00</b>", style_bold_right)
+        ])
+
+    t3 = Table(t3_data, colWidths=col_widths)
+    t3.setStyle(TableStyle(t1_style))
+    story.append(t3)
+    story.append(Spacer(1, 10))
+
     # --- GRAND SUMMARY CARD ---
     grand_net = round_curr(mp_basic + log_basic)
     grand_tax = round_curr(mp_tax + log_tax)
@@ -1501,11 +1669,14 @@ def generate_dealer_fee_invoice_pdf(
     except Exception:
         words = f"Rupees {grand_total:.2f} Only"
 
+    tds_summary_line = f"<b>TDS Withheld u/s 194-O:</b> ₹{tds_sum:.2f}<br/>" if tds_sum > 0 else "<b>TDS u/s 194-O:</b> NIL (Under ₹5L Limit)<br/>"
+
     summary_rows = [
         [
             Paragraph(f"<b>Total Taxable Value (Net Amount):</b> ₹{grand_net:.2f}<br/>"
                       f"<b>Total Tax Amount (GST):</b> ₹{grand_tax:.2f}<br/>"
                       f"<font size='9' color='#1E1B4B'><b>INVOICE TOTAL: ₹{grand_total:.2f}</b></font><br/>"
+                      f"{tds_summary_line}"
                       f"<font size='7' color='#555'>Amount in Words: {words}</font><br/>"
                       f"<font size='7' color='#666'>Whether tax is payable on Reverse Charge basis: <b>NO</b></font>", style_normal),
             Paragraph(f"<br/><br/><br/><b>For {p_name.upper()}</b><br/><font size='7' color='#555'>Authorized Signatory</font>", style_normal_right)

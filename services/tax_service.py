@@ -137,18 +137,32 @@ class TaxService:
     
     @staticmethod
     async def generate_tax_invoice_number(db: AsyncSession) -> str:
-        """Generates a sequential tax invoice number like TAX-2026-000042"""
+        """Generates a strictly sequential unique tax invoice number like TAX-2026-000042"""
         from models.invoice import OrderInvoice
+        from sqlalchemy import text
         year = datetime.now().year
+        prefix = f"TAX-{year}-"
         
-        # Get count of invoices this year
+        # Query existing invoice numbers directly using SQL or ORM to ensure all committed & uncommitted rows are checked
         result = await db.execute(
-            select(func.count(OrderInvoice.id))
-            .where(
-                func.extract('year', OrderInvoice.invoice_date) == year
-            )
+            select(OrderInvoice.invoice_number)
+            .where(OrderInvoice.invoice_number.like(f"{prefix}%"))
         )
-        count = result.scalar() or 0
+        existing_numbers = result.scalars().all()
         
-        sequence_number = str(count + 1).zfill(6)
-        return f"TAX-{year}-{sequence_number}"
+        max_seq = 0
+        for inv in existing_numbers:
+            if not inv:
+                continue
+            try:
+                seq_part = str(inv).replace(prefix, "").strip()
+                seq_num = int(seq_part)
+                if seq_num > max_seq:
+                    max_seq = seq_num
+            except (ValueError, TypeError):
+                continue
+                
+        next_seq = max_seq + 1
+        generated_number = f"{prefix}{str(next_seq).zfill(6)}"
+        print(f"[TAX_SERVICE] Existing invoices count={len(existing_numbers)}, max_seq={max_seq}, generated={generated_number}")
+        return generated_number

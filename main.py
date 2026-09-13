@@ -190,6 +190,13 @@ async def startup_event():
     except Exception as e:
         print(f"WARNING: Could not start settlement scheduler: {e}")
 
+    # Start the daily reward maturity scheduler
+    try:
+        from core.reward_scheduler import start_reward_scheduler
+        asyncio.create_task(start_reward_scheduler())
+    except Exception as e:
+        print(f"WARNING: Could not start reward scheduler: {e}")
+
     # GST configuration startup log
     import logging
     gst_logger = logging.getLogger("gst")

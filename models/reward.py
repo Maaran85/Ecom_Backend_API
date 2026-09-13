@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text, JSON
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from core.database import Base
@@ -109,3 +109,32 @@ class RewardSession(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+
+class RewardConfiguration(Base):
+    """Partner / Admin dynamic configuration for referral and reward rules."""
+    __tablename__ = "reward_configurations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    points_to_rupee_ratio = Column(Float, default=100.0, nullable=False)        # 100 pts = ₹1
+    referral_amount_points = Column(Float, default=100.0, nullable=False)       # 100 pts (₹1) signup bonus (A)
+    referral_qualifying_orders_count = Column(Integer, default=3, nullable=False) # 3 delivered orders to unlock bonus A
+    
+    # Slabs stored as JSON
+    # Default purchase slabs: 1-500: 0.20%, 501-1000: 0.15%, >1001: 0.20%
+    purchase_commission_slabs = Column(JSON, default=lambda: [
+        {"min": 1, "max": 500, "rate_percent": 0.20},
+        {"min": 501, "max": 1000, "rate_percent": 0.15},
+        {"min": 1001, "max": None, "rate_percent": 0.20}
+    ], nullable=False)
+
+    # Default spin slabs: 1-500: 1 to 5, 501-1000: 6 to 10, >1001: 11 to 15
+    spin_and_win_slabs = Column(JSON, default=lambda: [
+        {"min": 1, "max": 500, "min_points": 1, "max_points": 5},
+        {"min": 501, "max": 1000, "min_points": 6, "max_points": 10},
+        {"min": 1001, "max": None, "min_points": 11, "max_points": 15}
+    ], nullable=False)
+
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+

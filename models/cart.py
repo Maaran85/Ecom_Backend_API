@@ -89,6 +89,15 @@ class Order(Base):
     # Invoice
     tax_invoice_no = Column(String, nullable=True, unique=True)
     
+    # Referral & Reward Snapshots
+    referrer_id = Column(Integer, ForeignKey("customer_users.id"), nullable=True, index=True)
+    referral_reward_points = Column(Float, default=0.0, nullable=False)
+    referral_reward_amount = Column(Float, default=0.0, nullable=False)
+    referral_reward_status = Column(String(20), default="na", nullable=False)  # pending, credited, cancelled, refunded, na
+    spin_reward_points = Column(Float, default=0.0, nullable=False)
+    spin_reward_amount = Column(Float, default=0.0, nullable=False)
+    spin_reward_status = Column(String(20), default="na", nullable=False)      # on_hold, credited, cancelled, na
+
     # POS specific fields
     customer_name = Column(String, nullable=True)
     customer_phone = Column(String, nullable=True)
@@ -103,7 +112,8 @@ class Order(Base):
     shipping_address = relationship("Address", backref="orders_shipping", foreign_keys=[shipping_address_id])
     billing_address = relationship("Address", backref="orders_billing", foreign_keys=[billing_address_id])
     coupon = relationship("Coupon", backref="orders")
-    customer = relationship("CustomerUser", backref="orders")
+    customer = relationship("CustomerUser", backref="orders", foreign_keys=[customer_id])
+    referrer = relationship("CustomerUser", foreign_keys=[referrer_id])
     payment = relationship("Payment", back_populates="order", uselist=False)
     returns = relationship("OrderReturn", back_populates="order", cascade="all, delete-orphan", foreign_keys="OrderReturn.order_id")
 

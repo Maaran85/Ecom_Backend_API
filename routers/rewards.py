@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, delete
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from models import User, CustomerUser
 from models.reward import SpinConfig, SpinToken, SpinResult, RewardPrize, MonthlyLeaderboard, SpinSource, RewardSession, RewardSessionStatus
 from core.database import get_db
@@ -205,6 +205,533 @@ async def play_spin(
         spun_at=spin_result.spun_at,
         message=f"🎉 You got rank #{rank_earned} this spin!"
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# ORDER SPIN & WIN (SLAB-BASED WHEEL REWARD & HUB)
+# ─────────────────────────────────────────────────────────────
+
+def _generate_wheel_segments(min_pts: int, max_pts: int, ratio: float = 100.0) -> List[Dict[str, Any]]:
+    """Generate 6-8 visually distinct wheel slices spanning between min_pts and max_pts."""
+    colors = [
+        "#FF5722", "#4CAF50", "#2196F3", "#9C27B0", 
+        "#FF9800", "#E91E63", "#00BCD4", "#8BC34A"
+    ]
+    # Build list of points to distribute across 8 sectors
+    step = max(1, (max_pts - min_pts) // 4)
+    raw_points = []
+    curr = min_pts
+    while curr <= max_pts:
+        raw_points.append(curr)
+        curr += step
+    if max_pts not in raw_points:
+        raw_points.append(max_pts)
+
+    # Pad or tile to 8 sectors
+    while len(raw_points) < 8:
+        raw_points.extend(raw_points[:8 - len(raw_points)])
+    raw_points = raw_points[:8]
+    random.seed(42)  # consistent layout structure
+    random.shuffle(raw_points)
+
+    segments = []
+    for idx, pts in enumerate(raw_points):
+        segments.append({
+            "index": idx,
+            "points": pts,
+            "amount_inr": round(pts / ratio, 3),
+            "label": f"{pts} Pts",
+            "sub_label": f"₹{pts / ratio:.2f}",
+            "color": colors[idx % len(colors)]
+        })
+    return segments
+
+
+@router.get("/hub")
+@router.get("/spins/summary")
+async def get_spins_and_rewards_hub(
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Complete My Spins & Rewards Hub (Amazon / GPay / CRED Card-List Architecture).
+    Returns:
+      - Wallet balances (Available vs On-Hold)
+      - Ready to Play active cards (Unspun Orders & Tokens)
+      - Claimed Rewards History cards (Won Points, ₹ Amount, On-Hold/Credited status)
+    """
+    customer_id = int(current_user.id)
+
+    from models.cart import Order
+    from services.reward_service import get_or_create_reward_configuration, run_daily_reward_maturity_evaluation
+    from services.wallet_service import get_or_create_wallet
+
+    # Real-time auto-evaluation: Release any matured rewards before returning wallet and claimed history
+    try:
+        await run_daily_reward_maturity_evaluation(db)
+        await db.commit()
+    except Exception as e:
+        print(f"DEBUG: Error auto-evaluating reward maturity: {e}")
+
+    config = await get_or_create_reward_configuration(db)
+    slabs = config.spin_and_win_slabs or []
+    wallet = await get_or_create_wallet(db, customer_id)
+
+    # 1. Fetch unspun orders (Ready to Play)
+    res_unspun = await db.execute(
+        select(Order)
+        .where(
+            Order.customer_id == customer_id,
+            Order.spin_reward_status.in_(["pending", "unspun", "na", None])
+        )
+        .order_by(Order.id.desc())
+    )
+    unspun_orders_raw = res_unspun.scalars().all()
+
+    ready_to_play = []
+    for o in unspun_orders_raw:
+        min_pts, max_pts = 1, 5
+        for slab in slabs:
+            s_min = slab.get("min", 0)
+            s_max = slab.get("max")
+            if o.total_amount >= s_min and (s_max is None or o.total_amount <= s_max):
+                min_pts = int(slab.get("min_points", 1))
+                max_pts = int(slab.get("max_points", 5))
+                break
+        
+        max_inr = round(max_pts / config.points_to_rupee_ratio, 2)
+        ready_to_play.append({
+            "card_type": "order_spin",
+            "order_id": o.id,
+            "order_number": o.order_number or f"ORD-{o.id}",
+            "order_amount": float(o.total_amount or 0.0),
+            "order_date": o.created_at.isoformat() if hasattr(o, "created_at") and o.created_at else None,
+            "wheel_min_points": min_pts,
+            "wheel_max_points": max_pts,
+            "wheel_max_inr": max_inr,
+            "title": f"Order #{o.order_number or o.id}",
+            "subtitle": f"Win up to {max_pts} Points (₹{max_inr:.2f}) into Wallet",
+            "button_text": "Spin Now",
+            "claim_url": f"/rewards/order-spin/{o.id}/claim"
+        })
+
+    # 2. Fetch generic spin tokens (if any from recharges/promos)
+    res_tokens = await db.execute(
+        select(SpinToken).where(
+            SpinToken.customer_id == customer_id,
+            SpinToken.is_played == False
+        ).order_by(SpinToken.granted_at.desc())
+    )
+    tokens = res_tokens.scalars().all()
+    for t in tokens:
+        ready_to_play.append({
+            "card_type": "token_spin",
+            "token_id": t.id,
+            "source": t.source.value if hasattr(t.source, 'value') else str(t.source),
+            "granted_at": t.granted_at.isoformat() if t.granted_at else None,
+            "wheel_min_points": 1,
+            "wheel_max_points": 100,
+            "wheel_max_inr": 1.00,
+            "title": f"Special Promo Spin",
+            "subtitle": f"Earned from {t.source.value if hasattr(t.source, 'value') else t.source}",
+            "button_text": "Spin Now",
+            "claim_url": "/rewards/spins/play"
+        })
+
+    # 3. Fetch Claimed Rewards History (Spun Orders)
+    from models.cart import Order, OrderItem
+    from models.product import Product
+    from services.return_policy_service import resolve_item_return_policy
+
+    res_claimed = await db.execute(
+        select(Order)
+        .where(
+            Order.customer_id == customer_id,
+            Order.spin_reward_status.in_(["on_hold", "credited", "refunded", "cancelled"])
+        )
+        .order_by(Order.updated_at.desc() if hasattr(Order, "updated_at") else Order.id.desc())
+    )
+    claimed_orders_raw = res_claimed.scalars().all()
+
+    claimed_history = []
+    for o in claimed_orders_raw:
+        status_code = o.spin_reward_status or "credited"
+        
+        # Human-readable status mapping
+        if status_code == "on_hold":
+            status_label = "On Hold (Pending Delivery & Return Window)"
+            status_badge = "warning"
+            is_spendable = False
+        elif status_code == "credited":
+            status_label = "Credited to Available Balance"
+            status_badge = "success"
+            is_spendable = True
+        elif status_code == "refunded":
+            status_label = "Refunded / Returned"
+            status_badge = "secondary"
+            is_spendable = False
+        else:
+            status_label = "Cancelled"
+            status_badge = "danger"
+            is_spendable = False
+
+        # Resolve dynamic return window from order items & products
+        max_ret_days = 0
+        has_returnable_items = False
+        res_items = await db.execute(
+            select(OrderItem, Product)
+            .outerjoin(Product, OrderItem.product_id == Product.id)
+            .where(OrderItem.order_id == o.id)
+        )
+        item_rows = res_items.all()
+        if item_rows:
+            for itm, prod in item_rows:
+                pol = resolve_item_return_policy(itm, product=prod)
+                if pol["is_returnable"] or pol["is_exchangeable"]:
+                    has_returnable_items = True
+                    max_ret_days = max(max_ret_days, pol["return_window_days"])
+        else:
+            max_ret_days = 7
+            has_returnable_items = True
+
+        effective_days = max_ret_days if has_returnable_items else 0
+
+        # Estimated settlement text
+        if status_code == "on_hold":
+            if o.delivered_at:
+                est_date = o.delivered_at + timedelta(days=effective_days)
+                if effective_days == 0:
+                    est_settlement_text = "Matures on Delivery (Non-Returnable)"
+                else:
+                    est_settlement_text = f"Matures on {est_date.strftime('%b %d, %Y')}"
+            else:
+                if effective_days == 0:
+                    est_settlement_text = "Matures on delivery (Non-Returnable)"
+                else:
+                    est_settlement_text = f"Available {effective_days} days after delivery"
+        elif status_code == "credited":
+            est_settlement_text = "Ready to Spend at Checkout"
+        else:
+            est_settlement_text = "-"
+
+        claimed_history.append({
+            "order_id": o.id,
+            "order_number": o.order_number or f"ORD-{o.id}",
+            "order_amount": float(o.total_amount or 0.0),
+            "points_won": o.spin_reward_points or 0,
+            "amount_won": float(o.spin_reward_amount or 0.0),
+            "spin_reward_status": status_code,
+            "status_label": status_label,
+            "status_badge": status_badge,
+            "is_spendable": is_spendable,
+            "order_status": o.status.value if hasattr(o.status, 'value') else str(o.status),
+            "delivered_at": o.delivered_at.isoformat() if o.delivered_at else None,
+            "estimated_settlement": est_settlement_text
+        })
+
+    return {
+        "status": "success",
+        "wallet_summary": {
+            "available_points": wallet.available_points,
+            "available_amount": wallet.available_amount,
+            "on_hold_points": wallet.on_hold_points,
+            "on_hold_amount": wallet.on_hold_amount,
+            "redeemed_points": wallet.redeemed_points,
+            "redeemed_amount": wallet.redeemed_amount,
+            "lifetime_earned_points": wallet.lifetime_earned_points,
+            "lifetime_earned_amount": wallet.lifetime_earned_amount,
+            "points_to_rupee_ratio": config.points_to_rupee_ratio
+        },
+        "stats": {
+            "total_spins_ready": len(ready_to_play),
+            "unspun_orders_count": len(unspun_orders_raw),
+            "unplayed_tokens_count": len(tokens),
+            "total_claimed_rewards": len(claimed_history),
+        },
+        "ready_to_play": ready_to_play,
+        "claimed_history": claimed_history
+    }
+
+
+@router.get("/order-spin/{order_id}/wheel")
+async def get_order_spin_wheel(
+    order_id: int,
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieve wheel configuration and slice definitions for a specific order."""
+    from models.cart import Order
+    from services.reward_service import get_or_create_reward_configuration
+
+    res = await db.execute(
+        select(Order).where(Order.id == order_id, Order.customer_id == current_user.id)
+    )
+    order = res.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    config = await get_or_create_reward_configuration(db)
+    slabs = config.spin_and_win_slabs or []
+    min_pts, max_pts = 1, 5
+    for slab in slabs:
+        s_min = slab.get("min", 0)
+        s_max = slab.get("max")
+        if order.total_amount >= s_min and (s_max is None or order.total_amount <= s_max):
+            min_pts = int(slab.get("min_points", 1))
+            max_pts = int(slab.get("max_points", 5))
+            break
+
+    is_spun = order.spin_reward_status in ["on_hold", "credited"]
+    segments = _generate_wheel_segments(min_pts, max_pts, config.points_to_rupee_ratio)
+
+    return {
+        "status": "success",
+        "order_id": order.id,
+        "order_number": order.order_number or f"ORD-{order.id}",
+        "order_amount": float(order.total_amount or 0.0),
+        "is_spun": is_spun,
+        "points_earned": order.spin_reward_points if is_spun else None,
+        "amount_earned": order.spin_reward_amount if is_spun else None,
+        "spin_reward_status": order.spin_reward_status,
+        "wheel_min_points": min_pts,
+        "wheel_max_points": max_pts,
+        "segments": segments
+    }
+
+
+@router.get("/order-spin/latest/unspun")
+async def get_latest_unspun_order(
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieve the customer's most recent order that has not had its spin claimed yet."""
+    from models.cart import Order
+    from services.reward_service import get_or_create_reward_configuration
+
+    res = await db.execute(
+        select(Order)
+        .where(
+            Order.customer_id == current_user.id,
+            Order.spin_reward_status.in_(["na", "pending", "unspun", None])
+        )
+        .order_by(Order.id.desc())
+        .limit(1)
+    )
+    order = res.scalar_one_or_none()
+    if not order:
+        return {"status": "none", "order_id": None}
+
+    config = await get_or_create_reward_configuration(db)
+    slabs = config.spin_and_win_slabs or []
+    min_pts, max_pts = 1, 5
+    for slab in slabs:
+        s_min = slab.get("min", 0)
+        s_max = slab.get("max")
+        if order.total_amount >= s_min and (s_max is None or order.total_amount <= s_max):
+            min_pts = int(slab.get("min_points", 1))
+            max_pts = int(slab.get("max_points", 5))
+            break
+
+    return {
+        "status": "success",
+        "order_id": order.id,
+        "order_number": order.order_number,
+        "order_amount": order.total_amount,
+        "wheel_min_points": min_pts,
+        "wheel_max_points": max_pts,
+        "is_spun": False,
+        "points_earned": None,
+        "amount_earned": None,
+        "spin_reward_status": order.spin_reward_status or "na"
+    }
+
+
+@router.get("/order-spin/{order_id}")
+async def get_order_spin_status(
+    order_id: int,
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieve spin wheel parameters and status for a placed order."""
+    from models.cart import Order
+    from services.reward_service import get_or_create_reward_configuration
+
+    res = await db.execute(
+        select(Order).where(Order.id == order_id, Order.customer_id == current_user.id)
+    )
+    order = res.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    config = await get_or_create_reward_configuration(db)
+    slabs = config.spin_and_win_slabs or []
+    min_pts, max_pts = 1, 5
+    for slab in slabs:
+        s_min = slab.get("min", 0)
+        s_max = slab.get("max")
+        if order.total_amount >= s_min and (s_max is None or order.total_amount <= s_max):
+            min_pts = int(slab.get("min_points", 1))
+            max_pts = int(slab.get("max_points", 5))
+            break
+
+    is_spun = order.spin_reward_status in ["on_hold", "credited"]
+    return {
+        "status": "success",
+        "order_id": order.id,
+        "order_number": order.order_number,
+        "order_amount": order.total_amount,
+        "wheel_min_points": min_pts,
+        "wheel_max_points": max_pts,
+        "is_spun": is_spun,
+        "points_earned": order.spin_reward_points if is_spun else None,
+        "amount_earned": order.spin_reward_amount if is_spun else None,
+        "spin_reward_status": order.spin_reward_status
+    }
+
+
+@router.post("/order-spin/{order_id}/claim")
+async def claim_order_spin(
+    order_id: int,
+    current_user: CustomerUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Play the spin wheel for a completed order.
+    The points won are securely generated based on the order value slab (1-5, 6-10, 11-15)
+    and stored in ON_HOLD status in customer wallet during the return window.
+    """
+    from models.cart import Order
+    from models.referral import WalletTransaction, WalletTxnType, CommissionStatus
+    from services.reward_service import get_or_create_reward_configuration, calculate_spin_and_win_reward
+    from services.wallet_service import get_or_create_wallet
+
+    res = await db.execute(
+        select(Order).where(Order.id == order_id, Order.customer_id == current_user.id)
+    )
+    order = res.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    if order.spin_reward_status in ["on_hold", "credited"]:
+        return {
+            "status": "success",
+            "message": "Spin reward already claimed for this order.",
+            "points_earned": order.spin_reward_points,
+            "amount_earned": order.spin_reward_amount,
+            "spin_reward_status": order.spin_reward_status,
+            "is_already_claimed": True
+        }
+
+    config = await get_or_create_reward_configuration(db)
+    points_won, amount_in_inr = calculate_spin_and_win_reward(order.total_amount, config)
+
+    order.spin_reward_points = points_won
+    order.spin_reward_amount = amount_in_inr
+
+    # Resolve return window dynamically from order items & products
+    from models.cart import OrderItem, OrderStatus
+    from models.product import Product
+    from services.return_policy_service import resolve_item_return_policy
+    from datetime import timezone
+
+    max_ret_days = 0
+    has_returnable_items = False
+    res_items = await db.execute(
+        select(OrderItem, Product)
+        .outerjoin(Product, OrderItem.product_id == Product.id)
+        .where(OrderItem.order_id == order.id)
+    )
+    item_rows = res_items.all()
+    if item_rows:
+        for itm, prod in item_rows:
+            pol = resolve_item_return_policy(itm, product=prod)
+            if pol["is_returnable"] or pol["is_exchangeable"]:
+                has_returnable_items = True
+                max_ret_days = max(max_ret_days, pol["return_window_days"])
+    else:
+        max_ret_days = 7
+        has_returnable_items = True
+
+    effective_days = max_ret_days if has_returnable_items else 0
+    is_matured_now = False
+    if order.status == OrderStatus.DELIVERED and order.delivered_at:
+        deliv_at = order.delivered_at
+        if deliv_at.tzinfo is None:
+            deliv_at = deliv_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= deliv_at + timedelta(days=effective_days):
+            is_matured_now = True
+
+    buyer_wallet = await get_or_create_wallet(db, int(current_user.id))
+
+    if is_matured_now:
+        order.spin_reward_status = "credited"
+        buyer_wallet.available_points += points_won
+        buyer_wallet.available_amount += amount_in_inr
+        buyer_wallet.lifetime_earned_points += points_won
+        buyer_wallet.lifetime_earned_amount += amount_in_inr
+        buyer_wallet.available_balance = buyer_wallet.available_amount
+        buyer_wallet.lifetime_earned = buyer_wallet.lifetime_earned_amount
+        buyer_wallet.updated_at = datetime.utcnow()
+        tx_status = CommissionStatus.CREDITED
+        tx_desc = f"Spin & Win on Order #{order.order_number or order.id} (Credited - Matured)"
+    else:
+        order.spin_reward_status = "on_hold"
+        buyer_wallet.on_hold_points += points_won
+        buyer_wallet.on_hold_amount += amount_in_inr
+        buyer_wallet.updated_at = datetime.utcnow()
+        tx_status = CommissionStatus.ON_HOLD
+        tx_desc = f"Spin & Win on Order #{order.order_number or order.id} (On-Hold during return window)"
+
+    # Log to wallet transaction ledger
+    spin_tx = WalletTransaction(
+        customer_id=int(current_user.id),
+        order_id=order.id,
+        points=points_won,
+        amount=amount_in_inr,
+        transaction_type=WalletTxnType.SPIN_AND_WIN,
+        status=tx_status,
+        description=tx_desc,
+        created_at=datetime.utcnow()
+    )
+    db.add(spin_tx)
+    await db.commit()
+    await db.refresh(order)
+
+    # Find winning slice index for frontend animation
+    slabs = config.spin_and_win_slabs or []
+    min_pts, max_pts = 1, 5
+    for slab in slabs:
+        s_min = slab.get("min", 0)
+        s_max = slab.get("max")
+        if order.total_amount >= s_min and (s_max is None or order.total_amount <= s_max):
+            min_pts = int(slab.get("min_points", 1))
+            max_pts = int(slab.get("max_points", 5))
+            break
+    segments = _generate_wheel_segments(min_pts, max_pts, config.points_to_rupee_ratio)
+    winning_slice_index = 0
+    for seg in segments:
+        if seg["points"] == points_won:
+            winning_slice_index = seg["index"]
+            break
+
+    return {
+        "status": "success",
+        "message": f"🎉 Congratulations! You won {points_won} points (₹{amount_in_inr:.2f})!",
+        "order_id": order.id,
+        "order_number": order.order_number or f"ORD-{order.id}",
+        "points_earned": points_won,
+        "amount_earned": amount_in_inr,
+        "winning_slice_index": winning_slice_index,
+        "spin_reward_status": order.spin_reward_status,
+        "is_already_claimed": False,
+        "wallet_update": {
+            "on_hold_points": buyer_wallet.on_hold_points,
+            "on_hold_amount": buyer_wallet.on_hold_amount,
+            "available_points": buyer_wallet.available_points,
+            "available_amount": buyer_wallet.available_amount
+        }
+    }
+
 
 @router.get("/leaderboard")
 async def get_leaderboard(

@@ -31,7 +31,8 @@ from .tax import TaxCategory, TaxRule, TaxLedger
 from .logistics_remittance import LogisticsRemittance
 from .dealer_remittance import DealerRemittance
 from .recharge import RechargeTransaction, RechargeStatus
-from .reward import SpinConfig, SpinToken, SpinResult, RewardPrize, MonthlyLeaderboard, SpinSource, RewardSession, RewardSessionStatus
+from .reward import SpinConfig, SpinToken, SpinResult, RewardPrize, MonthlyLeaderboard, SpinSource, RewardSession, RewardSessionStatus, RewardConfiguration
+from .referral import CustomerReferralProfile, ReferralOrderCommission, ReferralItemCommission, CustomerWallet, WalletTransaction, WalletRedemption, CommissionStatus, WalletTxnType
 from .partner import Partner
 from .tds_configuration import TDSConfiguration
 from .fee_configuration import FeeConfiguration
@@ -67,7 +68,8 @@ __all__ = [
     "LogisticsRemittance",
     "DealerRemittance",
     "RechargeTransaction", "RechargeStatus",
-    "SpinConfig", "SpinToken", "SpinResult", "RewardPrize", "MonthlyLeaderboard", "SpinSource", "RewardSession", "RewardSessionStatus",
+    "SpinConfig", "SpinToken", "SpinResult", "RewardPrize", "MonthlyLeaderboard", "SpinSource", "RewardSession", "RewardSessionStatus", "RewardConfiguration",
+    "CustomerReferralProfile", "ReferralOrderCommission", "ReferralItemCommission", "CustomerWallet", "WalletTransaction", "WalletRedemption", "CommissionStatus", "WalletTxnType",
     "Partner",
     "AuctionItem", "AuctionBid",
     "TDSConfiguration", "FeeConfiguration",

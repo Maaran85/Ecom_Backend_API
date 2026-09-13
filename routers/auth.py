@@ -145,14 +145,47 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
     
     # Check OTP (Allow test codes)
     is_test_otp = data.otp in ["123456", "654321"]
-    if not customer or (not is_test_otp and data.otp != customer.otp_code):
-         raise HTTPException(status_code=400, detail="Invalid OTP code")
+    if not customer:
+        if is_test_otp:
+            customer = CustomerUserModel(
+                phone=data.identifier,
+                full_name=data.full_name,
+                is_active=True
+            )
+            db.add(customer)
+            await db.flush()
+        else:
+            raise HTTPException(status_code=400, detail="Invalid OTP code. Please request a new OTP.")
+    elif not is_test_otp and data.otp != customer.otp_code:
+        raise HTTPException(status_code=400, detail="Invalid OTP code")
     
     # Complete registration
     customer.full_name = data.full_name
     customer.is_active = True
     customer.otp_code = None
     
+    await db.flush()
+    customer_id = int(customer.id)
+
+    # Initialize Customer Referral Profile & Wallet
+    try:
+        from models.referral import CustomerReferralProfile
+        from routers.referrals import _generate_referral_code
+        from services.wallet_service import get_or_create_wallet
+        
+        ref_check = await db.execute(
+            select(CustomerReferralProfile).where(CustomerReferralProfile.customer_id == customer_id)
+        )
+        if not ref_check.scalar_one_or_none():
+            new_ref_profile = CustomerReferralProfile(
+                customer_id=customer_id,
+                referral_code=_generate_referral_code(customer_id)
+            )
+            db.add(new_ref_profile)
+        await get_or_create_wallet(db, customer_id)
+    except Exception as e:
+        print(f"Warning: Could not auto-generate referral profile on signup: {e}")
+
     try:
         await db.commit()
     except Exception as e:
@@ -164,7 +197,15 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
     return {
         "access_token": access_token, 
         "token_type": "bearer", 
-        "user": CustomerSchema.model_validate(customer)
+        "user": CustomerSchema(
+            id=customer.id,
+            full_name=customer.full_name,
+            email=customer.email,
+            phone=customer.phone,
+            dob=customer.dob,
+            is_active=customer.is_active,
+            created_at=customer.created_at or datetime.utcnow()
+        )
     }
 
 @router.post("/customer/login-request")
