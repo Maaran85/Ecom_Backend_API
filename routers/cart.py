@@ -473,7 +473,7 @@ async def create_order(
             if not is_waived:
                 total_delivery_charge += fee
     
-    # Deduct stock
+    # Check total available stock across hubs
     for update_data in stock_updates:
         p_id = update_data["product_id"]
         v_id = update_data["variant_id"]
@@ -483,23 +483,15 @@ async def create_order(
         
         from models.inventory import ProductInventory
         inv_result = await db.execute(
-            select(ProductInventory)
+            select(func.coalesce(func.sum(ProductInventory.stock), 0))
             .where(ProductInventory.product_id == target_id)
-            .order_by(ProductInventory.stock.desc())
-            .with_for_update()
         )
-        inv = inv_result.scalars().first()
-        if not inv or inv.stock < qty:
+        total_stock = inv_result.scalar_one()
+        if total_stock < qty:
             raise HTTPException(
                 status_code=400,
                 detail="Not enough stock available to complete this order."
             )
-        await db.execute(
-            update(ProductInventory)
-            .where(ProductInventory.id == inv.id)
-            .values(stock=ProductInventory.stock - qty)
-            .execution_options(synchronize_session=False)
-        )
     
     # ── Coupon Validation (Global) ─────────────────────────────────────────────
     coupon_code_str = order_request.coupon_code.strip().upper() if (order_request and order_request.coupon_code) else None

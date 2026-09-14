@@ -89,12 +89,32 @@ async def cancel_order(
     for item in order.items:
         item.status = OrderStatus.CANCELLED.value
     
-    # Restore product stock (from order items)
+    # Restore hub product stock (from order items)
     for item in order.items:
-        product_result = await db.execute(select(Product).where(Product.id == item.product_id))
-        product = product_result.scalar_one_or_none()
-        if product:
-            product.stock += item.quantity
+        if item.hub_id:
+            from models.inventory import ProductInventory, StockMovement, MovementType
+            inv_result = await db.execute(
+                select(ProductInventory)
+                .where(ProductInventory.product_id == item.product_id, ProductInventory.hub_id == item.hub_id)
+                .with_for_update()
+            )
+            inv = inv_result.scalar_one_or_none()
+            if inv:
+                stock_before = inv.stock
+                inv.stock += item.quantity
+                stock_after = inv.stock
+                db.add(StockMovement(
+                    product_id=item.product_id,
+                    movement_type=MovementType.CANCELLATION,
+                    quantity=item.quantity,
+                    stock_before=stock_before,
+                    stock_after=stock_after,
+                    reference_id=order.id,
+                    reference_type="order",
+                    hub_id=item.hub_id,
+                    user_id=current_user.id if hasattr(current_user, 'id') else None,
+                    notes=f"Restored {item.quantity} units for cancelled Order #{order.id}"
+                ))
     
     # Reverse coupon usage if applicable
     if order.coupon_id:

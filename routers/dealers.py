@@ -3318,10 +3318,39 @@ async def assign_items_to_hub(
         )
         item = item_result.scalar_one_or_none()
         if item:
+            # If item is already assigned to this exact hub, skip re-deduction
+            if item.hub_id == payload.hub_id:
+                updated.append(item_id)
+                continue
+
+            # If item was previously assigned to a different hub, restore stock to the old hub
+            if item.hub_id and item.hub_id != payload.hub_id:
+                old_inv_res = await db.execute(
+                    select(ProductInventory)
+                    .where(ProductInventory.product_id == item.product_id, ProductInventory.hub_id == item.hub_id)
+                    .with_for_update()
+                )
+                old_inv = old_inv_res.scalar_one_or_none()
+                if old_inv:
+                    old_inv.stock += item.quantity
+                    db.add(StockMovement(
+                        product_id=item.product_id,
+                        movement_type=MovementType.RELEASE,
+                        quantity=item.quantity,
+                        stock_before=old_inv.stock - item.quantity,
+                        stock_after=old_inv.stock,
+                        reference_id=item.order_id,
+                        reference_type="order",
+                        hub_id=item.hub_id,
+                        user_id=current_user.id,
+                        notes=f"Reassigned order item #{item.id} from hub #{item.hub_id} to hub '{hub.name}'"
+                    ))
+
             # Check hub-specific stock
             inventory_result = await db.execute(
                 select(ProductInventory)
                 .where(ProductInventory.product_id == item.product_id, ProductInventory.hub_id == payload.hub_id)
+                .with_for_update()
             )
             inv = inventory_result.scalar_one_or_none()
             
@@ -3333,6 +3362,25 @@ async def assign_items_to_hub(
                     status_code=400, 
                     detail=f"Insufficient stock for '{prod_name}' at hub '{hub.name}'. Requested: {item.quantity}, Available: {inv.stock if inv else 0}"
                 )
+            
+            # Deduct stock from the selected hub
+            stock_before = inv.stock
+            inv.stock -= item.quantity
+            stock_after = inv.stock
+
+            # Record stock movement
+            db.add(StockMovement(
+                product_id=item.product_id,
+                movement_type=MovementType.PURCHASE,
+                quantity=-item.quantity,
+                stock_before=stock_before,
+                stock_after=stock_after,
+                reference_id=item.order_id,
+                reference_type="order",
+                hub_id=payload.hub_id,
+                user_id=current_user.id,
+                notes=f"Deducted {item.quantity} units for Order Item #{item.id} assigned to hub '{hub.name}'"
+            ))
                 
             item.hub_id = payload.hub_id
             item.dispatch_date = now
@@ -3360,7 +3408,7 @@ async def unassign_items_from_hub(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove hub assignment from order items."""
+    """Remove hub assignment from order items and restore stock to the hub."""
     dealer = await get_current_dealer(current_user, db)
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer profile not found")
@@ -3373,9 +3421,32 @@ async def unassign_items_from_hub(
         )
         item = item_result.scalar_one_or_none()
         if item:
+            if item.hub_id:
+                inv_res = await db.execute(
+                    select(ProductInventory)
+                    .where(ProductInventory.product_id == item.product_id, ProductInventory.hub_id == item.hub_id)
+                    .with_for_update()
+                )
+                inv = inv_res.scalar_one_or_none()
+                if inv:
+                    stock_before = inv.stock
+                    inv.stock += item.quantity
+                    stock_after = inv.stock
+                    db.add(StockMovement(
+                        product_id=item.product_id,
+                        movement_type=MovementType.RELEASE,
+                        quantity=item.quantity,
+                        stock_before=stock_before,
+                        stock_after=stock_after,
+                        reference_id=item.order_id,
+                        reference_type="order",
+                        hub_id=item.hub_id,
+                        user_id=current_user.id,
+                        notes=f"Restored {item.quantity} units for unassigned Order Item #{item.id}"
+                    ))
             item.hub_id = None
             item.hub_arrived_at = None
-            if item.status == "at_hub":
+            if item.status in ["at_hub", "confirmed"]:
                 item.status = "packed"
             updated.append(item_id)
     await db.commit()
