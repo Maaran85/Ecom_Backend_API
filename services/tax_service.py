@@ -1,3 +1,4 @@
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func, or_
 from datetime import datetime
@@ -5,7 +6,7 @@ from models import TaxCategory, TaxRule, Product, Category, Dealer, Order, Order
 
 class TaxService:
     @staticmethod
-    async def get_applicable_tax_rule(db: AsyncSession, product_id: int):
+    async def get_applicable_tax_rule(db: AsyncSession, product_id: int, product: Optional[Product] = None):
         """
         Finds the applicable tax rule for a product.
         Priority:
@@ -13,7 +14,8 @@ class TaxService:
         2. Category-level rule
         3. Fallback (e.g., Default 18% or configured default)
         """
-        product = await db.get(Product, product_id)
+        if product is None and product_id:
+            product = await db.get(Product, product_id)
         if not product:
             return None
 
@@ -63,14 +65,27 @@ class TaxService:
         return None
 
     @staticmethod
-    async def calculate_item_tax(db: AsyncSession, base_price: float, qty: int, product_id: int, buyer_state: str, seller_state: str, is_inclusive: bool = True):
+    async def calculate_item_tax(
+        db: AsyncSession,
+        base_price: float,
+        qty: int,
+        product_id: int,
+        buyer_state: str,
+        seller_state: str,
+        is_inclusive: bool = True,
+        product: Optional[Product] = None,
+        tax_category: Optional[TaxCategory] = None
+    ):
         """
         Parses pricing into Net Taxable Value and Tax Amounts.
         Supports Inter-state (IGST) vs Intra-state (CGST+SGST).
         If is_inclusive is True, base_price includes tax. If False, base_price excludes tax.
+        Accepts pre-loaded product and tax_category to avoid redundant queries during checkout.
         """
-        rule = await TaxService.get_applicable_tax_rule(db, product_id)
-        product = await db.get(Product, product_id) if product_id else None
+        if product is None and product_id:
+            product = await db.get(Product, product_id)
+
+        rule = await TaxService.get_applicable_tax_rule(db, product_id, product=product)
         
         # Default if no rule found
         cgst_rate = 0.0
@@ -78,14 +93,19 @@ class TaxService:
         igst_rate = 0.0
         tax_category_id = None
         
-        if product and product.tax_category_id:
+        if tax_category:
+            tax_category_id = tax_category.id
+            cgst_rate = tax_category.cgst_rate
+            sgst_rate = tax_category.sgst_rate
+            igst_rate = tax_category.igst_rate
+        elif product and product.tax_category_id:
             tax_category = await db.get(TaxCategory, product.tax_category_id)
             if tax_category:
                 tax_category_id = tax_category.id
                 cgst_rate = tax_category.cgst_rate
                 sgst_rate = tax_category.sgst_rate
                 igst_rate = tax_category.igst_rate
-        elif rule:
+        elif rule and rule.tax_category_id:
             tax_category = await db.get(TaxCategory, rule.tax_category_id)
             if tax_category:
                 tax_category_id = tax_category.id
@@ -139,30 +159,77 @@ class TaxService:
     async def generate_tax_invoice_number(db: AsyncSession) -> str:
         """Generates a strictly sequential unique tax invoice number like TAX-2026-000042"""
         from models.invoice import OrderInvoice
-        from sqlalchemy import text
         year = datetime.now().year
         prefix = f"TAX-{year}-"
         
-        # Query existing invoice numbers directly using SQL or ORM to ensure all committed & uncommitted rows are checked
+        # Efficiently fetch the maximum existing invoice number using index
         result = await db.execute(
-            select(OrderInvoice.invoice_number)
+            select(func.max(OrderInvoice.invoice_number))
             .where(OrderInvoice.invoice_number.like(f"{prefix}%"))
         )
-        existing_numbers = result.scalars().all()
+        max_inv = result.scalar_one_or_none()
         
         max_seq = 0
-        for inv in existing_numbers:
-            if not inv:
-                continue
+        if max_inv:
             try:
-                seq_part = str(inv).replace(prefix, "").strip()
-                seq_num = int(seq_part)
-                if seq_num > max_seq:
-                    max_seq = seq_num
+                seq_part = str(max_inv).replace(prefix, "").strip()
+                max_seq = int(seq_part)
             except (ValueError, TypeError):
-                continue
+                max_seq = 0
                 
         next_seq = max_seq + 1
         generated_number = f"{prefix}{str(next_seq).zfill(6)}"
-        print(f"[TAX_SERVICE] Existing invoices count={len(existing_numbers)}, max_seq={max_seq}, generated={generated_number}")
         return generated_number
+
+    @staticmethod
+    async def create_order_invoice_with_retry(
+        db: AsyncSession,
+        order_id: int,
+        dealer_id,
+        total_amount: float,
+        tax_amount: float,
+        max_retries: int = 5
+    ):
+        """
+        Inserts an OrderInvoice with resilience against concurrent invoice-number uniqueness collisions.
+        Uses a transaction savepoint (begin_nested) so that collisions roll back only the savepoint,
+        allowing invoice number recalculation without invalidating the parent transaction.
+        Only retries when the error is confirmed to be an invoice_number unique constraint violation.
+        """
+        from models.invoice import OrderInvoice
+        from sqlalchemy import insert as sql_insert
+        from sqlalchemy.exc import IntegrityError
+        
+        last_error = None
+        for attempt in range(max_retries):
+            invoice_num = await TaxService.generate_tax_invoice_number(db)
+            try:
+                async with db.begin_nested():
+                    res = await db.execute(
+                        sql_insert(OrderInvoice).values(
+                            order_id=order_id,
+                            dealer_id=dealer_id,
+                            invoice_number=invoice_num,
+                            total_amount=total_amount,
+                            tax_amount=tax_amount,
+                            is_reverse_charge=False
+                        ).returning(OrderInvoice.id)
+                    )
+                    return invoice_num
+            except IntegrityError as exc:
+                last_error = exc
+                # Confirm the failure is specifically an invoice_number uniqueness collision
+                err_str = str(exc).lower()
+                is_invoice_collision = (
+                    "invoice_number" in err_str or
+                    "order_invoices_invoice_number_key" in err_str or
+                    "unique constraint" in err_str and "invoice" in err_str
+                )
+                if not is_invoice_collision:
+                    raise exc
+                # If collision and attempts remain, loop recalculates func.max on the next attempt
+                continue
+
+        if last_error:
+            raise last_error
+

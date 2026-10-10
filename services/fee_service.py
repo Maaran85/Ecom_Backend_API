@@ -45,6 +45,28 @@ async def get_applicable_slab(db: AsyncSession, category_key: str, net_basic_amo
     return res.scalar_one_or_none()
 
 
+async def get_all_active_slabs(db: AsyncSession) -> List[BillingSlab]:
+    """Pre-fetch all active billing slabs in a single query to eliminate per-item DB round trips."""
+    stmt = (
+        select(BillingSlab)
+        .where(BillingSlab.is_active == True)
+        .order_by(BillingSlab.min_price.desc())
+    )
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+
+def match_slab_from_list(slabs: List[BillingSlab], category_key: str, net_basic_amount: Decimal) -> Optional[BillingSlab]:
+    """Finds the active BillingSlab for category_key from pre-fetched slabs using identical price range rules."""
+    sale_val = float(net_basic_amount)
+    for slab in slabs:
+        if slab.category_key == category_key and slab.is_active and slab.min_price <= sale_val:
+            if slab.max_price is None or slab.max_price >= sale_val:
+                return slab
+    return None
+
+
+
 async def validate_no_overlap(
     db: AsyncSession,
     category_key: str,

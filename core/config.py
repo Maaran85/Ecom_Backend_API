@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "supersecretkey1234567890"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     ENCRYPTION_KEY: str = "thisisaverysecretencryptionkey32" # 32 bytes for AES
+    SQL_ECHO: bool = False
+
     
     # SMTP Settings (optional)
     SMTP_SERVER: Optional[str] = None

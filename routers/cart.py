@@ -321,7 +321,8 @@ async def create_order(
             qty=qty,
             product_id=product.id,
             buyer_state=buyer_state,
-            seller_state=seller_state
+            seller_state=seller_state,
+            product=product
         )
 
         fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
@@ -378,11 +379,19 @@ async def create_order(
 
         if invalid_cart_ids:
             await db.execute(delete(CartItemModel).where(CartItemModel.id.in_(invalid_cart_ids)))
-            await db.commit()
+            await db.flush()
 
         if not cart_items:
             raise HTTPException(status_code=400, detail="The items in your cart are no longer available. Please update your cart.")
         
+        # Batch pre-fetch tax categories for all products in cart
+        from models.tax import TaxCategory as TaxCategoryModel
+        tax_category_ids = {ci.product.tax_category_id for ci in cart_items if ci.product and ci.product.tax_category_id}
+        tax_categories_by_id = {}
+        if tax_category_ids:
+            tc_res = await db.execute(select(TaxCategoryModel).where(TaxCategoryModel.id.in_(tax_category_ids)))
+            tax_categories_by_id = {tc.id: tc for tc in tc_res.scalars().all()}
+
         for cart_item in cart_items:
             product = cart_item.product
 
@@ -415,13 +424,16 @@ async def create_order(
             buyer_state = shipping_address.state_rel.state_code if (shipping_address and shipping_address.state_rel) else None
             seller_state = product.dealer.state_code if product.dealer else None
             
+            cached_tax_cat = tax_categories_by_id.get(product.tax_category_id) if product.tax_category_id else None
             tax_res = await TaxService.calculate_item_tax(
                 db=db,
                 base_price=price,
                 qty=cart_item.quantity,
                 product_id=product.id,
                 buyer_state=buyer_state,
-                seller_state=seller_state
+                seller_state=seller_state,
+                product=product,
+                tax_category=cached_tax_cat
             )
             
             fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
@@ -473,25 +485,29 @@ async def create_order(
             if not is_waived:
                 total_delivery_charge += fee
     
-    # Check total available stock across hubs
-    for update_data in stock_updates:
-        p_id = update_data["product_id"]
-        v_id = update_data["variant_id"]
-        qty = update_data["quantity"]
-        
-        target_id = v_id if v_id else p_id
-        
+    # Check total available stock across hubs in a single batched query
+    if stock_updates:
         from models.inventory import ProductInventory
+        target_ids = list({u["variant_id"] if u["variant_id"] else u["product_id"] for u in stock_updates})
         inv_result = await db.execute(
-            select(func.coalesce(func.sum(ProductInventory.stock), 0))
-            .where(ProductInventory.product_id == target_id)
-        )
-        total_stock = inv_result.scalar_one()
-        if total_stock < qty:
-            raise HTTPException(
-                status_code=400,
-                detail="Not enough stock available to complete this order."
+            select(
+                ProductInventory.product_id,
+                func.coalesce(func.sum(ProductInventory.stock), 0)
             )
+            .where(ProductInventory.product_id.in_(target_ids))
+            .group_by(ProductInventory.product_id)
+        )
+        stock_map = {row[0]: row[1] for row in inv_result.all()}
+
+        for update_data in stock_updates:
+            target_id = update_data["variant_id"] if update_data["variant_id"] else update_data["product_id"]
+            qty = update_data["quantity"]
+            total_stock = stock_map.get(target_id, 0)
+            if total_stock < qty:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Not enough stock available to complete this order."
+                )
     
     # ── Coupon Validation (Global) ─────────────────────────────────────────────
     coupon_code_str = order_request.coupon_code.strip().upper() if (order_request and order_request.coupon_code) else None
@@ -565,6 +581,8 @@ async def create_order(
 
     # ── Create Separate Orders Per Item ────────────────────────────────────────
     from sqlalchemy import insert as sql_insert
+    from services.fee_service import get_all_active_slabs, match_slab_from_list
+    active_slabs = await get_all_active_slabs(db)
     created_order_ids = []
     created_order_items_list = []
     
@@ -630,12 +648,11 @@ async def create_order(
                 )
             )
         
-        # Compute transaction-time billing slab snapshot values
+        # Compute transaction-time billing slab snapshot values using pre-fetched slabs
         gross_sale_val = Decimal(str(max(0.0, item_subtotal - total_item_discount)))
-        from services.fee_service import get_applicable_slab
-        mp_slab = await get_applicable_slab(db, "marketplace", gross_sale_val)
-        mkt_slab = await get_applicable_slab(db, "marketing", gross_sale_val)
-        log_slab = await get_applicable_slab(db, "logistics", gross_sale_val)
+        mp_slab = match_slab_from_list(active_slabs, "marketplace", gross_sale_val)
+        mkt_slab = match_slab_from_list(active_slabs, "marketing", gross_sale_val)
+        log_slab = match_slab_from_list(active_slabs, "logistics", gross_sale_val)
 
         snap_mp_cust = round(float(gross_sale_val * Decimal(str(mp_slab.customer_percentage))), 2) if (mp_slab and mp_slab.customer_percentage) else 0.0
         snap_mp_dealer = round(float(gross_sale_val * Decimal(str(mp_slab.dealer_percentage))), 2) if mp_slab else 0.0
@@ -700,15 +717,12 @@ async def create_order(
             source
         )
         
-        await db.execute(
-            sql_insert(OrderInvoiceModel).values(
-                order_id=new_order_id,
-                dealer_id=item_data["dealer_id"],
-                invoice_number=await TaxService.generate_tax_invoice_number(db),
-                total_amount=final_item_total,
-                tax_amount=tax_data["total_tax"],
-                is_reverse_charge=False
-            )
+        await TaxService.create_order_invoice_with_retry(
+            db=db,
+            order_id=new_order_id,
+            dealer_id=item_data["dealer_id"],
+            total_amount=final_item_total,
+            tax_amount=tax_data["total_tax"]
         )
         
         if tax_data["tax_category_id"]:
