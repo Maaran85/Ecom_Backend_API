@@ -12,6 +12,7 @@ class CustomerUser(Base):
     phone = Column(String, unique=True, index=True, nullable=False)
     is_active = Column(Boolean, default=True)
     otp_code = Column(String, nullable=True)
+    otp_attempts = Column(Integer, default=0, nullable=True)
     dob = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     deleted_at = Column(DateTime(timezone=True), nullable=True)

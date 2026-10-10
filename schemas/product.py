@@ -90,19 +90,19 @@ class ProductBase(BaseModel):
     name: str
     description: Optional[str] = None
     sku: Optional[str] = None
-    dealer_price: float
+    dealer_price: Optional[float] = None
     selling_price: Optional[float] = None
     mrp: Optional[float] = None
     discount_price: Optional[float] = None
     tax_perc: Optional[float] = None
     tax_price: Optional[float] = None
     stock: int = 0
-    category_id: int
+    category_id: Optional[int] = None
     dealer_id: Optional[UUID] = None
-    images: List[str]
+    images: Optional[List[str]] = None
     subcategory_id: Optional[int] = None
     brand_id: Optional[int] = None
-    hsn_code: str
+    hsn_code: Optional[str] = None
     tax_category_id: Optional[int] = None
     discount_percentage: Optional[int] = None
     average_rating: Optional[float] = None
@@ -134,6 +134,10 @@ class ChildProductCreate(BaseModel):
     dealer_price: Optional[float] = None
     selling_price: Optional[float] = None
     mrp: Optional[float] = None
+    tax_perc: Optional[float] = None
+    tax_price: Optional[float] = None
+    discount_price: Optional[float] = None
+    discount_percentage: Optional[int] = None
     price_adjustment: Optional[float] = 0.0 # Kept for UI compatibility
     attributes: dict = {}
     images: Optional[List[str]] = []
@@ -151,6 +155,7 @@ class ProductUpdate(BaseModel):
     discount_price: Optional[float] = None
     tax_perc: Optional[float] = None
     tax_price: Optional[float] = None
+    discount_percentage: Optional[int] = None
     stock: Optional[int] = None
     category_id: Optional[int] = None
     subcategory_id: Optional[int] = None
@@ -165,6 +170,7 @@ class ProductUpdate(BaseModel):
     tax_category_id: Optional[int] = None
     parent_product_id: Optional[UUID] = None
     referral_commission_rate: Optional[float] = None
+    variants: Optional[List[ChildProductCreate]] = None
 
 class Product(ProductBase):
     id: UUID
@@ -177,3 +183,37 @@ class Product(ProductBase):
 
     class Config:
         from_attributes = True
+
+# Deduction & Payout Estimation Schemas
+class FeeDeductionItem(BaseModel):
+    name: str
+    category_key: str
+    percentage: Optional[float] = None
+    base_amount: float
+    tax_rate: float
+    tax_amount: float
+    total_amount: float
+
+class PriceTaxRow(BaseModel):
+    base_price: float
+    tax_rate: float
+    tax_amount: float
+    total_amount: float
+    discount_percentage: Optional[float] = None
+
+class ProductPayoutEstimationRequest(BaseModel):
+    dealer_price: float # Base MRP (Excl Tax)
+    tax_perc: Optional[float] = 12.0
+    discount_percentage: Optional[float] = 0.0
+    selling_price: Optional[float] = None # Base selling price (excl tax)
+    is_self_logistics: Optional[bool] = False
+
+class ProductPayoutEstimationResponse(BaseModel):
+    mrp: PriceTaxRow
+    selling_price: PriceTaxRow
+    discount: PriceTaxRow
+    deductions: List[FeeDeductionItem]
+    total_deductions: float
+    estimated_payout: float
+    disclaimer: str = "This is estimated payment. Final payout will be after deductions and settlement"
+

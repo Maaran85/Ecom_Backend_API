@@ -60,6 +60,8 @@ class User(Base):
     photo_url = Column(String, nullable=True)
     aadhaar_image = Column(String, nullable=True)
     otp_code = Column(String, nullable=True)
+    failed_login_attempts = Column(Integer, default=0, nullable=True)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 

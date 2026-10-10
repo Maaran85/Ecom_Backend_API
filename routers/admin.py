@@ -177,7 +177,7 @@ async def get_pending_approvals(
                 "is_approved": d.is_approved, "profile_status": d.profile_status,
                 "access_status": d.access_status, "created_at": d.created_at,
                 "business_phone": d.business_phone,
-                "city": d.city, "state": d.state, "pincode": d.pincode,
+                "city": d.city, "state": d.state_rel.name if d.state_rel else None, "pincode": d.pincode,
                 "country_id": d.country_id, "country_name": d.country.name if d.country else None,
                 "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
                 "partner_id": d.partner_id,
@@ -195,7 +195,30 @@ async def get_pending_approvals(
             for d in pending_dealers
         ],
         "pending_products": [
-            {"id": str(p.id), "name": p.name, "dealer_id": str(p.dealer_id), "price": p.dealer_price, "mrp": p.mrp, "created_at": p.created_at}
+            {
+                "id": str(p.id),
+                "name": p.name,
+                "dealer_id": str(p.dealer_id),
+                "dealer_price": p.dealer_price,
+                "selling_price": p.selling_price,
+                "price": p.selling_price or p.dealer_price,
+                "mrp": p.mrp,
+                "tax_perc": p.tax_perc,
+                "tax_price": p.tax_price,
+                "discount_price": p.discount_price,
+                "discount_percentage": p.discount_percentage,
+                "hsn_code": p.hsn_code,
+                "category_id": p.category_id,
+                "subcategory_id": p.subcategory_id,
+                "brand_id": p.brand_id,
+                "is_returnable": p.is_returnable,
+                "return_window_days": p.return_window_days,
+                "is_exchangeable": p.is_exchangeable,
+                "return_policy_note": p.return_policy_note,
+                "estimated_delivery_days": p.estimated_delivery_days,
+                "is_approved": p.is_approved,
+                "created_at": p.created_at
+            }
             for p in pending_products
         ]
     }
@@ -637,16 +660,45 @@ async def list_all_products(
     db: AsyncSession = Depends(get_db)
 ):
     """List all products (admin only)"""
-    from sqlalchemy.orm import selectinload
-    query = select(Product).options(selectinload(Product.dealer))
+    from sqlalchemy.orm import selectinload, joinedload
+    query = select(Product).options(selectinload(Product.dealer), joinedload(Product.brand))
     if dealer_id: query = query.where(Product.dealer_id == dealer_id)
+    query = query.order_by(Product.id.desc())
     result = await db.execute(query.offset(skip).limit(limit))
     products = result.scalars().all()
     return [
         {
-            "id": p.id, "name": p.name, "price": p.selling_price or p.dealer_price, "mrp": p.mrp, "stock": getattr(p, 'stock', 0),
-            "dealer_id": p.dealer_id, "dealer_name": p.dealer.business_name if p.dealer else None,
-            "is_approved": p.is_approved, "created_at": p.created_at
+            "id": p.id,
+            "name": p.name,
+            "dealer_price": p.dealer_price,
+            "selling_price": p.selling_price,
+            "price": p.selling_price or p.dealer_price,
+            "mrp": p.mrp,
+            "tax_perc": p.tax_perc,
+            "tax_price": p.tax_price,
+            "discount_price": p.discount_price,
+            "discount_percentage": p.discount_percentage,
+            "stock": getattr(p, 'stock', 0),
+            "dealer_id": p.dealer_id,
+            "dealer_name": p.dealer.business_name if p.dealer else None,
+            "category_id": p.category_id,
+            "subcategory_id": p.subcategory_id,
+            "brand_id": p.brand_id,
+            "brand_name": p.brand.name if p.brand else None,
+            "brand": {
+                "id": p.brand.id,
+                "name": p.brand.name,
+                "logo_url": p.brand.logo_url,
+                "is_active": p.brand.is_active
+            } if p.brand else None,
+            "hsn_code": p.hsn_code,
+            "is_returnable": p.is_returnable,
+            "return_window_days": p.return_window_days,
+            "is_exchangeable": p.is_exchangeable,
+            "return_policy_note": p.return_policy_note,
+            "estimated_delivery_days": p.estimated_delivery_days,
+            "is_approved": p.is_approved,
+            "created_at": p.created_at
         } for p in products
     ]
 
@@ -763,7 +815,7 @@ async def approve_product(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Approve a product (admin only)"""
+    """Approve a product and its variants (admin only)"""
     result = await db.execute(select(Product).where(Product.id == product_id))
     product = result.scalar_one_or_none()
     
@@ -773,6 +825,13 @@ async def approve_product(
     product.is_approved = True
     product_name = product.name
     product_id = product.id
+
+    # Cascade approval to child variants
+    await db.execute(
+        update(Product)
+        .where(Product.parent_product_id == product.id)
+        .values(is_approved=True)
+    )
     
     await db.commit()
     
@@ -788,7 +847,7 @@ async def reject_product(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Reject a product (admin only)"""
+    """Reject a product and its variants (admin only)"""
     from datetime import datetime
     result = await db.execute(select(Product).where(Product.id == product_id))
     product = result.scalar_one_or_none()
@@ -805,6 +864,16 @@ async def reject_product(
         "reason": payload.reason
     })
     product.reject_reasons = current_reasons
+
+    # Cascade rejection to child variants
+    await db.execute(
+        update(Product)
+        .where(Product.parent_product_id == product.id)
+        .values(
+            is_approved=False,
+            reject_reasons=product.reject_reasons
+        )
+    )
     
     product_name = product.name
     product_id = product.id

@@ -336,6 +336,8 @@ async def mark_settlement_paid(
 ) -> Settlement:
     """APPROVED -> PAID. Records the actual payment against the remittance."""
     assert_transition(settlement.status, SettlementStatus.PAID)
+    if not getattr(settlement, "is_l2_approved", False):
+        raise ValueError("Settlement requires L2 Backoffice approval before marking paid")
     if settlement.remittance_id is None:
         raise ValueError("Settlement has no remittance record; approve it first")
 

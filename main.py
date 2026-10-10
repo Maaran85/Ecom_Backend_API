@@ -30,7 +30,14 @@ from b2b_auction.routers import router as b2b_auction_router, product_router as 
 
 app = FastAPI(title=settings.PROJECT_NAME)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+@app.exception_handler(RateLimitExceeded)
+async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": f"Rate limit exceeded: {exc.detail}. Please try again shortly."}
+    )
+
 app.add_middleware(SlowAPIMiddleware)
 
 from fastapi.encoders import jsonable_encoder
@@ -151,8 +158,20 @@ async def startup_event():
             await conn.execute(text("ALTER TABLE categories ADD COLUMN IF NOT EXISTS referral_commission_rate DOUBLE PRECISION;"))
             await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet_amount_used DOUBLE PRECISION DEFAULT 0.0;"))
             await conn.execute(text("ALTER TABLE dealers ADD COLUMN IF NOT EXISTS organization_type VARCHAR;"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS order_item_id INTEGER REFERENCES order_items(id);"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS complaint_reason VARCHAR(255);"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS escalation_reason VARCHAR(255);"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS investigation_request TEXT;"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_department VARCHAR(50);"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS root_cause_analysis TEXT;"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS action_taken TEXT;"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS device_info JSON;"))
+            await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS exceptional_refund_approved BOOLEAN DEFAULT FALSE;"))
+            await conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS is_l2_approved BOOLEAN DEFAULT FALSE;"))
+            await conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS l2_approved_by INTEGER REFERENCES users(id);"))
+            await conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS l2_approved_at TIMESTAMP WITH TIME ZONE;"))
             await conn.run_sync(Base.metadata.create_all)
-        print("INFO: Successfully verified/created referral tables, wallet_transactions, orders.wallet_amount_used and dealers.organization_type columns.")
+        print("INFO: Successfully verified/created support_ticket complaint fields, settlement L2 fields, referral tables, and wallet_transactions.")
     except Exception as e:
         print(f"WARNING: Schema auto-migration on startup encountered: {e}")
 

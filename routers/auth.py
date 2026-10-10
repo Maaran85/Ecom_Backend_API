@@ -7,6 +7,7 @@ from pydantic import BaseModel
 import random
 import re
 
+from datetime import datetime, timezone, timedelta
 from core.database import get_db
 from core.security import create_access_token, verify_password, get_password_hash
 from core.permissions import get_current_active_user
@@ -14,6 +15,16 @@ from schemas.auth import Token, LoginRequest
 from schemas.user import UserCreate, User
 from models.user import User as UserModel, UserRole
 from models.customer_user import CustomerUser as CustomerUserModel
+
+def is_account_locked(locked_until: Optional[datetime]) -> bool:
+    if not locked_until:
+        return False
+    now = datetime.now(timezone.utc)
+    if locked_until.tzinfo is None:
+        locked_dt = locked_until.replace(tzinfo=timezone.utc)
+    else:
+        locked_dt = locked_until
+    return locked_dt > now
 from schemas.customer import Customer as CustomerSchema, CustomerLoginRequest, CustomerOTPVerify
 from schemas.dealer import DealerSelfRegistration
 from models.dealer import Dealer as DealerModel
@@ -53,7 +64,7 @@ async def register(request: Request, user_in: UserCreate, db: AsyncSession = Dep
     return db_user
 
 @router.post("/login")
-@limiter.limit("5/minute")
+@limiter.limit("60/minute")
 async def login(request: Request, login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     """Staff Login"""
     from sqlalchemy.orm import selectinload
@@ -67,8 +78,36 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
         .where(or_(UserModel.email == login_data.identifier, UserModel.phone == login_data.identifier)).order_by(UserModel.is_active.desc()).limit(1)
     )
     user = result.scalar_one_or_none()
-    if not user or not verify_password(login_data.password, user.password_hash):
+    if not user:
         raise HTTPException(status_code=401, detail="Incorrect credentials")
+    
+    # 1. Check account lockout BEFORE password authentication
+    if is_account_locked(user.locked_until):
+        raise HTTPException(
+            status_code=403, 
+            detail="Account is temporarily locked due to multiple failed login attempts. Please retry after 1 minute."
+        )
+    elif user.locked_until and not is_account_locked(user.locked_until):
+        # Lockout expired -> reset lock and failed attempts
+        user.locked_until = None
+        user.failed_login_attempts = 0
+
+    # 2. Verify password
+    if not verify_password(login_data.password, user.password_hash):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+        if user.failed_login_attempts >= 3:
+            user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=1)
+            user.failed_login_attempts = 0
+            await db.commit()
+            raise HTTPException(
+                status_code=403, 
+                detail="Account is temporarily locked due to multiple failed login attempts. Please retry after 1 minute."
+            )
+        else:
+            await db.commit()
+            raise HTTPException(status_code=401, detail="Incorrect credentials")
+
+    # 3. Check user roles and active status
     if user.role == UserRole.CUSTOMER:
          raise HTTPException(status_code=403, detail="Customers must use OTP login")
     if not user.is_active:
@@ -85,7 +124,13 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             raise HTTPException(status_code=403, detail="Dealer account is temporarily locked")
         if user.dealer.partner and not getattr(user.dealer.partner, 'is_active', True):
             raise HTTPException(status_code=403, detail="Associated partner account is inactive")
-    
+
+    # 4. Clear failed attempts and lock on successful login
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    await db.commit()
+    await db.refresh(user)
+
     access_token = create_access_token(data={"sub": user.email or user.phone, "role": user.role.value, "is_customer": False})
     return {"access_token": access_token, "token_type": "bearer", "user": user}
 
@@ -111,12 +156,14 @@ async def customer_register_request(request: Request, data: CustomerLoginRequest
             phone=data.identifier,
             full_name="Pending", # Temporary
             is_active=False,
-            otp_code=otp
+            otp_code=otp,
+            otp_attempts=0
         )
         db.add(customer)
     else:
         # Update OTP for existing pending record
         customer.otp_code = otp
+        customer.otp_attempts = 0
     
     await db.commit()
 
@@ -150,19 +197,33 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
             customer = CustomerUserModel(
                 phone=data.identifier,
                 full_name=data.full_name,
-                is_active=True
+                is_active=True,
+                otp_attempts=0
             )
             db.add(customer)
             await db.flush()
         else:
-            raise HTTPException(status_code=400, detail="Invalid OTP code. Please request a new OTP.")
-    elif not is_test_otp and data.otp != customer.otp_code:
-        raise HTTPException(status_code=400, detail="Invalid OTP code")
+            raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
+    else:
+        if not customer.otp_code and not is_test_otp:
+            raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
+
+        if not is_test_otp and data.otp != customer.otp_code:
+            customer.otp_attempts = (customer.otp_attempts or 0) + 1
+            if customer.otp_attempts >= 3:
+                customer.otp_code = None
+                customer.otp_attempts = 0
+                await db.commit()
+                raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
+            else:
+                await db.commit()
+                raise HTTPException(status_code=400, detail="Invalid OTP code")
     
     # Complete registration
     customer.full_name = data.full_name
     customer.is_active = True
     customer.otp_code = None
+    customer.otp_attempts = 0
     
     await db.flush()
     customer_id = int(customer.id)
@@ -224,6 +285,7 @@ async def customer_login_request(data: CustomerLoginRequest, db: AsyncSession = 
     
     otp = str(random.randint(100000, 999999))
     customer.otp_code = otp
+    customer.otp_attempts = 0
     email_to = customer.email
     phone_to = customer.phone
     await db.commit()
@@ -244,17 +306,41 @@ async def customer_login_verify(data: CustomerOTPVerify, db: AsyncSession = Depe
         )
     )
     customer = result.scalar_one_or_none()
-    if not customer or (data.otp != "123456" and data.otp != customer.otp_code):
+    if not customer:
         raise HTTPException(status_code=400, detail="Invalid OTP")
     
+    is_test_otp = data.otp == "123456"
+    if not customer.otp_code and not is_test_otp:
+        raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
+
+    if not is_test_otp and data.otp != customer.otp_code:
+        customer.otp_attempts = (customer.otp_attempts or 0) + 1
+        if customer.otp_attempts >= 3:
+            customer.otp_code = None
+            customer.otp_attempts = 0
+            await db.commit()
+            raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
+        else:
+            await db.commit()
+            raise HTTPException(status_code=400, detail="Invalid OTP")
+    
     customer.otp_code = None
+    customer.otp_attempts = 0
     await db.commit()
     await db.refresh(customer)
     access_token = create_access_token(data={"sub": data.identifier, "is_customer": True})
     return {
         "access_token": access_token, 
         "token_type": "bearer", 
-        "user": CustomerSchema.model_validate(customer)
+        "user": CustomerSchema(
+            id=customer.id,
+            full_name=customer.full_name,
+            email=customer.email,
+            phone=customer.phone,
+            dob=customer.dob,
+            is_active=customer.is_active,
+            created_at=customer.created_at or datetime.now(timezone.utc)
+        )
     }
 
 @router.get("/me")

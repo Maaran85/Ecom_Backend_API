@@ -398,6 +398,37 @@ async def approve_settlement_endpoint(
     return settlement
 
 
+@router.post("/admin/settlements/{settlement_id}/l2-approve", response_model=SettlementOut)
+async def l2_approve_settlement_endpoint(
+    settlement_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """L2 Approval step for senior Finance Specialist / Admin"""
+    if current_user.role not in [UserRole.PARTNER_FINANCE_SPECIALIST, UserRole.ADMIN, UserRole.SUPER_ADMIN]:
+        raise HTTPException(status_code=403, detail="Only Finance Specialists or Admins can perform L2 settlement approval")
+    settlement = await _load_settlement(db, settlement_id)
+    if not settlement:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+    if settlement.status != SettlementStatus.APPROVED:
+        raise HTTPException(status_code=400, detail=f"Settlement must be in APPROVED (L1) status before L2 approval. Current: {settlement.status.value}")
+    if settlement.is_l2_approved:
+        raise HTTPException(status_code=400, detail="Settlement is already L2 approved")
+    
+    settlement.is_l2_approved = True
+    settlement.l2_approved_by = current_user.id
+    settlement.l2_approved_at = datetime.now(timezone.utc)
+    
+    await log_audit(
+        db, current_user, "L2_APPROVE", "settlement",
+        resource_id=str(settlement.id),
+        new_values={"is_l2_approved": True, "l2_approved_by": current_user.id},
+    )
+    await db.commit()
+    await db.refresh(settlement)
+    return settlement
+
+
 @router.post("/admin/settlements/{settlement_id}/paid", response_model=SettlementOut)
 async def mark_settlement_paid_endpoint(
     settlement_id: int,
@@ -408,13 +439,16 @@ async def mark_settlement_paid_endpoint(
     settlement = await _load_settlement(db, settlement_id)
     if not settlement:
         raise HTTPException(status_code=404, detail="Settlement not found")
-    settlement = await mark_settlement_paid(
-        db, settlement, admin,
-        reference_no=req.reference_no,
-        payment_method=req.payment_method,
-        payment_date=req.payment_date,
-        notes=req.notes,
-    )
+    try:
+        settlement = await mark_settlement_paid(
+            db, settlement, admin,
+            reference_no=req.reference_no,
+            payment_method=req.payment_method,
+            payment_date=req.payment_date,
+            notes=req.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     await log_audit(
         db, admin, "PAID", "settlement",
         resource_id=str(settlement.id),

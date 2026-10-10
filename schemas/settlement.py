@@ -98,6 +98,9 @@ class SettlementOut(BaseModel):
     generated_at: Optional[datetime]
     approved_at: Optional[datetime]
     approved_by: Optional[int]
+    is_l2_approved: bool = False
+    l2_approved_at: Optional[datetime] = None
+    l2_approved_by: Optional[int] = None
     paid_at: Optional[datetime]
     paid_by: Optional[int]
     cancelled_at: Optional[datetime]
@@ -128,6 +131,8 @@ class SettlementSummaryOut(BaseModel):
     total_tds: float
     net_payable: float
     item_count: int = 0
+    is_l2_approved: bool = False
+    l2_approved_at: Optional[datetime] = None
     generated_at: Optional[datetime]
     paid_at: Optional[datetime]
     created_at: Optional[datetime]

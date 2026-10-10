@@ -67,6 +67,15 @@ class SupportTicket(Base):
     attachments = Column(JSON, nullable=True, default=list)
     
     assigned_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    order_item_id = Column(Integer, ForeignKey("order_items.id"), nullable=True, index=True)
+    complaint_reason = Column(String(255), nullable=True)
+    escalation_reason = Column(String(255), nullable=True)
+    investigation_request = Column(Text, nullable=True)
+    assigned_department = Column(String(50), nullable=True) # dealer, logistics, technology, finance, others
+    root_cause_analysis = Column(Text, nullable=True)
+    action_taken = Column(Text, nullable=True)
+    device_info = Column(JSON, nullable=True)
+    exceptional_refund_approved = Column(Boolean, default=False)
     
     # SLA & Feedback Fields
     escalation_deadline = Column(DateTime, nullable=True)
@@ -77,14 +86,17 @@ class SupportTicket(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
 
     customer = relationship("CustomerUser", backref="tickets")
     dealer = relationship("Dealer", backref="tickets")
     partner = relationship("Partner", backref="tickets")
     order = relationship("Order", backref="tickets")
+    order_item = relationship("OrderItem", backref="tickets", foreign_keys=[order_item_id])
     product = relationship("Product", backref="tickets")
     messages = relationship("TicketMessage", back_populates="ticket", cascade="all, delete-orphan")
     assigned_user = relationship("User", foreign_keys=[assigned_user_id])
+    resolved_by_user = relationship("User", foreign_keys=[resolved_by_user_id])
 
 
 class TicketMessage(Base):
@@ -92,7 +104,7 @@ class TicketMessage(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(Integer, ForeignKey("support_tickets.id"), nullable=False, index=True)
-    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False) # Can be customer, dealer, partner, or superadmin user id
+    sender_id = Column(Integer, nullable=False, index=True) # Can be customer (customer_users.id), dealer, partner, or superadmin (users.id)
     
     message = Column(Text, nullable=False)
     is_internal_note = Column(Boolean, default=False)
@@ -101,4 +113,3 @@ class TicketMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     ticket = relationship("SupportTicket", back_populates="messages")
-    sender = relationship("User", foreign_keys=[sender_id])

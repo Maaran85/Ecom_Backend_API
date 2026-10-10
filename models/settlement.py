@@ -58,6 +58,9 @@ class Settlement(Base):
     generated_at = Column(DateTime(timezone=True), nullable=True)
     approved_at = Column(DateTime(timezone=True), nullable=True)
     approved_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_l2_approved = Column(Boolean, default=False, nullable=False)
+    l2_approved_at = Column(DateTime(timezone=True), nullable=True)
+    l2_approved_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     paid_at = Column(DateTime(timezone=True), nullable=True)
     paid_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
@@ -81,6 +84,7 @@ class Settlement(Base):
         foreign_keys="SettlementAdjustment.settlement_id",
     )
     approver = relationship("User", foreign_keys=[approved_by])
+    l2_approver = relationship("User", foreign_keys=[l2_approved_by])
     payer = relationship("User", foreign_keys=[paid_by])
     canceller = relationship("User", foreign_keys=[cancelled_by])
     remittance = relationship("DealerRemittance")

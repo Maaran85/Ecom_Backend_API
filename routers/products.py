@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,9 +16,11 @@ from core.database import get_db
 gst_logger = logging.getLogger("gst")
 from schemas.product import (
     Product, ProductCreate, ProductUpdate, Brand, BrandCreate, BrandUpdate,
-    Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate
+    Category, CategoryCreate, CategoryUpdate, CategoryAttribute, CategoryAttributeCreate, CategoryAttributeUpdate,
+    FeeDeductionItem, PriceTaxRow, ProductPayoutEstimationRequest, ProductPayoutEstimationResponse
 )
 from models.product import Product as ProductModel, Category as CategoryModel, CategoryAttribute as CategoryAttributeModel, Brand as BrandModel, SubcategoryBrand
+from models.tax import TaxCategory as TaxCategoryModel
 from models.search_history import SearchHistory as SearchHistoryModel
 from models.user import UserRole
 from models.dealer import Dealer as DealerModel
@@ -32,9 +35,50 @@ from core.permissions import (
 from models.customer_user import CustomerUser
 from services.file_upload import FileUploadService as UploadService
 from services.recommendation import RecommendationService
+from services.fee_service import get_applicable_slab
 from models.user import User
 
 router = APIRouter()
+
+async def get_category_descendant_ids(category_id: int, db: AsyncSession) -> List[int]:
+    """Get all descendant category IDs (including the category itself) dynamically."""
+    res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id))
+    all_cats = res.all()
+    children_map: dict = {}
+    for cid, pid in all_cats:
+        if pid not in children_map:
+            children_map[pid] = []
+        children_map[pid].append(cid)
+    
+    stack = [category_id]
+    visited = set()
+    descendants = []
+    while stack:
+        curr = stack.pop()
+        if curr in visited:
+            continue
+        visited.add(curr)
+        descendants.append(curr)
+        for child_id in children_map.get(curr, []):
+            stack.append(child_id)
+            
+    return descendants
+
+async def get_category_ancestor_ids(category_id: int, db: AsyncSession) -> List[int]:
+    """Get all ancestor category IDs (including the category itself) dynamically."""
+    res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id))
+    all_cats = res.all()
+    parent_map = {cid: pid for cid, pid in all_cats}
+    
+    ancestors = []
+    curr = category_id
+    visited = set()
+    while curr is not None and curr not in visited:
+        visited.add(curr)
+        ancestors.append(curr)
+        curr = parent_map.get(curr)
+        
+    return ancestors
 
 # Category endpoints
 @router.post("/categories", response_model=Category, tags=["categories"])
@@ -180,8 +224,12 @@ async def get_category_products(
     db: AsyncSession = Depends(get_db)
 ):
     """Get products in a category with filters"""
+    descendant_ids = await get_category_descendant_ids(category_id, db)
     query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
-        ProductModel.category_id == category_id,
+        or_(
+            ProductModel.category_id.in_(descendant_ids),
+            ProductModel.subcategory_id.in_(descendant_ids)
+        ),
         ProductModel.is_deleted == False,
         DealerModel.access_status == 'active',
         DealerModel.is_active == True, DealerModel.is_deleted == False,
@@ -486,12 +534,29 @@ async def create_product(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Create a new product with mandatory attribute validation"""
-    
+    # If parent_product_id is provided, inherit category_id if omitted
+    parent_obj = None
+    if product_in.parent_product_id:
+        parent_res = await db.execute(select(ProductModel).where(ProductModel.id == product_in.parent_product_id))
+        parent_obj = parent_res.scalar_one_or_none()
+        if parent_obj and product_in.category_id is None:
+            product_in.category_id = parent_obj.category_id
+
     # Validate category exists
+    if product_in.category_id is None:
+        raise HTTPException(status_code=400, detail="Category ID is required")
     cat_result = await db.execute(select(CategoryModel).where(CategoryModel.id == product_in.category_id))
     if not cat_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Category not found")
+
+    # Validate subcategory belongs to category hierarchy if provided
+    if product_in.subcategory_id:
+        descendants = await get_category_descendant_ids(product_in.category_id, db)
+        if product_in.subcategory_id not in descendants:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected subcategory does not belong to the selected category hierarchy"
+            )
 
     # Fetch mandatory attributes (including from parents and their spec groups)
     start_id = product_in.subcategory_id if product_in.subcategory_id else product_in.category_id
@@ -541,6 +606,10 @@ async def create_product(
     if product_data.get("sku") == "":
         product_data["sku"] = None
         
+    if product_data.get("brand_id") == -1:
+        other_brand = await get_or_create_other_brand(db)
+        product_data["brand_id"] = other_brand.id
+
     variants_data = product_data.pop("variants", [])
     
     db_product = ProductModel(**product_data)
@@ -563,6 +632,61 @@ async def create_product(
         else:
              raise HTTPException(status_code=400, detail="Dealer ID is required for product creation.")
 
+    # Inherit from parent product if creating a child product directly
+    if db_product.parent_product_id:
+        if not parent_obj:
+            parent_res = await db.execute(select(ProductModel).where(ProductModel.id == db_product.parent_product_id))
+            parent_obj = parent_res.scalar_one_or_none()
+        if parent_obj:
+            if db_product.category_id is None:
+                db_product.category_id = parent_obj.category_id
+            if db_product.dealer_price is None or db_product.dealer_price == 0:
+                db_product.dealer_price = parent_obj.dealer_price
+            if db_product.mrp is None or db_product.mrp == 0:
+                db_product.mrp = parent_obj.mrp
+            if db_product.selling_price is None or db_product.selling_price == 0:
+                db_product.selling_price = parent_obj.selling_price
+            if db_product.discount_price is None or db_product.discount_price == 0:
+                db_product.discount_price = parent_obj.discount_price
+            if db_product.tax_category_id is None:
+                db_product.tax_category_id = parent_obj.tax_category_id
+            if db_product.tax_perc is None:
+                db_product.tax_perc = parent_obj.tax_perc
+            if db_product.discount_percentage is None:
+                db_product.discount_percentage = parent_obj.discount_percentage
+            if db_product.is_approved is None:
+                db_product.is_approved = parent_obj.is_approved
+            if not db_product.hsn_code:
+                db_product.hsn_code = parent_obj.hsn_code
+            if not db_product.images:
+                db_product.images = parent_obj.images or ["https://via.placeholder.com/300"]
+            if not db_product.brand_id:
+                db_product.brand_id = parent_obj.brand_id
+    else:
+        if db_product.dealer_price is None:
+            raise HTTPException(status_code=400, detail="Dealer price is required for products.")
+        if not db_product.hsn_code:
+            raise HTTPException(status_code=400, detail="HSN code is required for products.")
+        if not db_product.images:
+            db_product.images = ["https://via.placeholder.com/300"]
+
+    # Resolve tax_perc from TaxCategory if tax_category_id is provided and tax_perc is None
+    if db_product.tax_category_id is not None and db_product.tax_perc is None:
+        tc_res = await db.execute(select(TaxCategoryModel).where(TaxCategoryModel.id == db_product.tax_category_id))
+        tc = tc_res.scalar_one_or_none()
+        if tc:
+            db_product.tax_perc = tc.igst_rate or (tc.cgst_rate + tc.sgst_rate)
+
+    # Calculate parent price/tax fields if not fully provided
+    if db_product.tax_perc is not None and db_product.tax_price is None and db_product.dealer_price is not None:
+        db_product.tax_price = round(db_product.dealer_price * (db_product.tax_perc / 100.0), 2)
+    if db_product.mrp is None and db_product.dealer_price is not None:
+        db_product.mrp = round(db_product.dealer_price + (db_product.tax_price or 0.0), 2)
+    if db_product.discount_percentage is not None and db_product.selling_price is None:
+        db_product.selling_price = round((db_product.mrp or db_product.dealer_price) * (1.0 - db_product.discount_percentage / 100.0), 2)
+    if db_product.discount_price is None and db_product.mrp is not None and db_product.selling_price is not None:
+        db_product.discount_price = round(db_product.mrp - db_product.selling_price, 2)
+
     db.add(db_product)
     await db.flush() # Get product ID without committing
     
@@ -573,10 +697,54 @@ async def create_product(
                 detail="Cannot create variants because the category does not have any variant keys defined."
             )
         for v_data in variants_data:
-            # Backwards compatibility for price calculation
+            # 1. Child dealer price (base price excl tax)
             child_price = v_data.get("dealer_price")
             if child_price is None:
-                child_price = db_product.dealer_price + v_data.get("price_adjustment", 0.0)
+                price_adj = v_data.get("price_adjustment", 0.0) or 0.0
+                child_price = round(db_product.dealer_price + price_adj, 2)
+            else:
+                child_price = round(float(child_price), 2)
+
+            # 2. Child tax_perc and tax_price
+            child_tax_perc = v_data.get("tax_perc") if v_data.get("tax_perc") is not None else db_product.tax_perc
+            child_tax_price = v_data.get("tax_price")
+            if child_tax_price is None and child_tax_perc is not None and child_price is not None:
+                child_tax_price = round(child_price * (child_tax_perc / 100.0), 2)
+            elif child_tax_price is not None:
+                child_tax_price = round(float(child_tax_price), 2)
+
+            # 3. Child MRP (incl tax)
+            child_mrp = v_data.get("mrp")
+            if child_mrp is None:
+                if child_price is not None and child_tax_price is not None:
+                    child_mrp = round(child_price + child_tax_price, 2)
+                elif child_price is not None and child_tax_perc is not None:
+                    child_mrp = round(child_price * (1.0 + child_tax_perc / 100.0), 2)
+                else:
+                    child_mrp = child_price
+            else:
+                child_mrp = round(float(child_mrp), 2)
+
+            # 4. Child discount percentage and selling price
+            child_discount_pct = v_data.get("discount_percentage") if v_data.get("discount_percentage") is not None else db_product.discount_percentage
+            child_selling_price = v_data.get("selling_price")
+            if child_selling_price is None:
+                if child_discount_pct is not None and child_discount_pct > 0 and child_mrp is not None:
+                    child_selling_price = round(child_mrp * (1.0 - child_discount_pct / 100.0), 2)
+                elif db_product.selling_price is not None and db_product.mrp and child_mrp is not None and db_product.mrp > 0:
+                    discount_ratio = (db_product.mrp - db_product.selling_price) / db_product.mrp
+                    child_selling_price = round(child_mrp * (1.0 - discount_ratio), 2)
+                else:
+                    child_selling_price = child_mrp
+            else:
+                child_selling_price = round(float(child_selling_price), 2)
+
+            # 5. Child discount price (amount saved)
+            child_discount_price = v_data.get("discount_price")
+            if child_discount_price is None and child_mrp is not None and child_selling_price is not None:
+                child_discount_price = round(child_mrp - child_selling_price, 2)
+            elif child_discount_price is not None:
+                child_discount_price = round(float(child_discount_price), 2)
                 
             # Merge parent and child attributes
             parent_attrs = db_product.attributes or {}
@@ -591,9 +759,14 @@ async def create_product(
                 description=db_product.description,
                 sku=v_data.get("sku"),
                 dealer_price=child_price,
-                selling_price=db_product.selling_price,
+                selling_price=child_selling_price,
+                mrp=child_mrp,
+                tax_perc=child_tax_perc,
+                tax_price=child_tax_price,
+                discount_price=child_discount_price,
+                discount_percentage=child_discount_pct,
                 category_id=db_product.category_id,
-                subcategory=db_product.subcategory,
+                subcategory_id=db_product.subcategory_id,
                 brand_id=db_product.brand_id,
                 dealer_id=db_product.dealer_id,
                 is_approved=db_product.is_approved,
@@ -659,7 +832,24 @@ async def update_product(
     if update_data.get("sku") == "":
         update_data["sku"] = None
         
+    if update_data.get("brand_id") == -1:
+        other_brand = await get_or_create_other_brand(db)
+        update_data["brand_id"] = other_brand.id
+    elif "brand_id" in update_data and update_data["brand_id"] is None and db_product.brand_id is not None:
+        update_data.pop("brand_id")
+
     variants_data = update_data.pop("variants", None)
+
+    # Validate subcategory belongs to category hierarchy if provided/updated
+    target_category_id = update_data.get("category_id", db_product.category_id)
+    target_subcategory_id = update_data.get("subcategory_id", db_product.subcategory_id)
+    if target_subcategory_id and target_category_id:
+        descendants = await get_category_descendant_ids(target_category_id, db)
+        if target_subcategory_id not in descendants:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected subcategory does not belong to the selected category hierarchy"
+            )
     
     # We should validate mandatory attributes if they are being updated
     variant_attributes = []
@@ -713,6 +903,20 @@ async def update_product(
             db_product.id, old_tax_category_id, db_product.tax_category_id,
             db_product.tax_rule_id or "NULL"
         )
+        if db_product.tax_category_id is not None and "tax_perc" not in update_data:
+            tc_res = await db.execute(select(TaxCategoryModel).where(TaxCategoryModel.id == db_product.tax_category_id))
+            tc = tc_res.scalar_one_or_none()
+            if tc:
+                db_product.tax_perc = tc.igst_rate or (tc.cgst_rate + tc.sgst_rate)
+
+    # Recalculate parent price/tax fields if needed
+    if db_product.tax_perc is not None and db_product.dealer_price is not None:
+        db_product.tax_price = round(db_product.dealer_price * (db_product.tax_perc / 100.0), 2)
+        if db_product.mrp is None or "dealer_price" in update_data or "tax_category_id" in update_data:
+            db_product.mrp = round(db_product.dealer_price + db_product.tax_price, 2)
+        if db_product.discount_percentage is not None:
+            db_product.selling_price = round(db_product.mrp * (1.0 - db_product.discount_percentage / 100.0), 2)
+            db_product.discount_price = round(db_product.mrp - db_product.selling_price, 2)
 
     if variants_data is not None:
         if variants_data and not variant_attributes:
@@ -720,13 +924,63 @@ async def update_product(
                 status_code=400,
                 detail="Cannot create variants because the category does not have any variant keys defined."
             )
-        # Simple implementation: Delete existing children and insert new ones
+        # Delete existing children and insert new ones
         await db.execute(ProductModel.__table__.delete().where(ProductModel.parent_product_id == db_product.id))
         
         for v_data in variants_data:
+            # 1. Child dealer price (base price excl tax)
             child_price = v_data.get("dealer_price")
             if child_price is None:
-                child_price = db_product.dealer_price + v_data.get("price_adjustment", 0.0)
+                price_adj = v_data.get("price_adjustment", 0.0) or 0.0
+                child_price = round(db_product.dealer_price + price_adj, 2)
+            else:
+                child_price = round(float(child_price), 2)
+
+            # 2. Child tax_perc and tax_price
+            child_tax_perc = v_data.get("tax_perc") if v_data.get("tax_perc") is not None else db_product.tax_perc
+            if child_tax_perc is None and db_product.tax_category_id:
+                tc_res = await db.execute(select(TaxCategoryModel).where(TaxCategoryModel.id == db_product.tax_category_id))
+                tc = tc_res.scalar_one_or_none()
+                if tc:
+                    child_tax_perc = tc.igst_rate or (tc.cgst_rate + tc.sgst_rate)
+            child_tax_price = v_data.get("tax_price")
+            if child_tax_price is None and child_tax_perc is not None and child_price is not None:
+                child_tax_price = round(child_price * (child_tax_perc / 100.0), 2)
+            elif child_tax_price is not None:
+                child_tax_price = round(float(child_tax_price), 2)
+
+            # 3. Child MRP (incl tax)
+            child_mrp = v_data.get("mrp")
+            if child_mrp is None:
+                if child_price is not None and child_tax_price is not None:
+                    child_mrp = round(child_price + child_tax_price, 2)
+                elif child_price is not None and child_tax_perc is not None:
+                    child_mrp = round(child_price * (1.0 + child_tax_perc / 100.0), 2)
+                else:
+                    child_mrp = child_price
+            else:
+                child_mrp = round(float(child_mrp), 2)
+
+            # 4. Child discount percentage and selling price
+            child_discount_pct = v_data.get("discount_percentage") if v_data.get("discount_percentage") is not None else db_product.discount_percentage
+            child_selling_price = v_data.get("selling_price")
+            if child_selling_price is None:
+                if child_discount_pct is not None and child_discount_pct > 0 and child_mrp is not None:
+                    child_selling_price = round(child_mrp * (1.0 - child_discount_pct / 100.0), 2)
+                elif db_product.selling_price is not None and db_product.mrp and child_mrp is not None and db_product.mrp > 0:
+                    discount_ratio = (db_product.mrp - db_product.selling_price) / db_product.mrp
+                    child_selling_price = round(child_mrp * (1.0 - discount_ratio), 2)
+                else:
+                    child_selling_price = child_mrp
+            else:
+                child_selling_price = round(float(child_selling_price), 2)
+
+            # 5. Child discount price (amount saved)
+            child_discount_price = v_data.get("discount_price")
+            if child_discount_price is None and child_mrp is not None and child_selling_price is not None:
+                child_discount_price = round(child_mrp - child_selling_price, 2)
+            elif child_discount_price is not None:
+                child_discount_price = round(float(child_discount_price), 2)
                 
             parent_attrs = db_product.attributes or {}
             child_attrs = v_data.get("attributes", {})
@@ -740,7 +994,12 @@ async def update_product(
                 description=db_product.description,
                 sku=v_data.get("sku"),
                 dealer_price=child_price,
-                selling_price=db_product.selling_price,
+                selling_price=child_selling_price,
+                mrp=child_mrp,
+                tax_perc=child_tax_perc,
+                tax_price=child_tax_price,
+                discount_price=child_discount_price,
+                discount_percentage=child_discount_pct,
                 category_id=db_product.category_id,
                 subcategory_id=db_product.subcategory_id,
                 brand_id=db_product.brand_id,
@@ -813,6 +1072,16 @@ async def delete_product(
     await db.commit()
     return None
 
+async def get_or_create_other_brand(db: AsyncSession) -> BrandModel:
+    res = await db.execute(select(BrandModel).where(func.lower(BrandModel.name) == 'other'))
+    brand = res.scalar_one_or_none()
+    if not brand:
+        brand = BrandModel(name="Other", description="Other / Unlisted Brand", is_active=True)
+        db.add(brand)
+        await db.commit()
+        await db.refresh(brand)
+    return brand
+
 @router.get("/brands", response_model=List[Brand], tags=["products"])
 async def get_brands(
     subcategory_id: Optional[int] = Query(None), 
@@ -820,13 +1089,26 @@ async def get_brands(
     db: AsyncSession = Depends(get_db)
 ):
     """Get all active brands, optionally filtered by subcategory or category"""
+    await get_or_create_other_brand(db)
     query = select(BrandModel).where(BrandModel.is_active == True)
     if subcategory_id:
-        query = query.join(SubcategoryBrand, SubcategoryBrand.brand_id == BrandModel.id).where(SubcategoryBrand.subcategory_id == subcategory_id)
+        family_ids = await get_category_descendant_ids(subcategory_id, db)
+        ancestor_ids = await get_category_ancestor_ids(subcategory_id, db)
+        all_ids = list(set(family_ids + ancestor_ids))
+        query = query.outerjoin(SubcategoryBrand, SubcategoryBrand.brand_id == BrandModel.id).where(
+            or_(
+                SubcategoryBrand.subcategory_id.in_(all_ids),
+                func.lower(BrandModel.name) == 'other'
+            )
+        )
     elif category_id:
-        query = query.join(SubcategoryBrand, SubcategoryBrand.brand_id == BrandModel.id)\
-                     .join(CategoryModel, CategoryModel.id == SubcategoryBrand.subcategory_id)\
-                     .where(CategoryModel.parent_id == category_id)
+        family_ids = await get_category_descendant_ids(category_id, db)
+        query = query.outerjoin(SubcategoryBrand, SubcategoryBrand.brand_id == BrandModel.id).where(
+            or_(
+                SubcategoryBrand.subcategory_id.in_(family_ids),
+                func.lower(BrandModel.name) == 'other'
+            )
+        )
     
     query = query.order_by(BrandModel.name.asc()).distinct()
     result = await db.execute(query)
@@ -913,17 +1195,21 @@ async def delete_brand(
 @router.get("/products", response_model=List[Product], tags=["products"])
 async def get_products(
     response: Response,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=5000),
+    skip: int = 0,
+    limit: int = 100,
     category_id: Optional[int] = None,
-    dealer_id: Optional[UUID] = Query(None),
-    hub_id: Optional[int] = Query(None),
+    subcategory_id: Optional[int] = None,
+    dealer_id: Optional[UUID] = None,
+    hub_id: Optional[int] = None,
     search: Optional[str] = None,
-    is_approved: Optional[bool] = Query(None),
-    include_children: Optional[bool] = Query(False),
+    is_approved: Optional[bool] = None,
+    include_children: Optional[bool] = False,
+    min_discount: Optional[int] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = "asc",
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all products with pagination, search, and category filter"""
+    """Get all products with pagination, search, category, and subcategory filter"""
     query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
         ProductModel.is_deleted == False
     )
@@ -940,15 +1226,25 @@ async def get_products(
             query = query.where(ProductModel.parent_product_id.is_(None))
 
     
-    if category_id:
-        hierarchy = select(CategoryModel.id).where(CategoryModel.id == category_id).cte(name="hierarchy", recursive=True)
-        alias = aliased(CategoryModel)
-        hierarchy = hierarchy.union_all(
-            select(alias.id).where(alias.parent_id == hierarchy.c.id)
-        )
+    if subcategory_id is not None and category_id is not None:
+        subcat_family = await get_category_descendant_ids(subcategory_id, db)
+        cat_family = await get_category_descendant_ids(category_id, db)
+        target_ids = list(set(subcat_family).intersection(set(cat_family)))
         query = query.where(or_(
-            ProductModel.category_id.in_(select(hierarchy.c.id)),
-            ProductModel.subcategory_id.in_(select(hierarchy.c.id))
+            ProductModel.category_id.in_(target_ids),
+            ProductModel.subcategory_id.in_(target_ids)
+        ))
+    elif subcategory_id is not None:
+        subcat_family = await get_category_descendant_ids(subcategory_id, db)
+        query = query.where(or_(
+            ProductModel.category_id.in_(subcat_family),
+            ProductModel.subcategory_id.in_(subcat_family)
+        ))
+    elif category_id is not None:
+        cat_family = await get_category_descendant_ids(category_id, db)
+        query = query.where(or_(
+            ProductModel.category_id.in_(cat_family),
+            ProductModel.subcategory_id.in_(cat_family)
         ))
     
     if dealer_id:
@@ -965,6 +1261,14 @@ async def get_products(
     if is_approved is not None:
         query = query.where(ProductModel.is_approved == is_approved)
         
+    if min_discount is not None:
+        query = query.where(
+            or_(
+                ProductModel.discount_percentage >= min_discount,
+                and_(ProductModel.mrp.isnot(None), ProductModel.mrp > ProductModel.selling_price)
+            )
+        )
+        
     if hub_id:
         query = query.join(ProductInventoryModel, and_(
             ProductModel.id == ProductInventoryModel.product_id,
@@ -977,7 +1281,19 @@ async def get_products(
     total_count = total_result.scalar_one_or_none() or 0
     response.headers["X-Total-Count"] = str(total_count)
     
-    query = query.order_by(ProductModel.created_at.desc())
+    # Sorting
+    if sort_by == "price":
+        query = query.order_by(ProductModel.selling_price.asc() if sort_order == "asc" else ProductModel.selling_price.desc())
+    elif sort_by == "rating":
+        query = query.order_by(ProductModel.average_rating.desc())
+    elif sort_by == "newest":
+        query = query.order_by(ProductModel.created_at.desc())
+    elif sort_by == "discount":
+        query = query.order_by(ProductModel.discount_percentage.desc().nullslast(), ProductModel.created_at.desc())
+    elif sort_by == "name":
+        query = query.order_by(ProductModel.name.asc() if sort_order == "asc" else ProductModel.name.desc())
+    else:
+        query = query.order_by(ProductModel.created_at.desc())
     
     query = query.offset(skip).limit(limit).options(
         joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
@@ -1027,7 +1343,8 @@ async def search_products(
     max_price: Optional[float] = None,
     min_rating: Optional[float] = None,
     min_discount: Optional[int] = None,
-    brands: Optional[List[int]] = Query(None),
+    brands: Optional[List[int]] = Query(default=None),
+    colors: Optional[List[str]] = Query(default=None),
     attributes: Optional[str] = None, # JSON string of selected dynamic attribute filters
     in_stock: bool = False,
     include_variants: bool = False,
@@ -1039,7 +1356,6 @@ async def search_products(
     db: AsyncSession = Depends(get_db)
 ):
     """Advanced product search with filters and sorting"""
-    print(f"DEBUG: Search request received. q='{q}', cat={category_id}, user={user}")
     # Save search history if user is logged in and query is provided
     if user and getattr(user, 'is_customer', False) and q:
         history_entry = SearchHistoryModel(customer_id=user.id, query=q)
@@ -1064,33 +1380,27 @@ async def search_products(
         )
         query = query.where(search_filter)
     
-    # Category filter with subcategories (Iterative mapping)
-    if category_id:
-        # Fast, safe memory-level mapping
-        res = await db.execute(select(CategoryModel.id, CategoryModel.parent_id))
-        all_cats = res.all()
-        children_map = {}
-        for cid, pid in all_cats:
-            if pid not in children_map:
-                children_map[pid] = []
-            children_map[pid].append(cid)
-            
-        stack = [category_id]
-        visited = set()
-        while stack:
-            curr = stack.pop()
-            if curr in visited: continue
-            visited.add(curr)
-            for child_id in children_map.get(curr, []):
-                stack.append(child_id)
-                
+    # Category filter with subcategories
+    if subcategory_id is not None and category_id is not None:
+        subcat_family = await get_category_descendant_ids(subcategory_id, db)
+        cat_family = await get_category_descendant_ids(category_id, db)
+        target_ids = list(set(subcat_family).intersection(set(cat_family)))
         query = query.where(or_(
-            ProductModel.category_id.in_(list(visited)),
-            ProductModel.subcategory_id.in_(list(visited))
+            ProductModel.category_id.in_(target_ids),
+            ProductModel.subcategory_id.in_(target_ids)
         ))
-    
-    if subcategory_id is not None:
-        query = query.where(ProductModel.subcategory_id == subcategory_id)
+    elif subcategory_id is not None:
+        subcat_family = await get_category_descendant_ids(subcategory_id, db)
+        query = query.where(or_(
+            ProductModel.category_id.in_(subcat_family),
+            ProductModel.subcategory_id.in_(subcat_family)
+        ))
+    elif category_id is not None:
+        cat_family = await get_category_descendant_ids(category_id, db)
+        query = query.where(or_(
+            ProductModel.category_id.in_(cat_family),
+            ProductModel.subcategory_id.in_(cat_family)
+        ))
         
     # Price range
     if min_price is not None:
@@ -1104,13 +1414,37 @@ async def search_products(
     
     # Discount filter
     if min_discount is not None:
-        query = query.where(ProductModel.discount_percentage >= min_discount)
+        query = query.where(
+            or_(
+                ProductModel.discount_percentage >= min_discount,
+                and_(ProductModel.mrp.isnot(None), ProductModel.mrp > ProductModel.selling_price)
+            )
+        )
 
     # Brand filter (by brand_id)
-    if brands:
+    if brands and isinstance(brands, list):
         query = query.where(ProductModel.brand_id.in_(brands))
     
-    
+    # Color filter (checks ProductModel.attributes and child variant attributes)
+    if colors and isinstance(colors, list):
+        color_clauses = []
+        for c in colors:
+            color_clauses.append(
+                or_(
+                    cast(ProductModel.attributes['Color'], String).ilike(f'%{c}%'),
+                    cast(ProductModel.attributes['Colour'], String).ilike(f'%{c}%'),
+                    ProductModel.name.ilike(f'%{c}%'),
+                    ProductModel.children.any(
+                        or_(
+                            cast(ProductModel.attributes['Color'], String).ilike(f'%{c}%'),
+                            cast(ProductModel.attributes['Colour'], String).ilike(f'%{c}%'),
+                            ProductModel.name.ilike(f'%{c}%')
+                        )
+                    )
+                )
+            )
+        if color_clauses:
+            query = query.where(or_(*color_clauses))
         
     # Dynamic Attributes Filter
     # attributes param comes as JSON string e.g. '{"RAM":["8GB","12GB"],"Storage":["128GB"]}'
@@ -1126,7 +1460,6 @@ async def search_products(
                     child_has_it = ProductModel.children.any(cast(ProductModel.attributes[attr_key], String).in_(formatted_values))
                     query = query.where(or_(parent_has_it, child_has_it))
         except (json.JSONDecodeError, TypeError):
-            print(f"DEBUG: Failed to parse attributes JSON: {attributes}")
             pass
     
     # Stock filter - need to handle inventory
@@ -1141,6 +1474,8 @@ async def search_products(
         query = query.order_by(ProductModel.average_rating.desc())
     elif sort_by == "newest":
         query = query.order_by(ProductModel.created_at.desc())
+    elif sort_by == "discount":
+        query = query.order_by(ProductModel.discount_percentage.desc().nullslast(), ProductModel.created_at.desc())
     elif sort_by == "name":
         query = query.order_by(ProductModel.name.asc() if sort_order == "asc" else ProductModel.name.desc())
     else:
@@ -1411,7 +1746,129 @@ async def get_filter_counts(category_id: int, db: AsyncSession = Depends(get_db)
         if stats:
              result_counts[key] = stats
 
-    return result_counts
+@router.post("/products/estimate-payout", response_model=ProductPayoutEstimationResponse, tags=["products"])
+async def estimate_product_payout(
+    payload: ProductPayoutEstimationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
+):
+    """
+    Computes estimated product price breakdown, platform fee deductions, and dealer net payout.
+    Referral commission is NOT deducted from the dealer.
+    """
+    dealer_price = float(payload.dealer_price)
+    tax_perc = float(payload.tax_perc if payload.tax_perc is not None else 12.0)
+    
+    # Calculate base selling price
+    if payload.selling_price is not None:
+        selling_base = float(payload.selling_price)
+        discount_pct = round(((dealer_price - selling_base) / dealer_price) * 100.0, 2) if dealer_price > 0 else 0.0
+    elif payload.discount_percentage:
+        discount_pct = float(payload.discount_percentage)
+        selling_base = round(dealer_price * (1.0 - discount_pct / 100.0), 2)
+    else:
+        selling_base = dealer_price
+        discount_pct = 0.0
+
+    mrp_tax = round(dealer_price * (tax_perc / 100.0), 2)
+    mrp_total = round(dealer_price + mrp_tax, 2)
+    
+    selling_tax = round(selling_base * (tax_perc / 100.0), 2)
+    selling_total = round(selling_base + selling_tax, 2)
+    
+    discount_base = round(dealer_price - selling_base, 2)
+    discount_tax = round(mrp_tax - selling_tax, 2)
+    discount_total = round(mrp_total - selling_total, 2)
+
+    # Fee Deductions based on active BillingSlabs (or defaults)
+    net_basic_dec = Decimal(str(selling_base))
+    
+    # 1. Marketplace Fee
+    mp_slab = await get_applicable_slab(db, "marketplace", net_basic_dec)
+    mp_pct = float(mp_slab.dealer_percentage) if (mp_slab and mp_slab.dealer_percentage is not None) else 0.005
+    mp_base = round(selling_base * mp_pct, 2)
+    mp_tax = round(mp_base * (tax_perc / 100.0), 2)
+    mp_total = round(mp_base + mp_tax, 2)
+
+    # 2. Marketing Fee
+    mkt_slab = await get_applicable_slab(db, "marketing", net_basic_dec)
+    mkt_pct = float(mkt_slab.dealer_percentage) if (mkt_slab and mkt_slab.dealer_percentage is not None) else 0.005
+    mkt_base = round(selling_base * mkt_pct, 2)
+    mkt_tax = round(mkt_base * (tax_perc / 100.0), 2)
+    mkt_total = round(mkt_base + mkt_tax, 2)
+
+    # 3. Shipment / Logistics Fee
+    if not payload.is_self_logistics:
+        log_slab = await get_applicable_slab(db, "logistics", net_basic_dec)
+        log_pct = float(log_slab.dealer_percentage) if (log_slab and log_slab.dealer_percentage is not None) else 0.01
+        log_base = round(selling_base * log_pct, 2)
+        log_tax = round(log_base * (tax_perc / 100.0), 2)
+        log_total = round(log_base + log_tax, 2)
+    else:
+        log_pct = 0.0
+        log_base = 0.0
+        log_tax = 0.0
+        log_total = 0.0
+
+    deductions = [
+        FeeDeductionItem(
+            name="Market place",
+            category_key="marketplace",
+            percentage=round(mp_pct * 100.0, 2),
+            base_amount=mp_base,
+            tax_rate=tax_perc,
+            tax_amount=mp_tax,
+            total_amount=mp_total
+        ),
+        FeeDeductionItem(
+            name="Marketing fee",
+            category_key="marketing",
+            percentage=round(mkt_pct * 100.0, 2),
+            base_amount=mkt_base,
+            tax_rate=tax_perc,
+            tax_amount=mkt_tax,
+            total_amount=mkt_total
+        ),
+        FeeDeductionItem(
+            name="Shipment fee",
+            category_key="logistics",
+            percentage=round(log_pct * 100.0, 2),
+            base_amount=log_base,
+            tax_rate=tax_perc,
+            tax_amount=log_tax,
+            total_amount=log_total
+        )
+    ]
+
+    total_deductions = round(mp_total + mkt_total + log_total, 2)
+    estimated_payout = round(selling_total - total_deductions, 2)
+
+    return ProductPayoutEstimationResponse(
+        mrp=PriceTaxRow(
+            base_price=dealer_price,
+            tax_rate=tax_perc,
+            tax_amount=mrp_tax,
+            total_amount=mrp_total
+        ),
+        selling_price=PriceTaxRow(
+            base_price=selling_base,
+            tax_rate=tax_perc,
+            tax_amount=selling_tax,
+            total_amount=selling_total,
+            discount_percentage=discount_pct
+        ),
+        discount=PriceTaxRow(
+            base_price=discount_base,
+            tax_rate=tax_perc,
+            tax_amount=discount_tax,
+            total_amount=discount_total,
+            discount_percentage=discount_pct
+        ),
+        deductions=deductions,
+        total_deductions=total_deductions,
+        estimated_payout=estimated_payout,
+        disclaimer="This is estimated payment. Final payout will be after deductions and settlement"
+    )
 
 @router.get("/products/{product_id}", response_model=Product, tags=["products"])
 async def get_product(
@@ -1475,6 +1932,27 @@ async def get_product(
         raise HTTPException(status_code=404, detail="Product not found or currently unavailable")
         
     return product
+
+@router.get("/products/{product_id}/payout-estimate", response_model=ProductPayoutEstimationResponse, tags=["products"])
+async def get_product_payout_estimate(
+    product_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
+):
+    """
+    Get payout estimation breakdown for an existing product.
+    """
+    product = await db.get(ProductModel, product_id)
+    if not product or product.is_deleted:
+        raise HTTPException(status_code=404, detail="Product not found")
+        
+    req = ProductPayoutEstimationRequest(
+        dealer_price=product.dealer_price,
+        tax_perc=product.tax_perc or 12.0,
+        discount_percentage=float(product.discount_percentage or 0.0),
+        selling_price=product.selling_price
+    )
+    return await estimate_product_payout(req, db, current_user)
 
 @router.post("/products/upload-image", response_model=dict, tags=["products"])
 async def upload_product_image(

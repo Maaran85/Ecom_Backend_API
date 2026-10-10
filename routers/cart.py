@@ -2,7 +2,7 @@ import logging
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update
+from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import selectinload, joinedload
 from typing import List
 
