@@ -1760,8 +1760,13 @@ async def estimate_product_payout(
     tax_perc = float(payload.tax_perc if payload.tax_perc is not None else 12.0)
     
     # Calculate base selling price
-    if payload.selling_price is not None:
-        selling_base = float(payload.selling_price)
+    if payload.selling_price is not None and float(payload.selling_price) > 0:
+        sp_input = float(payload.selling_price)
+        mrp_total_est = round(dealer_price * (1.0 + tax_perc / 100.0), 2)
+        if sp_input > dealer_price and sp_input <= mrp_total_est:
+            selling_base = round(sp_input / (1.0 + tax_perc / 100.0), 2)
+        else:
+            selling_base = sp_input
         discount_pct = round(((dealer_price - selling_base) / dealer_price) * 100.0, 2) if dealer_price > 0 else 0.0
     elif payload.discount_percentage:
         discount_pct = float(payload.discount_percentage)
@@ -1780,31 +1785,58 @@ async def estimate_product_payout(
     discount_tax = round(mrp_tax - selling_tax, 2)
     discount_total = round(mrp_total - selling_total, 2)
 
-    # Fee Deductions based on active BillingSlabs (or defaults)
+    # Fee Deductions based on active BillingSlabs
     net_basic_dec = Decimal(str(selling_base))
+    missing_slab_categories = []
+    PLATFORM_FEE_GST_RATE = 18.0  # 18% GST on platform service fees under SAC 998314
     
     # 1. Marketplace Fee
     mp_slab = await get_applicable_slab(db, "marketplace", net_basic_dec)
-    mp_pct = float(mp_slab.dealer_percentage) if (mp_slab and mp_slab.dealer_percentage is not None) else 0.005
-    mp_base = round(selling_base * mp_pct, 2)
-    mp_tax = round(mp_base * (tax_perc / 100.0), 2)
-    mp_total = round(mp_base + mp_tax, 2)
+    mp_slab_found = mp_slab is not None and mp_slab.dealer_percentage is not None
+    if mp_slab_found:
+        mp_pct = float(mp_slab.dealer_percentage)
+        mp_base = round(selling_base * mp_pct, 2)
+        mp_tax = round(mp_base * (PLATFORM_FEE_GST_RATE / 100.0), 2)
+        mp_total = round(mp_base + mp_tax, 2)
+    else:
+        mp_pct = None
+        mp_base = 0.0
+        mp_tax = 0.0
+        mp_total = 0.0
+        missing_slab_categories.append("marketplace")
 
     # 2. Marketing Fee
     mkt_slab = await get_applicable_slab(db, "marketing", net_basic_dec)
-    mkt_pct = float(mkt_slab.dealer_percentage) if (mkt_slab and mkt_slab.dealer_percentage is not None) else 0.005
-    mkt_base = round(selling_base * mkt_pct, 2)
-    mkt_tax = round(mkt_base * (tax_perc / 100.0), 2)
-    mkt_total = round(mkt_base + mkt_tax, 2)
+    mkt_slab_found = mkt_slab is not None and mkt_slab.dealer_percentage is not None
+    if mkt_slab_found:
+        mkt_pct = float(mkt_slab.dealer_percentage)
+        mkt_base = round(selling_base * mkt_pct, 2)
+        mkt_tax = round(mkt_base * (PLATFORM_FEE_GST_RATE / 100.0), 2)
+        mkt_total = round(mkt_base + mkt_tax, 2)
+    else:
+        mkt_pct = None
+        mkt_base = 0.0
+        mkt_tax = 0.0
+        mkt_total = 0.0
+        missing_slab_categories.append("marketing")
 
     # 3. Shipment / Logistics Fee
     if not payload.is_self_logistics:
         log_slab = await get_applicable_slab(db, "logistics", net_basic_dec)
-        log_pct = float(log_slab.dealer_percentage) if (log_slab and log_slab.dealer_percentage is not None) else 0.01
-        log_base = round(selling_base * log_pct, 2)
-        log_tax = round(log_base * (tax_perc / 100.0), 2)
-        log_total = round(log_base + log_tax, 2)
+        log_slab_found = log_slab is not None and log_slab.dealer_percentage is not None
+        if log_slab_found:
+            log_pct = float(log_slab.dealer_percentage)
+            log_base = round(selling_base * log_pct, 2)
+            log_tax = round(log_base * (PLATFORM_FEE_GST_RATE / 100.0), 2)
+            log_total = round(log_base + log_tax, 2)
+        else:
+            log_pct = None
+            log_base = 0.0
+            log_tax = 0.0
+            log_total = 0.0
+            missing_slab_categories.append("logistics")
     else:
+        log_slab_found = True
         log_pct = 0.0
         log_base = 0.0
         log_tax = 0.0
@@ -1814,29 +1846,32 @@ async def estimate_product_payout(
         FeeDeductionItem(
             name="Market place",
             category_key="marketplace",
-            percentage=round(mp_pct * 100.0, 2),
+            percentage=round(mp_pct * 100.0, 2) if mp_pct is not None else None,
             base_amount=mp_base,
-            tax_rate=tax_perc,
+            tax_rate=PLATFORM_FEE_GST_RATE,
             tax_amount=mp_tax,
-            total_amount=mp_total
+            total_amount=mp_total,
+            slab_applied=mp_slab_found
         ),
         FeeDeductionItem(
             name="Marketing fee",
             category_key="marketing",
-            percentage=round(mkt_pct * 100.0, 2),
+            percentage=round(mkt_pct * 100.0, 2) if mkt_pct is not None else None,
             base_amount=mkt_base,
-            tax_rate=tax_perc,
+            tax_rate=PLATFORM_FEE_GST_RATE,
             tax_amount=mkt_tax,
-            total_amount=mkt_total
+            total_amount=mkt_total,
+            slab_applied=mkt_slab_found
         ),
         FeeDeductionItem(
             name="Shipment fee",
             category_key="logistics",
-            percentage=round(log_pct * 100.0, 2),
+            percentage=round(log_pct * 100.0, 2) if log_pct is not None else None,
             base_amount=log_base,
-            tax_rate=tax_perc,
+            tax_rate=PLATFORM_FEE_GST_RATE,
             tax_amount=log_tax,
-            total_amount=log_total
+            total_amount=log_total,
+            slab_applied=log_slab_found
         )
     ]
 
@@ -1867,7 +1902,9 @@ async def estimate_product_payout(
         deductions=deductions,
         total_deductions=total_deductions,
         estimated_payout=estimated_payout,
-        disclaimer="This is estimated payment. Final payout will be after deductions and settlement"
+        disclaimer="Estimated payout excludes applicable Section 194-O TDS (0.1% with PAN / 5% without PAN), which is evaluated based on dealer turnover and exemption limits at final settlement.",
+        all_slabs_applied=len(missing_slab_categories) == 0,
+        missing_slab_categories=missing_slab_categories
     )
 
 @router.get("/products/{product_id}", response_model=Product, tags=["products"])

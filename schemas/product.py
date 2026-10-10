@@ -193,6 +193,7 @@ class FeeDeductionItem(BaseModel):
     tax_rate: float
     tax_amount: float
     total_amount: float
+    slab_applied: Optional[bool] = True
 
 class PriceTaxRow(BaseModel):
     base_price: float
@@ -216,4 +217,6 @@ class ProductPayoutEstimationResponse(BaseModel):
     total_deductions: float
     estimated_payout: float
     disclaimer: str = "This is estimated payment. Final payout will be after deductions and settlement"
+    all_slabs_applied: Optional[bool] = True
+    missing_slab_categories: Optional[List[str]] = []
 
