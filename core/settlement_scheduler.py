@@ -39,6 +39,7 @@ async def _generate_daily_settlements():
 
             rows = await db.execute(
                 select(P.dealer_id)
+                .select_from(OI)
                 .join(O, O.id == OI.order_id)
                 .join(P, P.id == OI.product_id)
                 .where(O.status == OrderStatus.DELIVERED, O.delivered_at.isnot(None))

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     ENCRYPTION_KEY: str = "thisisaverysecretencryptionkey32" # 32 bytes for AES
     SQL_ECHO: bool = False
+    ENVIRONMENT: str = "development"
 
     
     # SMTP Settings (optional)

@@ -2340,32 +2340,46 @@ async def update_delivery_settings(
         "message": "Delivery settings updated successfully"
     }
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────────────────────────────────────────────────────────
 # Customer: Preview delivery charges (called from checkout)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────────────────────────────────────────────────────────
 @router.get("/delivery-preview")
 async def delivery_preview(
     product_id: Optional[UUID] = None,
+    variant_id: Optional[UUID] = None,
     quantity: int = 1,
+    coupon_code: Optional[str] = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Customer: Real-time delivery charge breakdown for items currently in cart or single buy-now product.
-    Returns per-dealer fees + total, so checkout can display them before placing order.
+    Returns per-dealer fees + total, applying overall cart-level free delivery threshold across all platform items.
     """
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
     from models.cart import CartItem as CartItemModel
     from models.product import Product as ProductModel
+    from models.coupon import Coupon as CouponModel, DiscountType
+    from services.fee_service import get_all_active_slabs, match_slab_from_list, SettlementFeeError
+    from services.delivery_pricing_service import calculate_cart_delivery_pricing, DeliveryPricingConfigurationError
 
-    dealer_subtotals: dict[int, float] = {}
+    dealer_subtotals: dict[Any, float] = {}
 
     cart_items = []
+    p = None
+    v = None
     if product_id:
         # Buy Now mode: preview for single product
         prod_res = await db.execute(select(ProductModel).where(ProductModel.id == product_id))
         p = prod_res.scalar_one_or_none()
         if p and p.dealer_id:
-            price = float(p.selling_price or p.mrp or p.dealer_price)
+            price = float(p.selling_price if p.selling_price is not None else (p.mrp or p.dealer_price))
+            if variant_id:
+                v_res = await db.execute(select(ProductModel).where(ProductModel.id == variant_id))
+                v = v_res.scalar_one_or_none()
+                if v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None):
+                    price = float(v.selling_price if v.selling_price is not None else (v.mrp or v.dealer_price))
             dealer_subtotals[p.dealer_id] = price * max(1, quantity)
     else:
         # Cart mode: preview for cart items
@@ -2379,11 +2393,50 @@ async def delivery_preview(
         for ci in cart_items:
             if ci.product and ci.product.dealer_id:
                 d_id = ci.product.dealer_id
-                price = float(ci.product.selling_price or ci.product.mrp or ci.product.dealer_price)
+                price = float(ci.product.selling_price if ci.product.selling_price is not None else (ci.product.mrp or ci.product.dealer_price))
                 dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + price * ci.quantity
 
     if not dealer_subtotals:
-        return {"dealers": [], "total_delivery_charge": 0.0}
+        from services.configuration_service import get_fee_config
+        threshold_cfg = await get_fee_config(db, "platform_free_delivery_threshold")
+        threshold_val = float(threshold_cfg.value) if (threshold_cfg and threshold_cfg.is_active and threshold_cfg.value is not None) else 1000.0
+        return {
+            "dealers": [],
+            "total_delivery_charge": 0.0,
+            "total_platform_fee": 0.0,
+            "platform_eligible_subtotal": 0.0,
+            "platform_free_delivery_threshold": threshold_val,
+            "platform_qualifies_for_free": False,
+            "platform_remaining_for_free": threshold_val,
+        }
+
+    total_gross = sum(dealer_subtotals.values())
+
+    # Optional Coupon Validation for preview
+    applied_coupon = None
+    total_discount_amount = 0.0
+    if coupon_code:
+        c_code_str = coupon_code.strip().upper()
+        c_res = await db.execute(select(CouponModel).where(CouponModel.code == c_code_str))
+        c_obj = c_res.scalar_one_or_none()
+        now = datetime.now(timezone.utc)
+        if (
+            c_obj
+            and c_obj.is_active
+            and c_obj.valid_from <= now <= c_obj.valid_until
+            and (not c_obj.usage_limit or c_obj.current_usage < c_obj.usage_limit)
+            and total_gross >= c_obj.min_order_value
+        ):
+            if c_obj.discount_type == DiscountType.PERCENTAGE:
+                disc = total_gross * (c_obj.discount_value / 100)
+                if c_obj.max_discount_amount:
+                    disc = min(disc, c_obj.max_discount_amount)
+                total_discount_amount = disc
+            elif c_obj.discount_type == DiscountType.FIXED:
+                total_discount_amount = min(c_obj.discount_value, total_gross)
+            applied_coupon = c_obj
+
+    active_slabs = await get_all_active_slabs(db)
 
     # Fetch dealer delivery settings
     dealers_res = await db.execute(
@@ -2391,19 +2444,42 @@ async def delivery_preview(
     )
     dealers = dealers_res.scalars().all()
 
-    breakdown = []
-    total_delivery = 0.0
+    dealer_shipments = []
     for d in dealers:
-        subtotal = dealer_subtotals.get(d.id, 0.0)
-        fee = float(d.delivery_charge or 0.0)
-        threshold = float(d.free_delivery_above or 0.0)
-        is_free = fee == 0.0 or (threshold > 0 and subtotal >= threshold)
-        charge = 0.0 if is_free else fee
-        total_delivery += charge
-        # Estimate delivery
-        from datetime import datetime, timedelta
-        
-        # Find maximum delivery days for this dealer's items
+        gross = dealer_subtotals.get(d.id, 0.0)
+        if applied_coupon and applied_coupon.dealer_id:
+            d_disc = total_discount_amount if applied_coupon.dealer_id == d.id else 0.0
+        else:
+            d_disc = round((gross / total_gross) * total_discount_amount, 2) if total_gross > 0 else 0.0
+        net = max(0.0, round(gross - d_disc, 2))
+        dealer_shipments.append({
+            "dealer": d,
+            "subtotal": Decimal(str(net)),
+            "gross_subtotal": gross,
+            "net_subtotal": net,
+        })
+
+    try:
+        pricing_res = await calculate_cart_delivery_pricing(
+            db=db,
+            dealer_shipments=dealer_shipments,
+            active_slabs=active_slabs,
+        )
+    except DeliveryPricingConfigurationError as dp_err:
+        raise HTTPException(status_code=400, detail=str(dp_err))
+
+    breakdown = []
+    for ds in dealer_shipments:
+        d = ds["dealer"]
+        shipment_res = pricing_res.shipments.get(d.id) or pricing_res.shipments.get(str(d.id))
+        if not shipment_res:
+            continue
+        charge = float(shipment_res.delivery_charge)
+        is_free = shipment_res.is_free
+        threshold = float(shipment_res.free_above)
+        remaining = float(shipment_res.remaining_for_free)
+
+        # Estimate delivery days
         max_days = d.estimated_delivery_days or 7
         if product_id and p and p.dealer_id == d.id:
             if p.estimated_delivery_days and p.estimated_delivery_days > max_days:
@@ -2413,25 +2489,57 @@ async def delivery_preview(
             for ci in dealer_items:
                 if ci.product.estimated_delivery_days and ci.product.estimated_delivery_days > max_days:
                     max_days = ci.product.estimated_delivery_days
-        
+
         est_date = datetime.now() + timedelta(days=max_days)
         formatted_date = est_date.strftime("%d %b %Y")
 
         breakdown.append({
             "dealer_id": d.id,
             "dealer_name": d.business_name,
-            "items_subtotal": round(subtotal, 2),
+            "items_subtotal": round(ds["gross_subtotal"], 2),
+            "net_subtotal": round(ds["net_subtotal"], 2),
             "delivery_charge": round(charge, 2),
             "is_free": is_free,
             "free_above": threshold,
-            "remaining_for_free": round(max(0.0, threshold - subtotal), 2) if threshold > 0 and not is_free else 0.0,
+            "remaining_for_free": round(remaining, 2),
+            "is_self_logistics": shipment_res.is_self_logistics,
             "estimated_delivery_days": max_days,
-            "formatted_delivery_date": formatted_date
+            "formatted_delivery_date": formatted_date,
         })
+
+    # Calculate platform fee using active marketplace billing slabs
+    total_platform_fee = 0.0
+
+    preview_items = []
+    if product_id and p:
+        target_prod = v if (variant_id and v) else p
+        preview_items.append((target_prod, max(1, quantity)))
+    elif cart_items:
+        for ci in cart_items:
+            if ci.product:
+                preview_items.append((ci.product, ci.quantity))
+
+    for item_prod, item_qty in preview_items:
+        item_price = float(item_prod.selling_price if item_prod.selling_price is not None else (item_prod.mrp or item_prod.dealer_price))
+        line_subtotal = Decimal(str(round(item_price * item_qty, 2)))
+        mp_slab = match_slab_from_list(active_slabs, "marketplace", line_subtotal)
+        if mp_slab and mp_slab.customer_percentage:
+            fee = round(float(line_subtotal * Decimal(str(mp_slab.customer_percentage))), 2)
+        else:
+            fee = 0.0
+        total_platform_fee += fee
 
     return {
         "dealers": breakdown,
-        "total_delivery_charge": round(total_delivery, 2)
+        "total_delivery_charge": float(pricing_res.total_delivery_charge),
+        "total_platform_fee": round(total_platform_fee, 2),
+        "platform_eligible_subtotal": float(pricing_res.platform_eligible_subtotal),
+        "platform_free_delivery_threshold": float(pricing_res.platform_free_delivery_threshold),
+        "platform_qualifies_for_free": pricing_res.platform_qualifies_for_free,
+        "platform_remaining_for_free": float(pricing_res.platform_remaining_for_free),
+        "coupon_applied": bool(applied_coupon),
+        "coupon_discount": round(total_discount_amount, 2),
+        "note": "Free delivery applies to all platform shipments when eligible items reach ₹1,000. Discounts applied at checkout affect final eligibility."
     }
 
 @router.post("/register", response_model=DealerSchema, status_code=status.HTTP_201_CREATED)
@@ -2570,6 +2678,52 @@ async def complete_dealer_profile(
     )
     dealer = res.scalar_one_or_none()
     return dealer
+
+
+@router.post("/me/reveal-sensitive")
+async def reveal_own_sensitive_info(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Authorized endpoint allowing an authenticated dealer to reveal their own unmasked KYC fields (Aadhaar, PAN, Bank Account).
+    Access is audited without logging plaintext identifiers.
+    """
+    dealer = await get_current_dealer(current_user, db)
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer profile not found")
+
+    from core.security import decrypt_field
+
+    aadhaar_plain = decrypt_field(dealer.aadhaar_number)
+    pan_plain = decrypt_field(dealer.pan_number)
+    account_plain = decrypt_field(dealer.account_number)
+    ifsc_plain = decrypt_field(dealer.ifsc_code)
+
+    # Audit access without logging sensitive plaintext
+    try:
+        from models.audit import AuditLog
+        audit = AuditLog(
+            user_id=current_user.id,
+            dealer_id=dealer.id,
+            action="REVEAL_OWN_SENSITIVE",
+            resource_type="dealer_kyc",
+            resource_id=str(dealer.id),
+            description=f"Dealer {current_user.email} revealed own sensitive KYC fields in profile editor."
+        )
+        db.add(audit)
+        await db.commit()
+    except Exception as log_err:
+        import logging
+        logging.getLogger(__name__).warning(f"Could not record audit log for reveal-sensitive: {log_err}")
+
+    return {
+        "dealer_id": str(dealer.id),
+        "aadhaar_number": aadhaar_plain,
+        "pan_number": pan_plain,
+        "account_number": account_plain,
+        "ifsc_code": ifsc_plain,
+    }
 
 
 # ======================================================================

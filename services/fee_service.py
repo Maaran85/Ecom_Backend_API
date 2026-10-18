@@ -26,6 +26,7 @@ async def get_applicable_slab(db: AsyncSession, category_key: str, net_basic_amo
     """
     Finds the active BillingSlab for category_key where:
       min_price <= net_basic_amount AND (max_price IS NULL OR net_basic_amount <= max_price)
+    Safely raises SettlementFeeError if ambiguous multiple active slabs match.
     """
     sale_val = float(net_basic_amount)
     stmt = (
@@ -39,10 +40,15 @@ async def get_applicable_slab(db: AsyncSession, category_key: str, net_basic_amo
             )
         )
         .order_by(BillingSlab.min_price.desc())
-        .limit(1)
     )
     res = await db.execute(stmt)
-    return res.scalar_one_or_none()
+    matching = res.scalars().all()
+    if len(matching) > 1:
+        slab_summaries = ", ".join([f"ID {s.id} (₹{s.min_price}-₹{s.max_price if s.max_price is not None else '∞'})" for s in matching])
+        raise SettlementFeeError(
+            f"Ambiguous active billing slabs found for category '{category_key}' at amount ₹{net_basic_amount}: {slab_summaries}"
+        )
+    return matching[0] if matching else None
 
 
 async def get_all_active_slabs(db: AsyncSession) -> List[BillingSlab]:
@@ -57,13 +63,22 @@ async def get_all_active_slabs(db: AsyncSession) -> List[BillingSlab]:
 
 
 def match_slab_from_list(slabs: List[BillingSlab], category_key: str, net_basic_amount: Decimal) -> Optional[BillingSlab]:
-    """Finds the active BillingSlab for category_key from pre-fetched slabs using identical price range rules."""
+    """
+    Finds the active BillingSlab for category_key from pre-fetched slabs using identical price range rules.
+    Safely raises SettlementFeeError if ambiguous multiple active slabs match.
+    """
     sale_val = float(net_basic_amount)
+    matches = []
     for slab in slabs:
         if slab.category_key == category_key and slab.is_active and slab.min_price <= sale_val:
             if slab.max_price is None or slab.max_price >= sale_val:
-                return slab
-    return None
+                matches.append(slab)
+    if len(matches) > 1:
+        slab_summaries = ", ".join([f"ID {s.id} (₹{s.min_price}-₹{s.max_price if s.max_price is not None else '∞'})" for s in matches])
+        raise SettlementFeeError(
+            f"Ambiguous active billing slabs found for category '{category_key}' at amount ₹{net_basic_amount}: {slab_summaries}"
+        )
+    return matches[0] if matches else None
 
 
 
@@ -75,8 +90,14 @@ async def validate_no_overlap(
     exclude_id: Optional[int] = None,
 ) -> None:
     """
-    Ensures that adding/updating a BillingSlab does not overlap with any existing active slab in category_key.
+    Ensures that adding/updating/activating a BillingSlab does not overlap with any existing active slab in category_key.
+    Enforces 2-decimal precision and boundary rules.
     """
+    if min_price < 0:
+        raise ValueError("Minimum price cannot be negative")
+    if max_price is not None and max_price < min_price:
+        raise ValueError(f"Maximum price (₹{max_price}) cannot be less than minimum price (₹{min_price})")
+
     stmt = select(BillingSlab).where(
         and_(BillingSlab.category_key == category_key, BillingSlab.is_active == True)
     )
@@ -86,15 +107,19 @@ async def validate_no_overlap(
     res = await db.execute(stmt)
     existing_slabs = res.scalars().all()
 
+    cur_min = round(float(min_price), 2)
+    cur_max = round(float(max_price), 2) if max_price is not None else float("inf")
+
     for s in existing_slabs:
-        s_min = s.min_price
-        s_max = s.max_price if s.max_price is not None else float("inf")
-        cur_min = min_price
-        cur_max = max_price if max_price is not None else float("inf")
+        s_min = round(float(s.min_price), 2)
+        s_max = round(float(s.max_price), 2) if s.max_price is not None else float("inf")
 
         if max(s_min, cur_min) <= min(s_max, cur_max):
             max_str = f"₹{s.max_price}" if s.max_price is not None else "∞"
-            raise ValueError(f"Price range ₹{min_price}-{max_price if max_price is not None else '∞'} overlaps with existing active slab ₹{s_min}-{max_str}")
+            cur_max_str = f"₹{max_price}" if max_price is not None else "∞"
+            raise ValueError(
+                f"Price range ₹{cur_min}-{cur_max_str} overlaps with existing active slab ID {s.id} (₹{s_min}-{max_str})"
+            )
 
 
 def compute_gross_sale(item: OrderItem, order: Order) -> Decimal:

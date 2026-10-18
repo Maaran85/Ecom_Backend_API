@@ -8,6 +8,16 @@ from sqlalchemy_utils.types.encrypted.encrypted_type import AesEngine
 import uuid
 from sqlalchemy.dialects.postgresql import UUID
 
+class SafeEncryptedType(EncryptedType):
+    cache_ok = True
+
+    def process_result_value(self, value, dialect=None):
+        if value is None:
+            return None
+        from core.security import decrypt_field
+        return decrypt_field(value)
+
+
 class Dealer(Base):
     __tablename__ = "dealers"
 
@@ -53,9 +63,9 @@ class Dealer(Base):
     company_photo_url = Column(String, nullable=True)
     gst_certificate_url = Column(String, nullable=True)
     incorporation_certificate_url = Column(String, nullable=True)
-    pan_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    pan_number = Column(SafeEncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     pan_photo_url = Column(String, nullable=True)
-    aadhaar_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    aadhaar_number = Column(SafeEncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     aadhaar_photo_url = Column(String, nullable=True)
     cin_number = Column(String, nullable=True)
     cin_certificate_url = Column(String, nullable=True)
@@ -66,19 +76,18 @@ class Dealer(Base):
     bank_name = Column(String, nullable=True)
     bank_address = Column(String, nullable=True)
     bank_branch = Column(String, nullable=True)
-    ifsc_code = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    ifsc_code = Column(SafeEncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
     account_holder_name = Column(String, nullable=True)
-    account_number = Column(EncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
+    account_number = Column(SafeEncryptedType(String, settings.ENCRYPTION_KEY, AesEngine, 'pkcs5'), nullable=True)
 
     # Delivery Settings
     delivery_charge = Column(Float, default=0.0, nullable=False)        # flat fee per order from this dealer
     free_delivery_above = Column(Float, default=0.0, nullable=False)    # 0 = always free; >0 = waived above this amount
     estimated_delivery_days = Column(Integer, default=7, nullable=False) # e.g. 5 means 5 days from order date
+    is_delivery_self_logistics = Column(Boolean, default=False, nullable=False, server_default='false')
     
     # Financial Settings
     platform_fee_amount = Column(Float, default=5.0, nullable=False)  # The flat amount the platform takes from each sale
-    free_delivery_above = Column(Float, default=0.0, nullable=False)    # 0 = always free; >0 = waived above this amount
-    estimated_delivery_days = Column(Integer, default=7, nullable=False) # e.g. 5 means 5 days from order date
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     

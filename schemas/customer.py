@@ -22,6 +22,7 @@ class Customer(CustomerBase):
     id: int
     is_active: bool
     created_at: datetime
+    role: str = "customer"
 
     class Config:
         from_attributes = True
@@ -29,7 +30,23 @@ class Customer(CustomerBase):
 class CustomerLoginRequest(BaseModel):
     identifier: str # email or phone
 
+class CustomerPasswordLogin(BaseModel):
+    identifier: str # email or phone
+    password: str
+
 class CustomerOTPVerify(BaseModel):
     identifier: str
     otp: str
     full_name: Optional[str] = None # Used for registration
+    password: Optional[str] = None # Optional password set during registration
+
+class CustomerForgotPasswordRequest(BaseModel):
+    identifier: str # email or phone
+
+class CustomerForgotPasswordVerify(BaseModel):
+    identifier: str
+    otp: str
+
+class CustomerResetPassword(BaseModel):
+    reset_token: str
+    new_password: str = Field(..., min_length=6, description="Password must be at least 6 characters")

@@ -106,6 +106,24 @@ SEED_FEE_CONFIGS: list[Dict[str, Any]] = [
         "is_gst_applicable": False,
         "gst_rate": 0.0,
     },
+    {
+        "key": "platform_delivery_fee",
+        "name": "Platform Delivery Fee",
+        "description": "Standard fixed delivery charge for platform-managed customer shipments.",
+        "fee_type": FeeType.FLAT,
+        "value": 40.0,
+        "is_gst_applicable": False,
+        "gst_rate": 0.0,
+    },
+    {
+        "key": "platform_free_delivery_threshold",
+        "name": "Platform Free Delivery Threshold",
+        "description": "Shipment subtotal above which platform delivery is free (e.g. 500.0). 0 for no threshold.",
+        "fee_type": FeeType.FLAT,
+        "value": 500.0,
+        "is_gst_applicable": False,
+        "gst_rate": 0.0,
+    },
 ]
 
 

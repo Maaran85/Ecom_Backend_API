@@ -330,24 +330,42 @@ async def update_task_status(
         if not already_delivered:
             print(f"DEBUG: Processing earnings for rider {rider.id}")
             from models import RiderEarning
-            earning = RiderEarning(
-                rider_id=rider.id, order_item_id=item.id, amount=40.0,
-                type="delivery", description=f"Delivery of item {item.id}"
+            from sqlalchemy.exc import IntegrityError
+            import logging
+            # Idempotency check: verify delivery earnings have not already been recorded for this item
+            existing_earning_res = await db.execute(
+                select(RiderEarning).where(
+                    RiderEarning.order_item_id == item.id,
+                    RiderEarning.type == "delivery"
+                )
             )
-            db.add(earning)
-            rider.current_balance += 40.0
-            rider.total_earnings += 40.0
+            if not existing_earning_res.scalar_one_or_none():
+                try:
+                    async with db.begin_nested():
+                        earning = RiderEarning(
+                            rider_id=rider.id, order_item_id=item.id, amount=40.0,
+                            type="delivery", description=f"Delivery of item {item.id}"
+                        )
+                        db.add(earning)
+                        rider.current_balance = (rider.current_balance or 0.0) + 40.0
+                        rider.total_earnings = (rider.total_earnings or 0.0) + 40.0
+                        db.add(rider)
+                        await db.flush()
+                except IntegrityError:
+                    db.expire(rider, ["current_balance", "total_earnings"])
+                    logging.getLogger(__name__).warning(
+                        f"RiderEarning unique constraint triggered for item {item.id}. Duplicate concurrent delivery earning prevented."
+                    )
 
     order_id = item.order_id
     item_id_val = item.id
     
     from core.order_status_logic import calculate_and_update_order_status
 
-    # Flush changes to the session so subsequent queries see the new status (since autoflush=False)
-    await db.flush()
-
-    # TRIGGER PARENT ORDER SYNC (Using shared logic)
+    # TRIGGER PARENT ORDER SYNC (Using shared logic) with safe rollback
     try:
+        # Flush changes to the session so subsequent queries see the new status
+        await db.flush()
         await calculate_and_update_order_status(db, order_id)
         # Re-fetch parent order for notification context if needed
         order_res = await db.execute(

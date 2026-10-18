@@ -158,6 +158,7 @@ async def startup_event():
             await conn.execute(text("ALTER TABLE categories ADD COLUMN IF NOT EXISTS referral_commission_rate DOUBLE PRECISION;"))
             await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet_amount_used DOUBLE PRECISION DEFAULT 0.0;"))
             await conn.execute(text("ALTER TABLE dealers ADD COLUMN IF NOT EXISTS organization_type VARCHAR;"))
+            await conn.execute(text("ALTER TABLE dealers ADD COLUMN IF NOT EXISTS is_delivery_self_logistics BOOLEAN DEFAULT FALSE;"))
             await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS order_item_id INTEGER REFERENCES order_items(id);"))
             await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS complaint_reason VARCHAR(255);"))
             await conn.execute(text("ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS escalation_reason VARCHAR(255);"))
@@ -170,8 +171,12 @@ async def startup_event():
             await conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS is_l2_approved BOOLEAN DEFAULT FALSE;"))
             await conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS l2_approved_by INTEGER REFERENCES users(id);"))
             await conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS l2_approved_at TIMESTAMP WITH TIME ZONE;"))
+            await conn.execute(text("ALTER TABLE customer_users ADD COLUMN IF NOT EXISTS password_hash VARCHAR;"))
+            await conn.execute(text("ALTER TABLE customer_users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0;"))
+            await conn.execute(text("ALTER TABLE customer_users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP WITH TIME ZONE;"))
+            await conn.execute(text("ALTER TABLE customer_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP WITH TIME ZONE;"))
             await conn.run_sync(Base.metadata.create_all)
-        print("INFO: Successfully verified/created support_ticket complaint fields, settlement L2 fields, referral tables, and wallet_transactions.")
+        print("INFO: Successfully verified/created customer password fields, support_ticket complaint fields, settlement L2 fields, referral tables, and wallet_transactions.")
     except Exception as e:
         print(f"WARNING: Schema auto-migration on startup encountered: {e}")
 

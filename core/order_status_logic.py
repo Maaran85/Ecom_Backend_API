@@ -29,16 +29,35 @@ async def calculate_and_update_order_status(db, order_id: int):
     terminal_states = ["delivered", "rejected", "undelivered", "cancelled", "returned"]
     if all(s in terminal_states for s in statuses):
         if any(s == "delivered" for s in statuses):
+            was_already_delivered = (parent_order.status == OrderStatus.DELIVERED and parent_order.delivered_at is not None)
             parent_order.status = OrderStatus.DELIVERED
             if not parent_order.delivered_at:
                 parent_order.delivered_at = datetime.now(timezone.utc)
             if parent_order.payment and parent_order.payment.status != PaymentStatus.REFUNDED:
                 parent_order.payment.status = PaymentStatus.SUCCESS
-            await settle_referral_commissions_for_order(db, parent_order.id, credit=True)
+            try:
+                async with db.begin_nested():
+                    await settle_referral_commissions_for_order(db, parent_order.id, credit=True, is_new_delivery=(not was_already_delivered))
+            except Exception as ref_err:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Referral commission settlement deferred for Order {parent_order.id}: {ref_err}",
+                    exc_info=True
+                )
+                if parent_order.referral_reward_status not in ["credited", "cancelled", "refunded"]:
+                    parent_order.referral_reward_status = "pending"
         else:
             # If all were cancelled/rejected, order is cancelled
             parent_order.status = OrderStatus.CANCELLED
-            await settle_referral_commissions_for_order(db, parent_order.id, credit=False)
+            try:
+                async with db.begin_nested():
+                    await settle_referral_commissions_for_order(db, parent_order.id, credit=False)
+            except Exception as ref_err:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Referral commission cancellation deferred for Order {parent_order.id}: {ref_err}",
+                    exc_info=True
+                )
     
     # Priority 2: Any out for delivery (High priority "transit" status)
     elif any(s == "out_for_delivery" for s in statuses):
@@ -105,7 +124,7 @@ async def calculate_and_update_order_status(db, order_id: int):
     return parent_order
 
 
-async def settle_referral_commissions_for_order(db, order_id: int, credit: bool = True):
+async def settle_referral_commissions_for_order(db, order_id: int, credit: bool = True, is_new_delivery: bool = True):
     """
     Settles pending referral commissions for an order:
     - If credit=True (Order Delivered): Credits commission amount & points to referrer's CustomerWallet balance & marks CREDITED.
@@ -172,8 +191,9 @@ async def settle_referral_commissions_for_order(db, order_id: int, credit: bool 
             order_obj.referral_reward_status = "credited" if commissions else order_obj.referral_reward_status
             
             buyer_wallet = await get_or_create_wallet(db, order_obj.customer_id)
-            buyer_wallet.order_delivered_count += 1
-            buyer_wallet.updated_at = now_naive
+            if is_new_delivery:
+                buyer_wallet.order_delivered_count += 1
+                buyer_wallet.updated_at = now_naive
             
             # Check 3 delivered orders threshold for referral signup bonus (A)
             config = await get_or_create_reward_configuration(db)

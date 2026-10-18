@@ -181,12 +181,12 @@ async def get_pending_approvals(
                 "country_id": d.country_id, "country_name": d.country.name if d.country else None,
                 "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
                 "partner_id": d.partner_id,
-                "pan_number": d.pan_number, "bank_name": d.bank_name,
-                "account_number": d.account_number, "ifsc_code": d.ifsc_code,
+                "pan_number": _mask_pan(d.pan_number), "bank_name": d.bank_name,
+                "account_number": _mask_account(d.account_number), "ifsc_code": _manual_decrypt(d.ifsc_code),
                 "reject_reason": d.reject_reason, "is_active": d.is_active,
                 "company_photo_url": d.company_photo_url, "gst_certificate_url": d.gst_certificate_url,
                 "incorporation_certificate_url": d.incorporation_certificate_url,
-                "pan_photo_url": d.pan_photo_url, "aadhaar_number": d.aadhaar_number,
+                "pan_photo_url": d.pan_photo_url, "aadhaar_number": _mask_aadhaar(d.aadhaar_number),
                 "aadhaar_photo_url": d.aadhaar_photo_url,
                 "cin_number": d.cin_number,
                 "cin_certificate_url": d.cin_certificate_url,
@@ -303,29 +303,50 @@ async def list_all_users(
     ]
 
 def _manual_decrypt(val: str) -> str:
-    if not val or len(val) < 20: return val
-    try:
-        from sqlalchemy_utils.types.encrypted.encrypted_type import AesEngine
-        from core.config import settings
-        engine = AesEngine()
-        engine._update_key(settings.ENCRYPTION_KEY)
-        decrypted = engine.decrypt(val)
-        if isinstance(decrypted, bytes):
-            return decrypted.decode('utf-8')
-        return str(decrypted) if decrypted else val
-    except Exception:
-        pass
-    
-    try:
-        import base64
-        from cryptography.fernet import Fernet
-        from core.config import settings
-        key = base64.urlsafe_b64encode(settings.ENCRYPTION_KEY.encode()[:32].ljust(32, b'0'))
-        f = Fernet(key)
-        return f.decrypt(val.encode()).decode()
-    except Exception:
-        pass
-    return val
+    if not val:
+        return val
+    from core.security import decrypt_field
+    res = decrypt_field(val)
+    return res if res is not None else val
+
+def _mask_aadhaar(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    plain = _manual_decrypt(val)
+    if not plain:
+        return None
+    s = str(plain).strip()
+    if '*' in s:
+        return s
+    if len(s) >= 4:
+        return f"********{s[-4:]}"
+    return s
+
+def _mask_pan(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    plain = _manual_decrypt(val)
+    if not plain:
+        return None
+    s = str(plain).strip()
+    if '*' in s:
+        return s
+    if len(s) >= 4:
+        return f"******{s[-4:]}"
+    return s
+
+def _mask_account(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    plain = _manual_decrypt(val)
+    if not plain:
+        return None
+    s = str(plain).strip()
+    if '*' in s:
+        return s
+    if len(s) >= 4:
+        return f"******{s[-4:]}"
+    return s
 
 @router.get("/dealers")
 async def list_all_dealers(
@@ -334,7 +355,7 @@ async def list_all_dealers(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """List all dealers (admin only)"""
+    """List all dealers with sensitive KYC information masked by default (admin only)"""
     from sqlalchemy.orm import selectinload
     query = select(Dealer).where(Dealer.is_deleted == False).options(
         selectinload(Dealer.user),
@@ -356,12 +377,12 @@ async def list_all_dealers(
             "country_id": d.country_id, "country_name": d.country.name if d.country else None,
             "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
             "partner_id": d.partner_id,
-            "pan_number": d.pan_number, "bank_name": d.bank_name,
-            "account_number": _manual_decrypt(d.account_number), "ifsc_code": _manual_decrypt(d.ifsc_code),
+            "pan_number": _mask_pan(d.pan_number), "bank_name": d.bank_name,
+            "account_number": _mask_account(d.account_number), "ifsc_code": _manual_decrypt(d.ifsc_code),
             "reject_reason": d.reject_reason, "is_active": d.is_active,
             "company_photo_url": d.company_photo_url, "gst_certificate_url": d.gst_certificate_url,
             "incorporation_certificate_url": d.incorporation_certificate_url,
-            "pan_photo_url": d.pan_photo_url, "aadhaar_number": d.aadhaar_number,
+            "pan_photo_url": d.pan_photo_url, "aadhaar_number": _mask_aadhaar(d.aadhaar_number),
             "aadhaar_photo_url": d.aadhaar_photo_url,
             "cin_number": d.cin_number,
             "cin_certificate_url": d.cin_certificate_url,
@@ -369,7 +390,6 @@ async def list_all_dealers(
             "lat_long": d.lat_long
         }
         for d in dealers
-
     ]
 
 @router.get("/logistics-partners")
@@ -1000,30 +1020,116 @@ async def create_dealer(
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+class RevealSensitiveRequest(BaseModel):
+    reason: Optional[str] = "Dealer KYC Verification"
+
 @router.patch("/dealers/{dealer_id}")
 async def update_dealer_profile(
     dealer_id: UUID, dealer_in: DealerAdminUpdate,
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Update dealer profile (Admin only)"""
+    """Update dealer profile (Admin only) with sensitive field safeguards"""
+    import re
     res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
     dealer = res.scalar_one_or_none()
     if not dealer: raise HTTPException(status_code=404, detail="Dealer profile not found")
     update_data = dealer_in.model_dump(exclude_unset=True)
-    print(f"DEBUG: Updating dealer {dealer_id} with data: {update_data}")
+    print(f"DEBUG: Updating dealer {dealer_id} with data keys: {list(update_data.keys())}")
+    
     # Handle user model updates if provided
     if "full_name" in update_data:
         full_name = update_data.pop("full_name")
         await db.refresh(dealer, attribute_names=["user"])
         if dealer.user: dealer.user.full_name = full_name
+
+    SENSITIVE_FIELDS = {"aadhaar_number", "pan_number", "account_number", "ifsc_code"}
+    clean_updates = {}
+    for field, value in update_data.items():
+        if field in SENSITIVE_FIELDS:
+            # If value is omitted, null, empty string, or contains masking asterisk '*', PRESERVE existing value
+            if value is None or (isinstance(value, str) and (not value.strip() or "*" in value)):
+                continue
+            
+            # User explicitly provided a replacement: validate format
+            str_val = str(value).strip()
+            if field == "aadhaar_number":
+                if not re.match(r"^\d{12}$", str_val):
+                    raise HTTPException(status_code=400, detail="Invalid Aadhaar: must be exactly 12 digits")
+                clean_updates[field] = str_val
+            elif field == "pan_number":
+                if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]{1}$", str_val.upper()):
+                    raise HTTPException(status_code=400, detail="Invalid PAN format: must be 10 alphanumeric characters")
+                clean_updates[field] = str_val.upper()
+            elif field == "account_number":
+                if not re.match(r"^[0-9A-Za-z]{6,30}$", str_val):
+                    raise HTTPException(status_code=400, detail="Invalid bank account number: must be 6-30 alphanumeric characters")
+                clean_updates[field] = str_val
+            elif field == "ifsc_code":
+                if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", str_val.upper()):
+                    raise HTTPException(status_code=400, detail="Invalid IFSC code format (e.g., SBIN0001234)")
+                clean_updates[field] = str_val.upper()
+        else:
+            clean_updates[field] = value
+
     try:
-        for field, value in update_data.items(): setattr(dealer, field, value)
+        for field, value in clean_updates.items(): setattr(dealer, field, value)
         await db.commit()
         return {"message": "Dealer profile synchronized successfully"}
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/dealers/{dealer_id}/reveal-sensitive")
+async def reveal_sensitive_dealer_info(
+    dealer_id: UUID,
+    request: Optional[RevealSensitiveRequest] = None,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reveal decrypted sensitive dealer KYC information with mandatory audit logging (Admin and Super Admin)."""
+    reason = request.reason.strip() if (request and request.reason and len(request.reason.strip()) >= 5) else "Dealer KYC Verification"
+
+    res = await db.execute(select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id))
+    dealer = res.scalar_one_or_none()
+    if not dealer:
+        raise HTTPException(status_code=404, detail="Dealer not found")
+
+    aadhaar_plain = _manual_decrypt(dealer.aadhaar_number)
+    pan_plain = _manual_decrypt(dealer.pan_number)
+    account_plain = _manual_decrypt(dealer.account_number)
+    ifsc_plain = _manual_decrypt(dealer.ifsc_code)
+
+    # Log access in audit log table
+    try:
+        from models.audit import AuditLog
+        audit = AuditLog(
+            user_id=current_user.id,
+            dealer_id=dealer.id,
+            action="REVEAL_SENSITIVE",
+            resource_type="dealer_kyc",
+            resource_id=str(dealer.id),
+            description=f"Admin {current_user.email} revealed sensitive KYC data. Reason: {reason}"
+        )
+        db.add(audit)
+        await db.commit()
+    except Exception as log_err:
+        import logging
+        logging.getLogger(__name__).warning(f"Could not record audit log for reveal-sensitive: {log_err}")
+
+    return {
+        "dealer_id": str(dealer.id),
+        "business_name": dealer.business_name,
+        "aadhaar_number": aadhaar_plain,
+        "pan_number": pan_plain,
+        "account_number": account_plain,
+        "ifsc_code": ifsc_plain,
+        "revealed_by": current_user.email,
+        "reason": reason
+    }
 
 @router.delete("/dealers/{dealer_id}")
 async def delete_dealer(

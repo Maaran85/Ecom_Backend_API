@@ -98,8 +98,15 @@ async def deactivate_billing_slab(
     if not slab:
         raise HTTPException(status_code=404, detail="Billing slab not found")
 
+    new_active = not slab.is_active
+    if new_active:
+        try:
+            await validate_no_overlap(db, slab.category_key, slab.min_price, slab.max_price, exclude_id=slab.id)
+        except ValueError as val_err:
+            raise HTTPException(status_code=400, detail=str(val_err))
+
     old_dict = {c.name: getattr(slab, c.name).isoformat() if hasattr(getattr(slab, c.name), "isoformat") else getattr(slab, c.name) for c in slab.__table__.columns}
-    slab.is_active = not slab.is_active
+    slab.is_active = new_active
     new_dict = {c.name: getattr(slab, c.name).isoformat() if hasattr(getattr(slab, c.name), "isoformat") else getattr(slab, c.name) for c in slab.__table__.columns}
 
     action_label = "ACTIVATE" if slab.is_active else "DEACTIVATE"

@@ -140,23 +140,41 @@ class Dealer(DealerBase):
     @field_validator('aadhaar_number', mode='before')
     @classmethod
     def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:
-        if v and len(str(v)) >= 12:
-            return f"********{str(v)[-4:]}"
-        return v
+        if not v:
+            return v
+        from core.security import decrypt_field
+        plain = decrypt_field(str(v))
+        if plain and '*' in str(plain):
+            return str(plain)
+        if plain and len(str(plain)) >= 12:
+            return f"********{str(plain)[-4:]}"
+        return plain
         
     @field_validator('pan_number', mode='before')
     @classmethod
     def mask_pan(cls, v: Optional[str]) -> Optional[str]:
-        if v and len(str(v)) >= 10:
-            return f"******{str(v)[-4:]}"
-        return v
+        if not v:
+            return v
+        from core.security import decrypt_field
+        plain = decrypt_field(str(v))
+        if plain and '*' in str(plain):
+            return str(plain)
+        if plain and len(str(plain)) >= 10:
+            return f"******{str(plain)[-4:]}"
+        return plain
 
     @field_validator('account_number', mode='before')
     @classmethod
     def mask_account(cls, v: Optional[str]) -> Optional[str]:
-        if v and len(str(v)) >= 4:
-            return f"******{str(v)[-4:]}"
-        return v
+        if not v:
+            return v
+        from core.security import decrypt_field
+        plain = decrypt_field(str(v))
+        if plain and '*' in str(plain):
+            return str(plain)
+        if plain and len(str(plain)) >= 4:
+            return f"******{str(plain)[-4:]}"
+        return plain
 
     class Config:
         from_attributes = True

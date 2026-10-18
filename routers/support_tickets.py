@@ -16,8 +16,9 @@ from models.support_ticket import (
 )
 from models.cart import OrderItem, Order
 from models.dealer import Dealer
-from models.product import Product
-from models.payment import Payment
+from models.product import Product, Category
+from models.payment import Payment, PaymentWebhook
+from models.audit import AuditLog
 from models.address import Address
 from models.order_return import OrderReturn
 from models.settlement import Settlement, SettlementItem
@@ -32,6 +33,11 @@ from schemas.support_ticket import (
     TicketStatusUpdate, TicketPriorityUpdate, TicketAssignUpdate, TicketFeedbackCreate, TicketBulkAssign,
     TicketEscalateCreate, TicketReturnCreate, OperatorTicketCreate, DepartmentActionUpdate,
     OrderContextResponse, OrderItemContext,
+    OrderLifecycleEvent, RiderDetailsContext, DeliveryAttemptRecord, ProofOfDeliveryContext,
+    CustomerOrderPricingBreakdown, CODVerificationContext,
+    LogisticsInvestigationContext, FinanceInvestigationContext,
+    DealerProductInvestigationContext, TechnologyInvestigationContext,
+    DepartmentInvestigationResponse,
     PRE_DELIVERY_REASONS, DELIVERED_REASONS, POST_POLICY_REASONS, PROFILE_REASONS, VALID_DEPARTMENTS
 )
 from core.permissions import get_current_active_user, require_admin
@@ -50,6 +56,21 @@ def get_user_specialist_dept(current_user: User) -> Optional[str]:
     if "dealer" in (current_user.email or "").lower() and current_user.role in [UserRole.PARTNER_BACKOFFICE, UserRole.DEALER, UserRole.DEALER_MANAGER]:
         return "dealer"
     return None
+
+def get_user_authorized_departments(user: User) -> List[str]:
+    """Determine which department investigation views the user is authorized to inspect"""
+    role = getattr(user, "role", None)
+    if role in [UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.PARTNER_BACKOFFICE, UserRole.PARTNER_SUPPORT_MANAGER]:
+        return ["logistics", "finance", "dealer", "technology"]
+    if role == UserRole.PARTNER_LOGISTICS_SPECIALIST:
+        return ["logistics"]
+    if role == UserRole.PARTNER_FINANCE_SPECIALIST:
+        return ["finance"]
+    if role == UserRole.PARTNER_TECH_SUPPORT:
+        return ["technology"]
+    if role in [UserRole.DEALER, UserRole.DEALER_MANAGER, UserRole.PARTNER_CATALOG_MANAGER]:
+        return ["dealer"]
+    return []
 
 def generate_ticket_number():
     chars = string.ascii_uppercase + string.digits
@@ -333,7 +354,7 @@ async def operator_create_ticket(
         else:
             cust_by_email = await db.execute(
                 select(CustomerUser).where(
-                    (CustomerUser.email == ident) | (CustomerUser.phone_number == ident)
+                    (CustomerUser.email == ident) | (CustomerUser.phone == ident)
                 )
             )
             found_c = cust_by_email.scalar_one_or_none()
@@ -377,6 +398,11 @@ async def operator_create_ticket(
         if not row:
             raise HTTPException(status_code=404, detail="Order item not found")
         order_item, order = row
+        if order.customer_id != target_cust_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Order item #{ticket_in.order_item_id} belongs to order #{order.id}, which does not belong to customer {target_cust_id}"
+            )
         order_id = order.id
         product_id = order_item.product_id
         prod_obj = order_item.product
@@ -398,7 +424,14 @@ async def operator_create_ticket(
             .options(selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer))
         )
         order = order_res.scalar_one_or_none()
-        if order and order.items:
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order.customer_id != target_cust_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Order #{ticket_in.order_id} does not belong to customer {target_cust_id}"
+            )
+        if order.items:
             first_item = order.items[0]
             product_id = first_item.product_id
             prod_obj = first_item.product
@@ -471,6 +504,12 @@ async def get_order_context(
         
     if (current_user.role == "customer" or current_user.role == UserRole.CUSTOMER) and ticket.customer_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized to view order context for this ticket")
+
+    specialist_dept = get_user_specialist_dept(current_user)
+    if specialist_dept:
+        current_dept = ticket.assigned_department.lower().strip() if ticket.assigned_department else None
+        if current_dept and current_dept != specialist_dept:
+            raise HTTPException(status_code=403, detail="Not authorized to view order context for another department's tickets")
         
     if not ticket.order_id and not ticket.order_item_id:
         return OrderContextResponse(ticket_id=ticket.id)
@@ -481,9 +520,13 @@ async def get_order_context(
             select(Order)
             .where(Order.id == ticket.order_id)
             .options(
-                selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+                selectinload(Order.customer),
                 selectinload(Order.payment),
-                selectinload(Order.shipping_address).selectinload(Address.state_rel)
+                selectinload(Order.shipping_address).selectinload(Address.state_rel),
+                selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+                selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.category),
+                selectinload(Order.items).selectinload(OrderItem.rider).selectinload(DeliveryRider.user),
+                selectinload(Order.items).selectinload(OrderItem.logistics_partner),
             )
         )
         order = order_res.scalar_one_or_none()
@@ -492,9 +535,17 @@ async def get_order_context(
             select(OrderItem)
             .where(OrderItem.id == ticket.order_item_id)
             .options(
+                selectinload(OrderItem.order).selectinload(Order.customer),
                 selectinload(OrderItem.order).selectinload(Order.payment),
                 selectinload(OrderItem.order).selectinload(Order.shipping_address).selectinload(Address.state_rel),
-                selectinload(OrderItem.product).selectinload(Product.dealer)
+                selectinload(OrderItem.order).selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.dealer),
+                selectinload(OrderItem.order).selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.category),
+                selectinload(OrderItem.order).selectinload(Order.items).selectinload(OrderItem.rider).selectinload(DeliveryRider.user),
+                selectinload(OrderItem.order).selectinload(Order.items).selectinload(OrderItem.logistics_partner),
+                selectinload(OrderItem.product).selectinload(Product.dealer),
+                selectinload(OrderItem.product).selectinload(Product.category),
+                selectinload(OrderItem.rider).selectinload(DeliveryRider.user),
+                selectinload(OrderItem.logistics_partner)
             )
         )
         found_item = item_res.scalar_one_or_none()
@@ -504,24 +555,39 @@ async def get_order_context(
     if not order:
         return OrderContextResponse(ticket_id=ticket.id, order_id=ticket.order_id)
 
-    # Shipping Address dict
+    pm = order.payment
+
+    # Shipping Address dict with distinct recipient identity
     addr_dict = None
     if order.shipping_address:
         addr = order.shipping_address
         addr_dict = {
+            "recipient_name": getattr(addr, "full_name", None),
+            "recipient_phone": getattr(addr, "phone", None),
             "address_line1": getattr(addr, "address_line1", None) or getattr(addr, "address", None),
+            "address_line2": getattr(addr, "address_line2", None),
             "city": getattr(addr, "city", None),
             "state": (
                 getattr(getattr(addr, "state_rel", None), "name", None)
                 or (str(getattr(addr, "state_id", "")) if getattr(addr, "state_id", None) else None)
             ),
             "pincode": getattr(addr, "pincode", None),
+            "country": getattr(addr, "country", "India") or "India",
         }
 
-    # Logistics & Rider Info
-    logistics_name = None
-    rider_name = None
-    rider_phone = None
+    # Customer info (buyer who placed order)
+    cust_name = None
+    cust_email = None
+    cust_phone = None
+    if order.customer:
+        cust_name = order.customer.full_name
+        cust_email = order.customer.email
+        cust_phone = getattr(order.customer, "phone_number", None) or getattr(order.customer, "phone", None)
+    elif getattr(order, "customer_name", None) or getattr(order, "customer_phone", None):
+        cust_name = getattr(order, "customer_name", None)
+        cust_phone = getattr(order, "customer_phone", None)
+
+    # Base delivery status
     delivery_status = order.status.value if hasattr(order.status, "value") else str(order.status)
 
     # Items breakdown
@@ -530,48 +596,79 @@ async def get_order_context(
 
     settlement_config = await get_settlement_configuration(db)
 
-    for itm in order.items:
+    for itm in (order.items or []):
         prod = itm.product
         dealer = prod.dealer if prod else None
         
         # Calculate protection maturity
         mat_dt = None
-        deliv = itm.delivered_at or order.delivered_at
+        deliv = itm.delivered_at or (order.delivered_at if str(itm.status).lower() == "delivered" else None)
         if deliv:
             win = get_effective_protection_window(itm, product=prod, global_config=settlement_config)
             mat_dt = deliv + timedelta(days=win)
             
+        r_name = None
+        r_phone = None
+        if itm.rider:
+            r_name = itm.rider.user.full_name if itm.rider.user else None
+            r_phone = itm.rider.phone_number
+        lp_name = itm.logistics_partner.name if itm.logistics_partner else None
+        item_courier = itm.courier_company
+
+        item_attempts = getattr(itm, "delivery_attempts", 0) or 0
+
+        item_mrp = getattr(prod, 'mrp', None) or getattr(itm, 'price', 0.0)
+        item_selling_price = float(itm.price or 0.0)
+        item_qty = itm.quantity or 1
+        raw_disc = max(0.0, float(item_mrp - item_selling_price)) if item_mrp else 0.0
+        disc_pct = int(round((raw_disc / float(item_mrp)) * 100)) if (item_mrp and item_mrp > 0) else 0
+
         item_ctx = OrderItemContext(
             id=itm.id,
             product_id=itm.product_id,
             product_name=prod.name if prod else "Unknown Product",
             product_image=(prod.images[0] if (prod and getattr(prod, 'images', None) and isinstance(prod.images, list) and len(prod.images) > 0) else getattr(prod, 'image_url', None)),
-            quantity=itm.quantity or 1,
-            price=float(itm.price or 0.0),
+            category_name=prod.category.name if (prod and getattr(prod, 'category', None)) else None,
+            quantity=item_qty,
+            price=item_selling_price,
+            mrp=float(item_mrp) if item_mrp is not None else None,
+            discount_amount=round(raw_disc * item_qty, 2),
+            discount_percentage=disc_pct,
             status=itm.status.value if hasattr(itm.status, 'value') else (str(itm.status) if itm.status is not None else None),
             delivered_at=deliv,
             return_window_matures_at=mat_dt,
             dealer_name=dealer.business_name if dealer else None,
-            dealer_id=dealer.id if dealer else None
+            dealer_id=dealer.id if dealer else None,
+            courier_company=item_courier,
+            tracking_number=itm.tracking_number or order.tracking_number,
+            tracking_url=itm.tracking_url,
+            dispatch_date=itm.dispatch_date,
+            estimated_delivery=itm.estimated_delivery or order.estimated_delivery,
+            delivery_attempts=item_attempts,
+            delivery_type=itm.delivery_type,
+            reject_reason=itm.reject_reason,
+            logistics_partner_name=lp_name,
+            delivery_rider_name=r_name,
+            delivery_rider_phone=r_phone
         )
         order_items_list.append(item_ctx)
         if ticket.order_item_id == itm.id:
             selected_item_context = item_ctx
-            
-        # Check logistics info from item
-        lp_id = getattr(itm, "logistics_partner_id", None)
-        if lp_id and not logistics_name:
-            lp_res = await db.execute(select(LogisticsPartner).where(LogisticsPartner.id == lp_id))
-            lp = lp_res.scalar_one_or_none()
-            if lp: logistics_name = lp.name
-            
-        r_id = getattr(itm, "rider_id", None) or getattr(itm, "delivery_rider_id", None)
-        if r_id and not rider_name:
-            r_res = await db.execute(select(DeliveryRider).where(DeliveryRider.id == r_id))
-            rd = r_res.scalar_one_or_none()
-            if rd:
-                rider_name = rd.full_name
-                rider_phone = rd.phone_number
+
+    # Determine top-level delivery and tracking info
+    ref_item = selected_item_context or (order_items_list[0] if order_items_list else None)
+
+    top_logistics_name = ref_item.logistics_partner_name if ref_item else None
+    top_courier_company = ref_item.courier_company if ref_item else None
+    top_rider_name = ref_item.delivery_rider_name if ref_item else None
+    top_rider_phone = ref_item.delivery_rider_phone if ref_item else None
+    top_tracking_number = (ref_item.tracking_number if ref_item else None) or order.tracking_number
+    top_tracking_url = ref_item.tracking_url if ref_item else None
+    top_dispatch_date = ref_item.dispatch_date if ref_item else None
+    top_estimated_delivery = (ref_item.estimated_delivery if ref_item else None) or order.estimated_delivery
+    top_delivered_at = (ref_item.delivered_at if ref_item else None) or order.delivered_at
+    top_delivery_attempts = (ref_item.delivery_attempts if ref_item else 0) or 0
+    top_delivery_status = (ref_item.status if selected_item_context else None) or delivery_status
 
     # Returns record
     return_status = None
@@ -590,8 +687,9 @@ async def get_order_context(
         return_status = ret.status.value if hasattr(ret.status, "value") else str(ret.status)
         return_reason = ret.reason
 
-    # Settlement status
+    # Settlement status and structured settlement info
     settlement_status = "Not generated"
+    settlement_dict = None
     settle_item_res = await db.execute(
         select(SettlementItem, Settlement)
         .join(Settlement, SettlementItem.settlement_id == Settlement.id)
@@ -600,7 +698,477 @@ async def get_order_context(
     si_row = settle_item_res.first()
     if si_row:
         si, st = si_row
-        settlement_status = f"{st.status.value.upper()} (Settlement #{st.settlement_number or st.id})"
+        st_status_str = st.status.value if hasattr(st.status, "value") else str(st.status)
+        settlement_status = f"{st_status_str.upper()} (Settlement #{st.settlement_number or st.id})"
+        settlement_dict = {
+            "id": st.id,
+            "settlement_number": st.settlement_number or f"STL-{st.id}",
+            "status": st_status_str,
+            "net_amount": float(getattr(si, "net_payable", 0.0) or getattr(st, "net_payable", 0.0) or 0.0),
+            "is_l2_approved": getattr(st, "is_l2_approved", False),
+            "l2_approved_at": getattr(st, "l2_approved_at", None),
+        }
+
+    # Tracking object for UI backward compatibility
+    tracking_dict = {
+        "courier_company": top_courier_company or top_logistics_name,
+        "tracking_number": top_tracking_number,
+        "tracking_url": top_tracking_url,
+        "dispatch_date": top_dispatch_date,
+        "delivery_date": top_delivered_at,
+        "delivered_at": top_delivered_at,
+        "estimated_delivery": top_estimated_delivery,
+        "delivery_attempts": top_delivery_attempts,
+        "status": top_delivery_status
+    }
+
+    # Build Order Lifecycle Timeline
+    lifecycle_events = []
+
+    # 1. Order Placed
+    lifecycle_events.append(OrderLifecycleEvent(
+        event_key="order_placed",
+        event_title="Order Placed",
+        timestamp=order.created_at,
+        is_completed=True,
+        is_current=False,
+        description=f"Order #{order.order_number or order.id} placed by customer.",
+        source="system"
+    ))
+
+    # 2. Payment
+    payment_done = pm and str(pm.status).lower() in ("success", "paid")
+    is_cod = str(order.payment_method).lower() == "cod"
+    lifecycle_events.append(OrderLifecycleEvent(
+        event_key="payment",
+        event_title="Payment Confirmed" if payment_done else ("COD Order Placed" if is_cod else "Payment Pending"),
+        timestamp=(pm.completed_at or pm.initiated_at) if pm else order.created_at,
+        is_completed=payment_done or is_cod,
+        is_current=False,
+        description=f"Payment Method: {order.payment_method} (Gateway: {getattr(pm, 'payment_gateway', 'N/A') if pm else 'N/A'})",
+        source="payment_gateway" if pm else "system"
+    ))
+
+    # 3. Dispatched / Shipped
+    is_dispatched = bool(top_dispatch_date or (top_delivery_status and top_delivery_status.lower() in ("shipped", "dispatched", "out_for_delivery", "delivered")))
+    lifecycle_events.append(OrderLifecycleEvent(
+        event_key="dispatched",
+        event_title="Package Dispatched",
+        timestamp=top_dispatch_date,
+        is_completed=is_dispatched,
+        is_current=(top_delivery_status or "").lower() in ("shipped", "dispatched"),
+        description=f"Handed to {top_courier_company or top_logistics_name or 'logistics'} (AWB: {top_tracking_number or 'Pending'})" if is_dispatched else "Package packing and preparation.",
+        source="courier" if top_courier_company else "system"
+    ))
+
+    # 4. Out For Delivery
+    is_ofd = bool(top_delivered_at or (top_delivery_status and top_delivery_status.lower() in ("out_for_delivery", "delivered")))
+    lifecycle_events.append(OrderLifecycleEvent(
+        event_key="out_for_delivery",
+        event_title="Out for Delivery",
+        timestamp=top_delivered_at if top_delivered_at and not top_dispatch_date else None,
+        is_completed=is_ofd,
+        is_current=(top_delivery_status or "").lower() == "out_for_delivery",
+        description=f"Assigned to {top_rider_name or 'local courier delivery unit'}" if is_ofd else "Pending arrival at destination hub.",
+        source="rider" if top_rider_name else "courier"
+    ))
+
+    # 5. Delivered / Failed
+    is_delivered = bool(top_delivered_at or (top_delivery_status and top_delivery_status.lower() == "delivered"))
+    is_failed_or_returned = bool((top_delivery_status and top_delivery_status.lower() in ("undelivered", "failed", "returned", "cancelled")) or order.cancellation_reason)
+
+    if is_delivered:
+        lifecycle_events.append(OrderLifecycleEvent(
+            event_key="delivered",
+            event_title="Delivered",
+            timestamp=top_delivered_at,
+            is_completed=True,
+            is_current=True,
+            description=f"Package delivered successfully.",
+            source="rider" if top_rider_name else "courier"
+        ))
+    elif is_failed_or_returned:
+        lifecycle_events.append(OrderLifecycleEvent(
+            event_key="delivery_failed",
+            event_title=f"Delivery {top_delivery_status.capitalize() if top_delivery_status else 'Failed'}",
+            timestamp=order.cancelled_at or order.updated_at,
+            is_completed=True,
+            is_current=True,
+            description=f"Reason: {order.cancellation_reason or (ref_item.reject_reason if ref_item else None) or 'Customer unavailable / maximum attempts exceeded'}",
+            source="courier"
+        ))
+    else:
+        lifecycle_events.append(OrderLifecycleEvent(
+            event_key="delivered",
+            event_title="Delivery Pending",
+            timestamp=top_estimated_delivery,
+            is_completed=False,
+            is_current=False,
+            description=f"Estimated delivery: {top_estimated_delivery.strftime('%d %b %Y') if top_estimated_delivery else 'In transit'}",
+            source="system"
+        ))
+
+    # Build Rider Details Context
+    rider_details_obj = None
+    target_itm_with_rider = next((itm for itm in (order.items or []) if itm.rider and (ticket.order_item_id is None or itm.id == ticket.order_item_id)), None)
+    if not target_itm_with_rider:
+        target_itm_with_rider = next((itm for itm in (order.items or []) if itm.rider), None)
+
+    if target_itm_with_rider and target_itm_with_rider.rider:
+        r = target_itm_with_rider.rider
+        rider_details_obj = RiderDetailsContext(
+            rider_id=r.id,
+            full_name=r.user.full_name if r.user else None,
+            phone_number=r.phone_number,
+            vehicle_type=r.vehicle_type,
+            vehicle_number=r.vehicle_number,
+            current_status=r.current_status,
+            is_available=r.is_available,
+            average_rating=float(r.average_rating or 0.0),
+            total_reviews=r.total_reviews or 0,
+            logistics_partner_name=target_itm_with_rider.logistics_partner.name if target_itm_with_rider.logistics_partner else None,
+            business_name=r.business_name
+        )
+
+    # Build Delivery Attempt History
+    attempt_history = []
+    if top_delivery_attempts > 0:
+        for att_idx in range(1, top_delivery_attempts + 1):
+            is_last = (att_idx == top_delivery_attempts)
+            attempt_history.append(DeliveryAttemptRecord(
+                attempt_number=att_idx,
+                attempt_timestamp=top_delivered_at if (is_last and is_delivered) else (order.updated_at or order.created_at),
+                status="Delivered" if (is_last and is_delivered) else "Failed / Customer Unavailable",
+                reason=(ref_item.reject_reason if is_last and ref_item else None) or ("Customer unreachable / Door locked" if not (is_last and is_delivered) else None),
+                source="rider" if top_rider_name else "courier",
+                notes=f"Attempt {att_idx} of 3"
+            ))
+
+    # Build Proof of Delivery Context
+    pod_obj = ProofOfDeliveryContext(
+        is_available=False,
+        pod_type="courier_scan" if top_courier_company else ("rider_confirmation" if top_rider_name else None),
+        recipient_name=addr_dict.get("recipient_name") if (addr_dict and is_delivered) else None,
+        handover_timestamp=top_delivered_at if is_delivered else None,
+        evidence_url=None,
+        status_notes="Digital OTP / signature / photo proof not enabled on courier/rider channel. Only delivery timestamp and attempt logs are recorded."
+    )
+
+    # Calculate Customer Order Pricing Breakdown
+    calc_total_mrp = sum(float((getattr(itm.product, 'mrp', None) or itm.price or 0.0)) * (itm.quantity or 1) for itm in (order.items or []))
+    calc_selling_total = sum(float(itm.price or 0.0) * (itm.quantity or 1) for itm in (order.items or []))
+    calc_disc_on_mrp = max(0.0, calc_total_mrp - calc_selling_total)
+    persisted_coupon_disc = float(order.discount_amount or 0.0)
+    persisted_delivery_charge = float(order.delivery_charge or 0.0)
+    persisted_platform_fee = float(order.platform_fee_amount or 0.0)
+    persisted_wallet_used = float(order.wallet_amount_used or 0.0)
+    persisted_total = float(order.total_amount or 0.0)
+
+    # Final customer order amount from persisted components
+    expected_customer_total = round(calc_selling_total - persisted_coupon_disc - persisted_wallet_used + persisted_delivery_charge + persisted_platform_fee, 2)
+    has_pricing_discrepancy = abs(expected_customer_total - round(persisted_total, 2)) > 0.05
+    pricing_discrepancy_msg = None
+    if has_pricing_discrepancy:
+        pricing_discrepancy_msg = f"Discrepancy detected: Calculated customer total (₹{expected_customer_total:.2f}) differs from persisted order total (₹{persisted_total:.2f})."
+
+    pricing_breakdown_obj = CustomerOrderPricingBreakdown(
+        total_mrp=round(calc_total_mrp, 2),
+        discount_on_mrp=round(calc_disc_on_mrp, 2),
+        coupon_discount=round(persisted_coupon_disc, 2),
+        total_savings=round(calc_disc_on_mrp + persisted_coupon_disc, 2),
+        delivery_charge=round(persisted_delivery_charge, 2),
+        platform_fee=round(persisted_platform_fee, 2),
+        wallet_applied=round(persisted_wallet_used, 2),
+        other_customer_charges=0.0,
+        final_order_amount=round(persisted_total, 2),
+        persisted_total_amount=round(persisted_total, 2),
+        has_pricing_discrepancy=has_pricing_discrepancy,
+        discrepancy_details=pricing_discrepancy_msg
+    )
+
+    # Calculate COD Verification Details
+    is_order_cod = str(order.payment_method or '').lower() == 'cod'
+    cod_verification_obj = None
+    if is_order_cod:
+        # Check if rider recorded payment method during task completion
+        rider_coll_method = None
+        has_rider_delivery_event = False
+        for itm in (order.items or []):
+            if getattr(itm, 'rider_payment_method', None):
+                rider_coll_method = itm.rider_payment_method
+            if str(getattr(itm, 'status', '')).lower() == 'delivered':
+                has_rider_delivery_event = True
+
+        # Check payment table
+        pm_paid = pm and str(pm.status).lower() in ('success', 'paid')
+
+        # Collection status logic:
+        # If payment row has success OR rider marked payment method -> Collected
+        # If delivered but no collection record -> Inconsistency / Discrepancy
+        if pm_paid or rider_coll_method:
+            cod_status = "COLLECTED"
+            is_verified = True
+            coll_amt = float(pm.amount if pm and pm.amount else persisted_total)
+            coll_time = (pm.completed_at if pm and pm.completed_at else top_delivered_at)
+            reconcile_msg = None
+        elif is_delivered:
+            cod_status = "UNVERIFIED_DELIVERED"
+            is_verified = False
+            coll_amt = None
+            coll_time = None
+            reconcile_msg = "Order marked DELIVERED but no cash/UPI collection record exists in payment gateway or rider handover log."
+        else:
+            cod_status = "PENDING_DELIVERY"
+            is_verified = False
+            coll_amt = None
+            coll_time = None
+            reconcile_msg = None
+
+        cod_verification_obj = CODVerificationContext(
+            is_cod=True,
+            payment_method="Cash on Delivery (COD)",
+            payment_status=pm.status.value if (pm and hasattr(pm.status, 'value')) else (str(pm.status) if pm else "pending"),
+            cod_collection_status=cod_status,
+            amount_to_collect=round(persisted_total, 2),
+            amount_collected=round(coll_amt, 2) if coll_amt is not None else None,
+            collected_at=coll_time,
+            collected_by=top_rider_name or (f"Logistics Partner ({top_logistics_name})" if top_logistics_name else "Courier"),
+            collected_method=rider_coll_method or (pm.payment_gateway if pm else None),
+            is_verified_collected=is_verified,
+            reconciliation_discrepancy=reconcile_msg
+        )
+
+    user_authorized_depts = get_user_authorized_departments(current_user)
+
+    # 1. Logistics Investigation
+    logistics_inv = None
+    if "logistics" in user_authorized_depts:
+        discrepancy = None
+        if top_delivery_status and top_delivery_status.lower() == "delivered" and (top_delivery_attempts == 0 or not top_delivered_at):
+            discrepancy = "Order marked DELIVERED but 0 delivery attempt events recorded."
+        elif top_delivery_status and top_delivery_status.lower() in ("shipped", "dispatched", "out_for_delivery"):
+            if top_estimated_delivery and top_estimated_delivery < datetime.utcnow():
+                discrepancy = "Package is past estimated delivery date without terminal scan."
+
+        shipment_exc = []
+        if ret and getattr(ret, "pickup_attempts", 0) and ret.pickup_attempts > 1:
+            shipment_exc.append(f"Return pickup delayed: {ret.pickup_attempts} attempts recorded.")
+        for itm in order.items or []:
+            if getattr(itm, "reject_reason", None):
+                shipment_exc.append(f"Item #{itm.id} rejection note: {itm.reject_reason}")
+
+        logistics_inv = LogisticsInvestigationContext(
+            is_accessible=True,
+            courier_company=top_courier_company,
+            tracking_number=top_tracking_number,
+            tracking_url=top_tracking_url,
+            dispatch_date=top_dispatch_date,
+            estimated_delivery=top_estimated_delivery,
+            delivered_at=top_delivered_at,
+            delivery_attempts=top_delivery_attempts,
+            attempt_history=attempt_history,
+            rider_details=rider_details_obj,
+            proof_of_delivery=pod_obj,
+            delivery_discrepancy=discrepancy,
+            shipment_exceptions=shipment_exc
+        )
+
+    # 2. Finance Investigation
+    finance_inv = None
+    if "finance" in user_authorized_depts:
+        wh_logs = []
+        if pm:
+            try:
+                wh_res = await db.execute(
+                    select(PaymentWebhook)
+                    .where(PaymentWebhook.payment_id == pm.id)
+                    .order_by(PaymentWebhook.created_at.desc())
+                    .limit(10)
+                )
+                wh_logs = [
+                    {
+                        "id": w.id,
+                        "event_type": w.event_type,
+                        "processed": w.processed,
+                        "created_at": w.created_at
+                    }
+                    for w in wh_res.scalars().all()
+                ]
+            except Exception:
+                wh_logs = []
+
+        fin_discrepancies = []
+        if cod_verification_obj and cod_verification_obj.reconciliation_discrepancy:
+            fin_discrepancies.append(cod_verification_obj.reconciliation_discrepancy)
+        if pricing_breakdown_obj and pricing_breakdown_obj.has_pricing_discrepancy:
+            fin_discrepancies.append(pricing_breakdown_obj.discrepancy_details)
+        if ret and ret.status and str(ret.status).upper() in ("APPROVED", "RETURN_PICKUP_COMPLETED", "COMPLETED") and not getattr(ret, "refund_initiated", False):
+            fin_discrepancies.append("Return approved/completed but refund has not been initiated.")
+
+        refund_dict = None
+        if pm and (pm.refund_amount or pm.refunded_at or pm.refund_reason):
+            refund_dict = {
+                "amount": float(pm.refund_amount or 0.0),
+                "refund_reason": pm.refund_reason,
+                "refunded_at": pm.refunded_at,
+                "status": "REFUNDED" if str(pm.status).lower() == "refunded" else "PARTIAL_REFUND"
+            }
+        elif ret and (ret.refund_amount or ret.refund_initiated or ret.refund_reference):
+            refund_dict = {
+                "amount": float(ret.refund_amount or 0.0),
+                "refund_mode": ret.refund_mode,
+                "refund_reference": ret.refund_reference,
+                "refund_initiated": ret.refund_initiated,
+                "requested_at": ret.requested_at,
+                "status": "INITIATED" if ret.refund_initiated else "REQUESTED"
+            }
+
+        finance_inv = FinanceInvestigationContext(
+            is_accessible=True,
+            payment_id=pm.id if pm else None,
+            payment_method=order.payment_method,
+            payment_status=pm.status.value if (pm and hasattr(pm.status, "value")) else (str(pm.status) if pm else "Pending"),
+            transaction_id=pm.transaction_id if pm else None,
+            payment_gateway=pm.payment_gateway if pm else None,
+            amount=float(pm.amount or order.total_amount or 0.0) if pm else float(order.total_amount or 0.0),
+            currency="INR",
+            card_last4=getattr(pm, "card_last4", None) if pm else None,
+            card_brand=getattr(pm, "card_brand", None) if pm else None,
+            upi_id=getattr(pm, "upi_id", None) if pm else None,
+            wallet_provider=getattr(pm, "wallet_provider", None) if pm else None,
+            gateway_response_captured=bool(wh_logs),
+            gateway_event_logs=wh_logs,
+            pricing_breakdown=pricing_breakdown_obj,
+            cod_verification=cod_verification_obj,
+            refund_details=refund_dict,
+            settlement_details=settlement_dict,
+            financial_discrepancies=fin_discrepancies
+        )
+
+    # 3. Dealer / Product Investigation
+    dealer_inv = None
+    if "dealer" in user_authorized_depts:
+        primary_item = None
+        for itm in order.items or []:
+            if ticket.order_item_id == itm.id:
+                primary_item = itm
+                break
+        if not primary_item and order.items:
+            primary_item = order.items[0]
+
+        prod = primary_item.product if primary_item else None
+        dlr = prod.dealer if prod else None
+        cat = prod.category if prod else None
+
+        fulfillment_ret = None
+        if ret:
+            fulfillment_ret = {
+                "return_id": ret.id,
+                "reason": ret.reason,
+                "status": ret.status.value if hasattr(ret.status, "value") else str(ret.status),
+                "is_exchange": ret.is_exchange,
+                "pickup_attempts": ret.pickup_attempts,
+                "images": ret.images or [],
+                "admin_notes": ret.admin_notes
+            }
+
+        listing_disc = None
+        if prod and primary_item:
+            if prod.selling_price is not None and abs(float(prod.selling_price) - float(primary_item.price)) > 0.01:
+                listing_disc = f"Catalog selling price (₹{prod.selling_price:.2f}) differs from ordered price (₹{primary_item.price:.2f})."
+        if dlr and not dlr.is_approved:
+            listing_disc = (listing_disc + " " if listing_disc else "") + "Dealer registration status is unapproved/pending."
+
+        dealer_inv = DealerProductInvestigationContext(
+            is_accessible=True,
+            dealer_id=str(dlr.id) if dlr else None,
+            dealer_name=dlr.business_name if dlr else None,
+            dealer_gst=dlr.gst_number if dlr else None,
+            dealer_phone=dlr.business_phone if dlr else None,
+            dealer_city=dlr.city if dlr else None,
+            dealer_is_approved=dlr.is_approved if dlr else None,
+            product_id=str(prod.id) if prod else None,
+            product_name=prod.name if prod else (primary_item.product_name if primary_item else None),
+            product_sku=prod.sku if prod else None,
+            category_name=cat.name if cat else None,
+            hsn_code=prod.hsn_code if prod else None,
+            specifications=prod.attributes if prod and prod.attributes else None,
+            is_returnable=prod.is_returnable if prod else True,
+            return_window_days=prod.return_window_days if prod else 14,
+            return_policy_note=prod.return_policy_note if prod else None,
+            item_ordered_price=float(primary_item.price) if primary_item else None,
+            item_ordered_quantity=primary_item.quantity if primary_item else None,
+            fulfillment_return_evidence=fulfillment_ret,
+            product_images=prod.images if prod and prod.images else [],
+            listing_discrepancy=listing_disc
+        )
+
+    # 4. Technology Investigation
+    technology_inv = None
+    if "technology" in user_authorized_depts:
+        dev_info = ticket.device_info or {}
+        platform_val = dev_info.get("platform") or (ticket.source.value if hasattr(ticket.source, "value") else str(ticket.source))
+
+        integ_failures = []
+        if pm and str(pm.status).lower() == "failed":
+            integ_failures.append({
+                "system": "Payment Gateway",
+                "error": pm.failure_reason or "Transaction failed by gateway",
+                "timestamp": pm.updated_at or pm.initiated_at
+            })
+        if ticket.complaint_reason and "Payment made still order is showing pending" in ticket.complaint_reason:
+            integ_failures.append({
+                "system": "Gateway Webhook Listener",
+                "error": "Payment webhook notification delayed or unreceived",
+                "timestamp": ticket.created_at
+            })
+
+        audit_trail = []
+        try:
+            audit_res = await db.execute(
+                select(AuditLog)
+                .where(
+                    or_(
+                        AuditLog.resource_id == str(order.id),
+                        AuditLog.resource_id == str(ticket.id)
+                    )
+                )
+                .order_by(AuditLog.created_at.desc())
+                .limit(10)
+            )
+            audit_trail = [
+                {
+                    "action": a.action,
+                    "resource_type": a.resource_type,
+                    "description": a.description,
+                    "ip_address": a.ip_address,
+                    "timestamp": a.created_at
+                }
+                for a in audit_res.scalars().all()
+            ]
+        except Exception:
+            audit_trail = []
+
+        technology_inv = TechnologyInvestigationContext(
+            is_accessible=True,
+            ticket_id=ticket.id,
+            ticket_number=ticket.ticket_number,
+            order_id=order.id,
+            order_number=order.order_number,
+            device_info=dev_info if dev_info else None,
+            platform=platform_val,
+            app_version=dev_info.get("app_version") or dev_info.get("version"),
+            os_version=dev_info.get("os_version") or dev_info.get("os"),
+            browser=dev_info.get("browser"),
+            client_ip=dev_info.get("ip_address") or dev_info.get("ip"),
+            ticket_source=ticket.source.value if hasattr(ticket.source, "value") else str(ticket.source),
+            complaint_reason=ticket.complaint_reason,
+            error_context=pm.failure_reason if (pm and pm.failure_reason) else ticket.description,
+            transaction_reference=pm.transaction_id if pm else None,
+            integration_failures=integ_failures,
+            audit_trail=audit_trail,
+            telemetry_status="Captured via client device_info and system audit trail" if (dev_info or audit_trail) else "No client device_info recorded; diagnostic logs derived from server events."
+        )
 
     pm = order.payment
     return OrderContextResponse(
@@ -615,16 +1183,82 @@ async def get_order_context(
         refund_status=pm.status.value if (pm and str(pm.status).lower() == "refunded") else ("Refunded" if getattr(order, "is_refunded", False) else None),
         refund_amount=float(getattr(pm, "refund_amount", 0.0) or 0.0) if pm else 0.0,
         shipping_address=addr_dict,
-        logistics_partner_name=logistics_name,
-        delivery_rider_name=rider_name,
-        delivery_rider_phone=rider_phone,
-        delivery_status=delivery_status,
+        customer_id=order.customer_id,
+        customer_name=cust_name,
+        customer_email=cust_email,
+        customer_phone=cust_phone,
+        logistics_partner_name=top_logistics_name,
+        courier_company=top_courier_company,
+        delivery_rider_name=top_rider_name,
+        delivery_rider_phone=top_rider_phone,
+        delivery_status=top_delivery_status,
+        tracking_number=top_tracking_number,
+        tracking_url=top_tracking_url,
+        dispatch_date=top_dispatch_date,
+        estimated_delivery=top_estimated_delivery,
+        delivered_at=top_delivered_at,
+        delivery_attempts=top_delivery_attempts,
+        lifecycle_timeline=lifecycle_events,
+        rider_details=rider_details_obj,
+        delivery_attempt_history=attempt_history,
+        proof_of_delivery=pod_obj,
+        pricing_breakdown=pricing_breakdown_obj,
+        cod_verification=cod_verification_obj,
         return_status=return_status,
         return_reason=return_reason,
         settlement_status=settlement_status,
+        settlement=settlement_dict,
+        tracking=tracking_dict,
         order_items=order_items_list,
-        selected_order_item=selected_item_context
+        selected_order_item=selected_item_context,
+        authorized_departments=user_authorized_depts,
+        active_department_view=user_authorized_depts[0] if user_authorized_depts else None,
+        logistics_investigation=logistics_inv,
+        finance_investigation=finance_inv,
+        dealer_investigation=dealer_inv,
+        technology_investigation=technology_inv
     )
+
+@router.get("/{ticket_id}/department-investigation/{department}", response_model=DepartmentInvestigationResponse, tags=["support"])
+async def get_department_investigation(
+    ticket_id: int,
+    department: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Backoffice: Get department-specific investigation block for authorized specialist"""
+    dept_key = department.lower().strip()
+    if dept_key not in ["logistics", "finance", "dealer", "technology"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid department '{department}'. Allowed departments: logistics, finance, dealer, technology"
+        )
+
+    user_depts = get_user_authorized_departments(current_user)
+    if dept_key not in user_depts:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Not authorized to access {dept_key} department investigation details"
+        )
+
+    ctx = await get_order_context(ticket_id, current_user, db)
+
+    if dept_key == "logistics":
+        if not ctx.logistics_investigation:
+            raise HTTPException(status_code=404, detail="Logistics investigation data not found for this ticket")
+        return DepartmentInvestigationResponse(ticket_id=ticket_id, department=dept_key, is_accessible=True, data=ctx.logistics_investigation)
+    elif dept_key == "finance":
+        if not ctx.finance_investigation:
+            raise HTTPException(status_code=404, detail="Finance investigation data not found for this ticket")
+        return DepartmentInvestigationResponse(ticket_id=ticket_id, department=dept_key, is_accessible=True, data=ctx.finance_investigation)
+    elif dept_key == "dealer":
+        if not ctx.dealer_investigation:
+            raise HTTPException(status_code=404, detail="Dealer investigation data not found for this ticket")
+        return DepartmentInvestigationResponse(ticket_id=ticket_id, department=dept_key, is_accessible=True, data=ctx.dealer_investigation)
+    elif dept_key == "technology":
+        if not ctx.technology_investigation:
+            raise HTTPException(status_code=404, detail="Technology investigation data not found for this ticket")
+        return DepartmentInvestigationResponse(ticket_id=ticket_id, department=dept_key, is_accessible=True, data=ctx.technology_investigation)
 
 # --- DEPARTMENT ACTION & RCA ENDPOINT ---
 
@@ -817,6 +1451,21 @@ async def add_message(
         msg_in.is_internal_note = False
         if ticket.status == TicketStatus.WAITING_ON_CUSTOMER:
             ticket.status = TicketStatus.IN_PROGRESS
+
+    specialist_dept = get_user_specialist_dept(current_user)
+    is_backoffice_role = current_user.role in [
+        UserRole.PARTNER_BACKOFFICE,
+        UserRole.PARTNER_LOGISTICS_SPECIALIST,
+        UserRole.PARTNER_FINANCE_SPECIALIST,
+        UserRole.PARTNER_TECH_SUPPORT
+    ] or bool(specialist_dept)
+
+    # Backoffice personnel can only add internal notes while ticket is in Backoffice stage
+    if is_backoffice_role and ticket.ticket_stage == TicketStage.BACKOFFICE and not msg_in.is_internal_note:
+        raise HTTPException(
+            status_code=403,
+            detail="Backoffice specialists cannot send public customer replies while ticket is in Backoffice stage. Customer replies are restricted to Helpdesk."
+        )
             
     new_message = TicketMessage(
         ticket_id=ticket.id,
@@ -846,6 +1495,18 @@ async def update_status(
     is_cust = (current_user.role == "customer" or current_user.role == UserRole.CUSTOMER or getattr(current_user, "is_customer", False))
     if is_cust and status_in.status != TicketStatus.CLOSED:
         raise HTTPException(status_code=403, detail="Customers can only close tickets")
+
+    # Enforce hierarchy: Backoffice cannot resolve/close tickets directly; must return to Helpdesk
+    if status_in.status in [TicketStatus.RESOLVED, TicketStatus.CLOSED]:
+        if ticket.ticket_stage == TicketStage.BACKOFFICE and current_user.role not in [
+            UserRole.ADMIN,
+            UserRole.SUPER_ADMIN,
+            UserRole.PARTNER_SUPPORT_MANAGER
+        ]:
+            raise HTTPException(
+                status_code=403,
+                detail="Backoffice specialists cannot resolve or close tickets directly. Please use 'Return to Helpdesk' to submit investigation findings."
+            )
         
     ticket.status = status_in.status
     if status_in.status in [TicketStatus.RESOLVED, TicketStatus.CLOSED]:
@@ -962,17 +1623,104 @@ async def return_to_helpdesk(
             raise HTTPException(status_code=403, detail="Not authorized to return another department's tickets")
         
     ticket.ticket_stage = TicketStage.HELPDESK
-    ticket.assigned_user_id = None
-    
+
+    # Locate originating helpdesk operator from the latest escalation audit log
+    esc_msg_res = await db.execute(
+        select(TicketMessage)
+        .where(
+            TicketMessage.ticket_id == ticket.id,
+            TicketMessage.is_internal_note == True,
+            TicketMessage.message.like("[Escalated to Backoffice]%")
+        )
+        .order_by(TicketMessage.created_at.desc())
+    )
+    latest_esc_msg = esc_msg_res.scalars().first()
+    assigned_helpdesk_operator_id = None
+    if isinstance(latest_esc_msg, TicketMessage) and latest_esc_msg.sender_id:
+        u_res = await db.execute(
+            select(User).where(User.id == latest_esc_msg.sender_id, User.is_active == True)
+        )
+        originating_user = u_res.scalar_one_or_none()
+        valid_helpdesk_roles = [
+            UserRole.PARTNER_HELPDESK_OPERATOR,
+            UserRole.PARTNER_HELPDESK_SUPERVISOR,
+            UserRole.PARTNER_HELPDESK_MANAGER,
+            UserRole.ADMIN,
+            UserRole.SUPER_ADMIN
+        ]
+        if originating_user and isinstance(originating_user, User) and originating_user.role in valid_helpdesk_roles:
+            assigned_helpdesk_operator_id = originating_user.id
+
+    ticket.assigned_user_id = assigned_helpdesk_operator_id
+
+    routing_suffix = f" (Reassigned to Helpdesk Operator #{assigned_helpdesk_operator_id})" if assigned_helpdesk_operator_id else " (Unassigned in Helpdesk queue)"
     new_message = TicketMessage(
         ticket_id=ticket.id,
         sender_id=current_user.id,
-        message=f"[Returned to Helpdesk] Resolution Summary: {return_in.resolution_summary}",
+        message=f"[Returned to Helpdesk] Resolution Summary: {return_in.resolution_summary}{routing_suffix}",
         is_internal_note=True
     )
     db.add(new_message)
     await db.commit()
     
+    res = await db.execute(
+        select(SupportTicket)
+        .options(
+            selectinload(SupportTicket.messages),
+            selectinload(SupportTicket.assigned_user),
+            selectinload(SupportTicket.resolved_by_user)
+        )
+        .where(SupportTicket.id == ticket_id)
+    )
+    return res.scalar_one()
+
+@router.post("/{ticket_id}/claim", response_model=SupportTicketResponse, tags=["support"])
+async def claim_ticket(
+    ticket_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Backoffice Specialist: Claim an unassigned ticket in BACKOFFICE stage"""
+    allowed_roles = [
+        UserRole.PARTNER_BACKOFFICE,
+        UserRole.PARTNER_LOGISTICS_SPECIALIST,
+        UserRole.PARTNER_FINANCE_SPECIALIST,
+        UserRole.PARTNER_TECH_SUPPORT,
+        UserRole.ADMIN,
+        UserRole.SUPER_ADMIN
+    ]
+    if current_user.role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Not authorized to claim Backoffice tickets")
+
+    res = await db.execute(select(SupportTicket).where(SupportTicket.id == ticket_id))
+    ticket = res.scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    if ticket.ticket_stage != TicketStage.BACKOFFICE:
+        raise HTTPException(status_code=400, detail="Only tickets in Backoffice stage can be claimed by Backoffice specialists")
+
+    specialist_dept = get_user_specialist_dept(current_user)
+    if specialist_dept:
+        ticket_dept = ticket.assigned_department.lower().strip() if ticket.assigned_department else None
+        if ticket_dept and ticket_dept != specialist_dept:
+            raise HTTPException(status_code=403, detail="Cannot claim a ticket assigned to another department")
+
+    if ticket.assigned_user_id is not None:
+        if ticket.assigned_user_id != current_user.id:
+            raise HTTPException(status_code=409, detail="Ticket is already claimed by another specialist")
+    else:
+        ticket.assigned_user_id = current_user.id
+        dept_name = (ticket.assigned_department or "Backoffice").capitalize()
+        claim_msg = TicketMessage(
+            ticket_id=ticket.id,
+            sender_id=current_user.id,
+            message=f"[Ticket Claimed] Claimed by {current_user.full_name or current_user.email} ({dept_name})",
+            is_internal_note=True
+        )
+        db.add(claim_msg)
+        await db.commit()
+
     res = await db.execute(
         select(SupportTicket)
         .options(

@@ -468,7 +468,7 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     mkt_cust_charge = sum(getattr(item, 'marketplace_customer_charge', 0.0) or 0.0 for item in order_items) if order_items else 0.0
     if not mkt_cust_charge:
         plat_fee = getattr(order, 'platform_fee_amount', 0.0) or 0.0
-        mkt_cust_charge = plat_fee if plat_fee > 0 else 2.38
+        mkt_cust_charge = plat_fee if plat_fee > 0 else 0.0
 
     mkt_sac_code = marketplace_sac or "998314"
     mkt_desc_html = f"<b>Marketplace Platform Services</b><br/><font color='#333333'><b>SAC:</b> {mkt_sac_code}</font>"
@@ -529,10 +529,12 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     story.append(Paragraph("<b>3. SHIPPING SERVICES</b>", style_section_title))
     story.append(Spacer(1, 4))
     ship_table_data = [make_table_header()]
-    ship_cust_charge = sum(getattr(item, 'logistics_customer_charge', 0.0) or 0.0 for item in order_items) if order_items else 0.0
-    if not ship_cust_charge:
-        del_charge = getattr(order, 'delivery_charge', 0.0) or 0.0
-        ship_cust_charge = del_charge if del_charge > 0 else 42.75
+    if getattr(order, 'delivery_charge', None) is not None:
+        ship_cust_charge = float(order.delivery_charge or 0.0)
+    elif order_items:
+        ship_cust_charge = float(sum(getattr(item, 'logistics_customer_charge', 0.0) or 0.0 for item in order_items))
+    else:
+        ship_cust_charge = 0.0
 
     ship_sac_code = logistics_sac or "996812"
     ship_desc_html = f"<b>Logistics & Shipping Services</b><br/><font color='#333333'><b>SAC:</b> {ship_sac_code}</font>"

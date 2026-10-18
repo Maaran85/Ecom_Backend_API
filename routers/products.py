@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, and_, cast, String, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload, aliased, joinedload
 from typing import List, Optional
 import csv
@@ -611,6 +612,11 @@ async def create_product(
         product_data["brand_id"] = other_brand.id
 
     variants_data = product_data.pop("variants", [])
+    if product_in.parent_product_id and variants_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create child variants for an existing variant. Multi-level variant nesting is not supported."
+        )
     
     db_product = ProductModel(**product_data)
     
@@ -839,6 +845,11 @@ async def update_product(
         update_data.pop("brand_id")
 
     variants_data = update_data.pop("variants", None)
+    if (db_product.parent_product_id or update_data.get("parent_product_id")) and variants_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create child variants for an existing variant. Multi-level variant nesting is not supported."
+        )
 
     # Validate subcategory belongs to category hierarchy if provided/updated
     target_category_id = update_data.get("category_id", db_product.category_id)
@@ -1192,6 +1203,38 @@ async def delete_brand(
     await db.commit()
     return {"message": "Brand deleted successfully"}
 
+def get_search_variations(term: str) -> List[str]:
+    clean = term.strip()
+    if not clean:
+        return []
+    variations = [clean]
+    lower = clean.lower()
+
+    # Plural to singular
+    if lower.endswith("ies") and len(clean) > 4:
+        variations.append(clean[:-3] + "y")
+    elif lower.endswith("es") and len(clean) > 4 and (lower[-3] in "sxyz" or lower.endswith(("ches", "shes"))):
+        variations.append(clean[:-2])
+    elif lower.endswith("s") and len(clean) > 3 and not lower.endswith("ss"):
+        variations.append(clean[:-1])
+
+    # Singular to plural
+    if lower.endswith("y") and len(clean) > 3 and lower[-2] not in "aeiou":
+        variations.append(clean[:-1] + "ies")
+    elif lower.endswith(("s", "x", "z", "ch", "sh")) and not lower.endswith("es"):
+        variations.append(clean + "es")
+    elif not lower.endswith("s"):
+        variations.append(clean + "s")
+
+    seen = set()
+    result = []
+    for v in variations:
+        v_low = v.lower()
+        if v_low not in seen:
+            seen.add(v_low)
+            result.append(v)
+    return result
+
 @router.get("/products", response_model=List[Product], tags=["products"])
 async def get_products(
     response: Response,
@@ -1202,6 +1245,7 @@ async def get_products(
     dealer_id: Optional[UUID] = None,
     hub_id: Optional[int] = None,
     search: Optional[str] = None,
+    q: Optional[str] = None,
     is_approved: Optional[bool] = None,
     include_children: Optional[bool] = False,
     min_discount: Optional[int] = None,
@@ -1255,8 +1299,26 @@ async def get_products(
         if not include_children:
             query = query.where(ProductModel.parent_product_id.is_(None))
 
-    if search:
-        query = query.where(ProductModel.name.ilike(f"%{search}%"))
+    search_term = (q or search or "").strip()
+    if search_term:
+        SubcategoryModel = aliased(CategoryModel)
+        variations = get_search_variations(search_term)
+        search_clauses = []
+        for term in variations:
+            search_clauses.extend([
+                ProductModel.name.ilike(f"%{term}%"),
+                ProductModel.description.ilike(f"%{term}%"),
+                BrandModel.name.ilike(f"%{term}%"),
+                and_(CategoryModel.name.ilike(f"%{term}%"), CategoryModel.is_active == True, CategoryModel.is_deleted == False),
+                and_(SubcategoryModel.name.ilike(f"%{term}%"), SubcategoryModel.is_active == True, SubcategoryModel.is_deleted == False)
+            ])
+        query = (
+            query
+            .outerjoin(BrandModel, ProductModel.brand_id == BrandModel.id)
+            .outerjoin(CategoryModel, ProductModel.category_id == CategoryModel.id)
+            .outerjoin(SubcategoryModel, ProductModel.subcategory_id == SubcategoryModel.id)
+            .where(or_(*search_clauses))
+        )
         
     if is_approved is not None:
         query = query.where(ProductModel.is_approved == is_approved)
@@ -1304,7 +1366,7 @@ async def get_products(
         selectinload(ProductModel.children).joinedload(ProductModel.brand)
     )
     result = await db.execute(query)
-    products = result.scalars().all()
+    products = result.scalars().unique().all()
     
     if hub_id and products:
         product_ids = [p.id for p in products]
@@ -1326,9 +1388,25 @@ async def get_search_history(
     db: AsyncSession = Depends(get_db)
 ):
     """Get recent search history for logged-in user"""
+    target_id = current_user.id
+    user_exists = await db.scalar(select(User.id).where(User.id == current_user.id))
+    if not user_exists and (getattr(current_user, 'phone', None) or getattr(current_user, 'email', None)):
+        conds = []
+        if getattr(current_user, 'phone', None):
+            conds.append(User.phone == current_user.phone)
+        if getattr(current_user, 'email', None):
+            conds.append(User.email == current_user.email)
+        matched_id = await db.scalar(select(User.id).where(or_(*conds)))
+        if matched_id:
+            target_id = matched_id
+        else:
+            return []
+    elif not user_exists:
+        return []
+
     result = await db.execute(
         select(SearchHistoryModel)
-        .where(SearchHistoryModel.customer_id == current_user.id)
+        .where(SearchHistoryModel.customer_id == target_id)
         .order_by(SearchHistoryModel.created_at.desc())
         .limit(limit)
     )
@@ -1336,14 +1414,16 @@ async def get_search_history(
 
 @router.get("/products/search", response_model=List[Product], tags=["products"])
 async def search_products(
+    response: Response = None,
     q: Optional[str] = None,
+    search: Optional[str] = None,
     category_id: Optional[int] = None,
     subcategory_id: Optional[int] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     min_rating: Optional[float] = None,
     min_discount: Optional[int] = None,
-    brands: Optional[List[int]] = Query(default=None),
+    brands: Optional[List[str]] = Query(default=None),
     colors: Optional[List[str]] = Query(default=None),
     attributes: Optional[str] = None, # JSON string of selected dynamic attribute filters
     in_stock: bool = False,
@@ -1356,29 +1436,62 @@ async def search_products(
     db: AsyncSession = Depends(get_db)
 ):
     """Advanced product search with filters and sorting"""
+    search_term = (q or search or "").strip()
     # Save search history if user is logged in and query is provided
-    if user and getattr(user, 'is_customer', False) and q:
-        history_entry = SearchHistoryModel(customer_id=user.id, query=q)
-        db.add(history_entry)
-        await db.commit()  # Commit history even if search fails or returns nothing
+    if user and getattr(user, 'is_customer', False) and search_term:
+        try:
+            # Check if customer has a valid referenced user ID in the users table
+            target_user_id = await db.scalar(select(User.id).where(User.id == user.id))
+            if not target_user_id and (getattr(user, 'phone', None) or getattr(user, 'email', None)):
+                conds = []
+                if getattr(user, 'phone', None):
+                    conds.append(User.phone == user.phone)
+                if getattr(user, 'email', None):
+                    conds.append(User.email == user.email)
+                target_user_id = await db.scalar(select(User.id).where(or_(*conds)))
+
+            if target_user_id:
+                history_entry = SearchHistoryModel(customer_id=target_user_id, query=search_term)
+                db.add(history_entry)
+                await db.commit()
+        except IntegrityError:
+            await db.rollback()
+        except Exception as e:
+            await db.rollback()
+            gst_logger.warning("Failed to record search history: %s", e)
     
-    query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
-        ProductModel.is_deleted == False,
-        DealerModel.access_status == 'active',
-        DealerModel.is_active == True, DealerModel.is_deleted == False,
-        ProductModel.is_approved == True,
-        or_(DealerModel.partner_id.is_(None), PartnerModel.is_active == True)
+    SubcategoryModel = aliased(CategoryModel)
+    query = (
+        select(ProductModel)
+        .join(DealerModel)
+        .outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id)
+        .outerjoin(BrandModel, ProductModel.brand_id == BrandModel.id)
+        .outerjoin(CategoryModel, ProductModel.category_id == CategoryModel.id)
+        .outerjoin(SubcategoryModel, ProductModel.subcategory_id == SubcategoryModel.id)
+        .where(
+            ProductModel.is_deleted == False,
+            DealerModel.access_status == 'active',
+            DealerModel.is_active == True, DealerModel.is_deleted == False,
+            ProductModel.is_approved == True,
+            or_(DealerModel.partner_id.is_(None), PartnerModel.is_active == True)
+        )
     )
     if not include_variants:
         query = query.where(ProductModel.parent_product_id.is_(None))
     
-    # Text search (name and description)
-    if q:
-        search_filter = or_(
-            ProductModel.name.ilike(f"%{q}%"),
-            ProductModel.description.ilike(f"%{q}%")
-        )
-        query = query.where(search_filter)
+    # Text search (name, description, brand, category, subcategory with singular/plural variations)
+    if search_term:
+        variations = get_search_variations(search_term)
+        search_clauses = []
+        for term in variations:
+            search_clauses.extend([
+                ProductModel.name.ilike(f"%{term}%"),
+                ProductModel.description.ilike(f"%{term}%"),
+                BrandModel.name.ilike(f"%{term}%"),
+                and_(CategoryModel.name.ilike(f"%{term}%"), CategoryModel.is_active == True, CategoryModel.is_deleted == False),
+                and_(SubcategoryModel.name.ilike(f"%{term}%"), SubcategoryModel.is_active == True, SubcategoryModel.is_deleted == False)
+            ])
+        query = query.where(or_(*search_clauses))
     
     # Category filter with subcategories
     if subcategory_id is not None and category_id is not None:
@@ -1421,9 +1534,25 @@ async def search_products(
             )
         )
 
-    # Brand filter (by brand_id)
-    if brands and isinstance(brands, list):
-        query = query.where(ProductModel.brand_id.in_(brands))
+    # Brand filter (by brand_id or brand name)
+    actual_brands = brands if isinstance(brands, (list, tuple, set)) else None
+    if actual_brands:
+        brand_id_filters = []
+        brand_name_filters = []
+        for b in actual_brands:
+            b_str = str(b).strip()
+            if b_str.isdigit():
+                brand_id_filters.append(int(b_str))
+            elif b_str:
+                brand_name_filters.append(b_str)
+        brand_clauses = []
+        if brand_id_filters:
+            brand_clauses.append(ProductModel.brand_id.in_(brand_id_filters))
+        if brand_name_filters:
+            for bn in brand_name_filters:
+                brand_clauses.append(BrandModel.name.ilike(f"%{bn}%"))
+        if brand_clauses:
+            query = query.where(or_(*brand_clauses))
     
     # Color filter (checks ProductModel.attributes and child variant attributes)
     if colors and isinstance(colors, list):
@@ -1462,11 +1591,25 @@ async def search_products(
         except (json.JSONDecodeError, TypeError):
             pass
     
-    # Stock filter - need to handle inventory
+    # Stock filter - applied in SQL before count & pagination
     if in_stock:
-        # We can't filter purely on ProductModel.stock > 0 anymore in DB, we'd have to filter the results.
-        pass
+        from models.inventory import ProductInventory
+        query = query.where(
+            select(ProductInventory.id).where(
+                and_(
+                    ProductInventory.product_id == ProductModel.id,
+                    ProductInventory.stock > 0
+                )
+            ).exists()
+        )
     
+    # Total count before pagination
+    count_query = select(func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
+    total_count = total_result.scalar_one_or_none() or 0
+    if response:
+        response.headers["X-Total-Count"] = str(total_count)
+
     # Sorting
     if sort_by == "price":
         query = query.order_by(ProductModel.selling_price.asc() if sort_order == "asc" else ProductModel.selling_price.desc())
@@ -1492,12 +1635,7 @@ async def search_products(
     )
     
     result = await db.execute(query)
-    products = result.scalars().all()
-    
-    if in_stock:
-        # safely check inventory
-        products = [p for p in products if (getattr(p, 'hub_stock', 0) or 0) > 0]
-            
+    products = result.scalars().unique().all()
     return products
 
 @router.get("/products/autocomplete", tags=["products"])
@@ -1507,25 +1645,51 @@ async def autocomplete_products(
     db: AsyncSession = Depends(get_db)
 ):
     """Get product name and category suggestions for autocomplete"""
+    variations = get_search_variations(q)
+    SubcategoryModel = aliased(CategoryModel)
+    
+    product_clauses = []
+    for term in variations:
+        product_clauses.extend([
+            ProductModel.name.ilike(f"%{term}%"),
+            BrandModel.name.ilike(f"%{term}%"),
+            and_(CategoryModel.name.ilike(f"%{term}%"), CategoryModel.is_active == True, CategoryModel.is_deleted == False),
+            and_(SubcategoryModel.name.ilike(f"%{term}%"), SubcategoryModel.is_active == True, SubcategoryModel.is_deleted == False)
+        ])
     
     # Get matching product names
     result = await db.execute(
         select(ProductModel.name, ProductModel.id, ProductModel.selling_price, ProductModel.images)
         .join(DealerModel)
         .outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id)
+        .outerjoin(BrandModel, ProductModel.brand_id == BrandModel.id)
+        .outerjoin(CategoryModel, ProductModel.category_id == CategoryModel.id)
+        .outerjoin(SubcategoryModel, ProductModel.subcategory_id == SubcategoryModel.id)
         .where(
-            ProductModel.name.ilike(f"%{q}%"),
+            or_(*product_clauses),
             DealerModel.access_status == 'active',
             DealerModel.is_active == True, DealerModel.is_deleted == False,
             ProductModel.is_approved == True,
+            ProductModel.is_deleted == False,
+            ProductModel.parent_product_id.is_(None),
             or_(DealerModel.partner_id == None, PartnerModel.is_active == True)
         )
-        .limit(limit)
+        .limit(limit * 2)
     )
-    products = result.all()
+    products_raw = result.all()
+    
+    # Deduplicate products by product ID in Python (since ProductModel.images is JSON)
+    seen_ids = set()
+    products = []
+    for p in products_raw:
+        if p[1] not in seen_ids:
+            seen_ids.add(p[1])
+            products.append(p)
+            if len(products) >= limit:
+                break
     
     # Extract unique suggestions
-    suggestions = list(set([p[0] for p in products]))[:5]
+    suggestions = list(dict.fromkeys([p[0] for p in products]))[:5]
     
     # Format product results
     product_results = [
@@ -1539,12 +1703,18 @@ async def autocomplete_products(
     ]
     
     # Get matching categories
+    cat_clauses = []
+    for term in variations:
+        cat_clauses.append(CategoryModel.name.ilike(f"%{term}%"))
+
     cat_result = await db.execute(
         select(CategoryModel.id, CategoryModel.name)
         .where(
-            CategoryModel.name.ilike(f"%{q}%"),
-            CategoryModel.is_active == True
+            or_(*cat_clauses),
+            CategoryModel.is_active == True,
+            CategoryModel.is_deleted == False
         )
+        .distinct()
         .limit(5)
     )
     categories = cat_result.all()

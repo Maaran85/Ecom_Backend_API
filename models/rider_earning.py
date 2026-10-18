@@ -1,10 +1,18 @@
-from sqlalchemy import Column, Integer, Float, ForeignKey, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, Float, ForeignKey, String, DateTime, Boolean, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from core.database import Base
 
 class RiderEarning(Base):
     __tablename__ = "rider_earnings"
+    __table_args__ = (
+        Index(
+            "uq_rider_earnings_delivery_order_item",
+            "order_item_id",
+            unique=True,
+            postgresql_where=(Column("type") == "delivery"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     rider_id = Column(Integer, ForeignKey("delivery_riders.id"), nullable=False)

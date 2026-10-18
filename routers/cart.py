@@ -254,6 +254,10 @@ async def create_order(
     stock_updates = []
     dealer_subtotals: dict[int, float] = {}
 
+    from decimal import Decimal
+    from services.fee_service import get_all_active_slabs, match_slab_from_list
+    active_slabs = await get_all_active_slabs(db)
+
     # Fetch buyer state_id from shipping address with strict customer ownership verification
     shipping_address_state_id = None
     shipping_address = None
@@ -356,8 +360,12 @@ async def create_order(
             product=product
         )
 
-        fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
-        platform_fee = fee_amount * qty
+        line_gross = Decimal(str(round(price * qty, 2)))
+        mp_slab_item = match_slab_from_list(active_slabs, "marketplace", line_gross)
+        if mp_slab_item and mp_slab_item.customer_percentage:
+            platform_fee = round(float(line_gross * Decimal(str(mp_slab_item.customer_percentage))), 2)
+        else:
+            platform_fee = 0.0
 
         order_items_data.append({
             "product_id": product.id,
@@ -467,8 +475,12 @@ async def create_order(
                 tax_category=cached_tax_cat
             )
             
-            fee_amount = product.dealer.platform_fee_amount if product.dealer else 5.0
-            platform_fee = fee_amount * cart_item.quantity
+            line_gross = Decimal(str(round(price * cart_item.quantity, 2)))
+            mp_slab_item = match_slab_from_list(active_slabs, "marketplace", line_gross)
+            if mp_slab_item and mp_slab_item.customer_percentage:
+                platform_fee = round(float(line_gross * Decimal(str(mp_slab_item.customer_percentage))), 2)
+            else:
+                platform_fee = 0.0
 
             order_items_data.append({
                 "product_id": cart_item.product_id,
@@ -493,29 +505,103 @@ async def create_order(
                 "quantity": int(cart_item.quantity)
             })
 
-    # ── Delivery Charge Breakdown ──────────────────────────────────────────────
+    # ── Coupon Validation (Global & Dealer-Specific) ───────────────────────────
+    coupon_code_str = order_request.coupon_code.strip().upper() if (order_request and order_request.coupon_code) else None
+    applied_coupon = None
+    total_discount_amount = 0.0
+
+    if coupon_code_str:
+        coupon_res = await db.execute(
+            select(CouponModel).where(CouponModel.code == coupon_code_str)
+        )
+        coupon_obj = coupon_res.scalar_one_or_none()
+        now = datetime.now(timezone.utc)
+
+        if not coupon_obj or not coupon_obj.is_active:
+            raise HTTPException(status_code=400, detail="Invalid or inactive coupon code")
+        if now < coupon_obj.valid_from or now > coupon_obj.valid_until:
+            raise HTTPException(status_code=400, detail="Coupon is expired or not yet valid")
+        if coupon_obj.usage_limit and coupon_obj.current_usage >= coupon_obj.usage_limit:
+            raise HTTPException(status_code=400, detail="Coupon usage limit reached")
+        if total_amount < coupon_obj.min_order_value:
+            raise HTTPException(status_code=400, detail=f"Minimum order value ₹{coupon_obj.min_order_value} required for this coupon")
+
+        if coupon_obj.dealer_id:
+            cart_product_ids = [item_data["product_id"] for item_data in order_items_data]
+            dealer_check = await db.execute(
+                select(ProductModel.id).where(
+                    ProductModel.id.in_(cart_product_ids),
+                    ProductModel.dealer_id == coupon_obj.dealer_id
+                )
+            )
+            if not dealer_check.first():
+                raise HTTPException(status_code=400, detail="Coupon is not valid for items in your cart")
+
+        from models.coupon import DiscountType
+        if coupon_obj.discount_type == DiscountType.PERCENTAGE:
+            total_discount_amount = total_amount * (coupon_obj.discount_value / 100)
+            if coupon_obj.max_discount_amount:
+                total_discount_amount = min(total_discount_amount, coupon_obj.max_discount_amount)
+        elif coupon_obj.discount_type == DiscountType.FIXED:
+            total_discount_amount = min(coupon_obj.discount_value, total_amount)
+
+        applied_coupon = coupon_obj
+
+    if applied_coupon:
+        await db.execute(
+            update(CouponModel)
+            .where(CouponModel.id == applied_coupon.id)
+            .values(current_usage=CouponModel.current_usage + 1)
+            .execution_options(synchronize_session=False)
+        )
+
+    # ── Delivery Charge Breakdown (Cart-Level Free Delivery & Logistics Slabs) ──
     dealer_fees_map: dict[int, dict] = {}
     if dealer_subtotals:
+        from services.delivery_pricing_service import calculate_cart_delivery_pricing, DeliveryPricingConfigurationError
         dealers_res = await db.execute(
-            select(
-                DealerModel.id,
-                DealerModel.delivery_charge,
-                DealerModel.free_delivery_above
-            ).where(DealerModel.id.in_(list(dealer_subtotals.keys())))
+            select(DealerModel).where(DealerModel.id.in_(list(dealer_subtotals.keys())))
         )
-        for row in dealers_res.fetchall():
-            dealer_items_total = dealer_subtotals.get(row.id, 0.0)
-            fee = float(row.delivery_charge or 0.0)
-            threshold = float(row.free_delivery_above or 0.0)
-            is_waived = (fee == 0 or (threshold > 0 and dealer_items_total >= threshold))
-            
-            dealer_fees_map[row.id] = {
-                "fee": 0.0 if is_waived else fee,
-                "total_dealer_subtotal": dealer_items_total
+        dealers_list = dealers_res.scalars().all()
+
+        # Compute net dealer subtotals after applicable discounts & coupons
+        dealer_shipments = []
+        for dealer_obj in dealers_list:
+            dealer_gross = dealer_subtotals.get(dealer_obj.id, 0.0)
+            if applied_coupon and applied_coupon.dealer_id:
+                dealer_disc = total_discount_amount if applied_coupon.dealer_id == dealer_obj.id else 0.0
+            else:
+                dealer_disc = round((dealer_gross / total_amount) * total_discount_amount, 2) if total_amount > 0 else 0.0
+            dealer_net = max(0.0, round(dealer_gross - dealer_disc, 2))
+            dealer_shipments.append({
+                "dealer": dealer_obj,
+                "subtotal": Decimal(str(dealer_net)),
+                "gross_subtotal": dealer_gross,
+            })
+
+        try:
+            cart_delivery_res = await calculate_cart_delivery_pricing(
+                db=db,
+                dealer_shipments=dealer_shipments,
+                active_slabs=active_slabs,
+            )
+        except DeliveryPricingConfigurationError as dp_err:
+            raise HTTPException(status_code=400, detail=str(dp_err))
+
+        for ds in dealer_shipments:
+            dealer_obj = ds["dealer"]
+            shipment_res = cart_delivery_res.shipments.get(dealer_obj.id) or cart_delivery_res.shipments.get(str(dealer_obj.id))
+            if not shipment_res:
+                continue
+            fee = float(shipment_res.delivery_charge)
+            dealer_fees_map[dealer_obj.id] = {
+                "fee": fee,
+                "total_dealer_subtotal": ds["gross_subtotal"],
+                "allocated": Decimal("0.00"),
+                "remaining_items_count": sum(1 for it in order_items_data if it["dealer_id"] == dealer_obj.id),
             }
-            if not is_waived:
-                total_delivery_charge += fee
-    
+            total_delivery_charge += fee
+
     # Check total available stock across hubs in a single batched query
     if stock_updates:
         from models.inventory import ProductInventory
@@ -601,56 +687,6 @@ async def create_order(
                 status_code=400,
                 detail=f"Sorry, {prod_name} cannot be delivered to pincode {dest_pincode}."
             )
-    
-    # ── Coupon Validation (Global) ─────────────────────────────────────────────
-    coupon_code_str = order_request.coupon_code.strip().upper() if (order_request and order_request.coupon_code) else None
-    applied_coupon = None
-    total_discount_amount = 0.0
-
-    if coupon_code_str:
-        coupon_res = await db.execute(
-            select(CouponModel).where(CouponModel.code == coupon_code_str)
-        )
-        coupon_obj = coupon_res.scalar_one_or_none()
-        now = datetime.now(timezone.utc)
-
-        if not coupon_obj or not coupon_obj.is_active:
-            raise HTTPException(status_code=400, detail="Invalid or inactive coupon code")
-        if now < coupon_obj.valid_from or now > coupon_obj.valid_until:
-            raise HTTPException(status_code=400, detail="Coupon is expired or not yet valid")
-        if coupon_obj.usage_limit and coupon_obj.current_usage >= coupon_obj.usage_limit:
-            raise HTTPException(status_code=400, detail="Coupon usage limit reached")
-        if total_amount < coupon_obj.min_order_value:
-            raise HTTPException(status_code=400, detail=f"Minimum order value ₹{coupon_obj.min_order_value} required for this coupon")
-
-        if coupon_obj.dealer_id:
-            cart_product_ids = [item_data["product_id"] for item_data in order_items_data]
-            dealer_check = await db.execute(
-                select(ProductModel.id).where(
-                    ProductModel.id.in_(cart_product_ids),
-                    ProductModel.dealer_id == coupon_obj.dealer_id
-                )
-            )
-            if not dealer_check.first():
-                raise HTTPException(status_code=400, detail="Coupon is not valid for items in your cart")
-
-        from models.coupon import DiscountType
-        if coupon_obj.discount_type == DiscountType.PERCENTAGE:
-            total_discount_amount = total_amount * (coupon_obj.discount_value / 100)
-            if coupon_obj.max_discount_amount:
-                total_discount_amount = min(total_discount_amount, coupon_obj.max_discount_amount)
-        elif coupon_obj.discount_type == DiscountType.FIXED:
-            total_discount_amount = min(coupon_obj.discount_value, total_amount)
-
-        applied_coupon = coupon_obj
-
-    if applied_coupon:
-        await db.execute(
-            update(CouponModel)
-            .where(CouponModel.id == applied_coupon.id)
-            .values(current_usage=CouponModel.current_usage + 1)
-            .execution_options(synchronize_session=False)
-        )
 
     # ── Wallet Deduction ───────────────────────────────────────────────────────
     total_wallet_discount = 0.0
@@ -674,8 +710,6 @@ async def create_order(
 
     # ── Create Separate Orders Per Item ────────────────────────────────────────
     from sqlalchemy import insert as sql_insert
-    from services.fee_service import get_all_active_slabs, match_slab_from_list
-    active_slabs = await get_all_active_slabs(db)
     created_order_ids = []
     created_order_items_list = []
     
@@ -691,9 +725,21 @@ async def create_order(
             item_wallet_discount = round((item_subtotal / total_amount) * total_wallet_discount, 2)
             
         item_delivery = 0.0
-        dealer_info = dealer_fees_map.get(item_data["dealer_id"], {"fee": 0.0, "total_dealer_subtotal": 0.0})
-        if dealer_info["total_dealer_subtotal"] > 0:
-            item_delivery = round((item_subtotal / dealer_info["total_dealer_subtotal"]) * dealer_info["fee"], 2)
+        dealer_info = dealer_fees_map.get(item_data["dealer_id"])
+        if dealer_info and dealer_info.get("fee", 0.0) > 0 and dealer_info.get("total_dealer_subtotal", 0.0) > 0:
+            shipment_fee = Decimal(str(dealer_info["fee"]))
+            dealer_sub = Decimal(str(dealer_info["total_dealer_subtotal"]))
+            rem_items = dealer_info.get("remaining_items_count", 1)
+            allocated = dealer_info.get("allocated", Decimal("0.00"))
+
+            if rem_items <= 1:
+                item_delivery_dec = money_2dp(shipment_fee - allocated)
+            else:
+                item_delivery_dec = money_2dp(shipment_fee * (Decimal(str(item_subtotal)) / dealer_sub))
+                allocated += item_delivery_dec
+                dealer_info["allocated"] = allocated
+            dealer_info["remaining_items_count"] = rem_items - 1
+            item_delivery = float(item_delivery_dec)
             
         total_item_discount = round(item_discount + item_wallet_discount, 2)
         final_item_total = round(max(0.0, item_subtotal - total_item_discount) + item_delivery + item_data["platform_fee"], 2)
@@ -747,12 +793,12 @@ async def create_order(
         mkt_slab = match_slab_from_list(active_slabs, "marketing", gross_sale_val)
         log_slab = match_slab_from_list(active_slabs, "logistics", gross_sale_val)
 
-        snap_mp_cust = round(float(gross_sale_val * Decimal(str(mp_slab.customer_percentage))), 2) if (mp_slab and mp_slab.customer_percentage) else 0.0
+        snap_mp_cust = item_data["platform_fee"]
         snap_mp_dealer = round(float(gross_sale_val * Decimal(str(mp_slab.dealer_percentage))), 2) if mp_slab else 0.0
         snap_mkt = round(float(gross_sale_val * Decimal(str(mkt_slab.dealer_percentage))), 2) if mkt_slab else 0.0
         snap_mkt_cust = round(float(gross_sale_val * Decimal(str(mkt_slab.customer_percentage))), 2) if (mkt_slab and mkt_slab.customer_percentage) else 0.0
         snap_log_dealer = round(float(gross_sale_val * Decimal(str(log_slab.dealer_percentage))), 2) if log_slab else 0.0
-        snap_log_cust = round(float(gross_sale_val * Decimal(str(log_slab.customer_percentage))), 2) if (log_slab and log_slab.customer_percentage) else item_delivery
+        snap_log_cust = item_delivery
 
         item_result = await db.execute(
             sql_insert(OrderItemModel).values(
