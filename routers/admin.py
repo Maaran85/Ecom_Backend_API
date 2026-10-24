@@ -8,9 +8,10 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, delete, case
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 from core.database import get_db
 from core.permissions import require_admin, require_super_admin
-from models import User, Dealer, Product, Category, Order, OrderItem, UserRole, DeliveryRider, DeliveryHub, LogisticsPartner, LogisticsRemittance, Payment, PaymentMethod, PaymentStatus, DealerRemittance, RechargeTransaction, RechargeStatus
+from models import User, Dealer, Product, Category, Order, OrderItem, UserRole, DeliveryRider, DeliveryHub, LogisticsPartner, LogisticsRemittance, Payment, PaymentMethod, PaymentStatus, DealerRemittance, RechargeTransaction, RechargeStatus, Partner
 from schemas.rider import Rider as RiderSchema, RiderUpdate
 from schemas.user import AdminUserCreate, AdminUserUpdate
 from schemas.logistics import RemittanceResponse, RemittanceStatusUpdate
@@ -669,13 +670,99 @@ async def create_user(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new user (Admin only)"""
-    res = await db.execute(select(User).where(User.email == user_in.email, User.is_active == True))
-    if res.scalar_one_or_none(): raise HTTPException(status_code=400, detail="Email already registered")
     user_data = user_in.model_dump()
+
+    # 1. Normalize empty strings for optional fields to None
+    for field in [
+        "phone", "employee_id", "aadhaar_number", "address",
+        "emergency_contact", "photo_url", "aadhaar_image",
+        "shift_type", "dob"
+    ]:
+        if field in user_data and isinstance(user_data[field], str) and user_data[field].strip() == "":
+            user_data[field] = None
+
+    if user_data.get("phone") and isinstance(user_data["phone"], str):
+        user_data["phone"] = user_data["phone"].strip()
+    if user_data.get("employee_id") and isinstance(user_data["employee_id"], str):
+        user_data["employee_id"] = user_data["employee_id"].strip()
+    if user_data.get("email") and isinstance(user_data["email"], str):
+        user_data["email"] = user_data["email"].strip()
+
+    # 2. Preserve existing duplicate-email validation
+    if user_data.get("email"):
+        res = await db.execute(select(User).where(User.email == user_data["email"], User.is_active == True))
+        if res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+    # 3. Check whether a non-empty phone number already exists in User
+    if user_data.get("phone"):
+        p_res = await db.execute(select(User).where(User.phone == user_data["phone"]))
+        if p_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+
+    # 4. Check whether a non-empty employee ID already exists in User
+    if user_data.get("employee_id"):
+        e_res = await db.execute(select(User).where(User.employee_id == user_data["employee_id"]))
+        if e_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Employee ID already registered")
+
+    # 5. Validate any supplied foreign-key IDs
+    if user_data.get("logistics_partner_id"):
+        lp_res = await db.execute(select(LogisticsPartner).where(LogisticsPartner.id == user_data["logistics_partner_id"]))
+        if not lp_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Logistics partner not found")
+
+    if user_data.get("dealer_id"):
+        d_res = await db.execute(select(Dealer).where(Dealer.id == user_data["dealer_id"], Dealer.is_deleted == False))
+        if not d_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Dealer not found")
+
+    if user_data.get("partner_id"):
+        partner_res = await db.execute(select(Partner).where(Partner.id == user_data["partner_id"]))
+        if not partner_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Platform partner not found")
+
+    if user_data.get("hub_id"):
+        hub_res = await db.execute(select(DeliveryHub).where(DeliveryHub.id == user_data["hub_id"]))
+        if not hub_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Delivery hub not found")
+
+    if user_data.get("supervisor_id"):
+        sup_res = await db.execute(select(User).where(User.id == user_data["supervisor_id"], User.is_active == True))
+        if not sup_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Supervisor not found")
+
+    # 6. Database insert and commit with IntegrityError handling & rollback
     password = user_data.pop("password")
     db_user = User(**user_data, password_hash=get_password_hash(password))
     db.add(db_user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        err_msg = str(exc.orig) if hasattr(exc, "orig") and exc.orig else str(exc)
+        if "uq_users_phone" in err_msg or "phone" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+        elif "users_employee_id_key" in err_msg or "employee_id" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Employee ID already registered")
+        elif "users_email" in err_msg or "email" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        elif "fk_users_logistics_partner" in err_msg or "logistics_partner_id" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Logistics partner not found")
+        elif "users_dealer_id_fkey" in err_msg or "dealer_id" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Dealer not found")
+        elif "users_partner_id_fkey" in err_msg or "partner_id" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Platform partner not found")
+        elif "users_supervisor_id_fkey" in err_msg or "supervisor_id" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Supervisor not found")
+        elif "users_hub_id_fkey" in err_msg or "hub_id" in err_msg.lower():
+            raise HTTPException(status_code=400, detail="Delivery hub not found")
+        else:
+            raise HTTPException(status_code=400, detail="User with provided details already exists or violates constraints")
+    except Exception:
+        await db.rollback()
+        raise
+
     await db.refresh(db_user)
     return db_user
 

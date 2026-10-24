@@ -1,3 +1,4 @@
+from uuid import UUID
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -41,6 +42,23 @@ class PincodeResponse(BaseModel):
 
 class ServiceabilityCheckResponse(BaseModel):
     is_serviceable: bool
-    delivery_type: Optional[str] = None # "local_hub" or "courier"
+    serviceable: Optional[bool] = None
+    delivery_type: Optional[str] = None # "warehouse_direct", "local_hub", or "courier"
+    serviceability_source: Optional[str] = None # "same_pincode_warehouse", "local_hub_radius", or "courier_whitelist"
     message: str
     estimated_days: Optional[int] = None
+    estimated_delivery_date: Optional[str] = None
+    pincode: Optional[str] = None
+    product_id: Optional[UUID] = None
+    variant_id: Optional[UUID] = None
+    reason_code: Optional[str] = None
+    delivery_fee: Optional[float] = None
+    warehouse_id: Optional[int] = None
+    locality: Optional[str] = None
+    district: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    is_interstate: Optional[bool] = False
+    origin_state: Optional[str] = None
+    destination_state: Optional[str] = None
+

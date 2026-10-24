@@ -89,6 +89,24 @@ async def add_to_cart(
             detail="This product is currently unavailable or the seller is inactive."
         )
 
+    # Validate delivery PIN code if provided
+    if getattr(item_in, 'pincode', None) and str(item_in.pincode).strip():
+        clean_pincode = str(item_in.pincode).strip()
+        from services.delivery_pricing_service import check_serviceability_full
+        serv_res = await check_serviceability_full(
+            db=db,
+            pincode=clean_pincode,
+            dealer_id=product_exists.dealer_id,
+            product_id=product_id,
+            variant_id=variant_id,
+            quantity=quantity
+        )
+        if not serv_res.is_serviceable:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item '{product_exists.name}' cannot be delivered to PIN code {clean_pincode}. {serv_res.message}"
+            )
+
     # Check if item with SAME product AND same size AND same variant already in cart
     cart_match_conds = [
         CartItemModel.customer_id == customer_id, 
@@ -367,7 +385,11 @@ async def create_order(
         # Validate delivery address serviceability
         if shipping_address and shipping_address.pincode:
             from services.delivery_pricing_service import check_pincode_serviceability
-            is_serv = await check_pincode_serviceability(db, shipping_address.pincode, product.dealer_id)
+            dest_lat = float(shipping_address.latitude) if getattr(shipping_address, 'latitude', None) else None
+            dest_lon = float(shipping_address.longitude) if getattr(shipping_address, 'longitude', None) else None
+            is_serv = await check_pincode_serviceability(
+                db, shipping_address.pincode, product.dealer_id, lat=dest_lat, long=dest_lon
+            )
             if not is_serv:
                 raise HTTPException(
                     status_code=400,
@@ -502,7 +524,11 @@ async def create_order(
             # Validate delivery address serviceability
             if shipping_address and shipping_address.pincode:
                 from services.delivery_pricing_service import check_pincode_serviceability
-                is_serv = await check_pincode_serviceability(db, shipping_address.pincode, d_id)
+                dest_lat = float(shipping_address.latitude) if getattr(shipping_address, 'latitude', None) else None
+                dest_lon = float(shipping_address.longitude) if getattr(shipping_address, 'longitude', None) else None
+                is_serv = await check_pincode_serviceability(
+                    db, shipping_address.pincode, d_id, lat=dest_lat, long=dest_lon
+                )
                 if not is_serv:
                     raise HTTPException(
                         status_code=400,
@@ -683,59 +709,26 @@ async def create_order(
             detail="A valid delivery address with a pincode is required to complete this order."
         )
     dest_pincode = shipping_address.pincode.strip()
-    from models.location import ServiceablePincode
-    # Collect distinct dealer IDs for items being ordered
-    distinct_dealer_ids = list({item["dealer_id"] for item in order_items_data if item.get("dealer_id")})
-
-    # Batch check courier serviceability for dest_pincode across the required dealers
-    serv_res = await db.execute(
-        select(ServiceablePincode.dealer_id)
-        .where(
-            ServiceablePincode.pincode == dest_pincode,
-            ServiceablePincode.is_active == True,
-            (ServiceablePincode.dealer_id.in_(distinct_dealer_ids)) | (ServiceablePincode.dealer_id.is_(None))
-        )
-    )
-    serviceable_dealer_rows = serv_res.scalars().all()
-    # If any row has dealer_id is None, it is globally serviceable for all dealers
-    has_global_service = any(d_id is None for d_id in serviceable_dealer_rows)
-    serviceable_dealer_set = set(serviceable_dealer_rows)
-
-    # For any dealer not covered by courier serviceability, check local hub delivery radius if coordinates available
-    uncovered_dealers = [d for d in distinct_dealer_ids if not has_global_service and d not in serviceable_dealer_set]
-    if uncovered_dealers and shipping_address.latitude and shipping_address.longitude:
-        try:
-            lat = float(shipping_address.latitude)
-            lon = float(shipping_address.longitude)
-            from models.hub import DeliveryHub
-            from routers.locations import get_distance_km
-            hubs_res = await db.execute(
-                select(DeliveryHub)
-                .where(
-                    DeliveryHub.dealer_id.in_(uncovered_dealers),
-                    DeliveryHub.is_active == True,
-                    DeliveryHub.lat_long.isnot(None),
-                    DeliveryHub.max_delivery_radius.isnot(None)
-                )
-            )
-            for hub in hubs_res.scalars().all():
-                try:
-                    h_lat, h_lon = map(float, hub.lat_long.split(","))
-                    dist = get_distance_km(lat, lon, h_lat, h_lon)
-                    if dist <= hub.max_delivery_radius:
-                        serviceable_dealer_set.add(hub.dealer_id)
-                except Exception:
-                    continue
-        except (ValueError, TypeError):
-            pass
+    from services.delivery_pricing_service import check_serviceability_full
+    dest_lat = float(shipping_address.latitude) if getattr(shipping_address, 'latitude', None) else None
+    dest_lon = float(shipping_address.longitude) if getattr(shipping_address, 'longitude', None) else None
 
     for item in order_items_data:
-        item_dealer_id = item.get("dealer_id")
-        if item_dealer_id and not has_global_service and item_dealer_id not in serviceable_dealer_set:
+        item_serv = await check_serviceability_full(
+            db=db,
+            pincode=dest_pincode,
+            dealer_id=item.get("dealer_id"),
+            product_id=item.get("product_id"),
+            variant_id=item.get("variant_id"),
+            quantity=item.get("quantity", 1),
+            lat=dest_lat,
+            long=dest_lon,
+        )
+        if not item_serv.is_serviceable:
             prod_name = item.get("product_name") or f"Product #{item.get('product_id')}"
             raise HTTPException(
                 status_code=400,
-                detail=f"Sorry, {prod_name} cannot be delivered to pincode {dest_pincode}."
+                detail=f"Sorry, {prod_name} cannot be delivered to PIN code {dest_pincode}. {item_serv.message}"
             )
 
     # ── Wallet Deduction ───────────────────────────────────────────────────────

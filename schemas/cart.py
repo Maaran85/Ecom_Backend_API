@@ -14,6 +14,7 @@ class CartItemBase(BaseModel):
     variant_id: Optional[UUID] = None
     size: Optional[str] = None
     variant_attributes: Optional[dict] = None
+    pincode: Optional[str] = None
 
 class CartItemCreate(CartItemBase):
     pass

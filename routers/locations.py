@@ -67,76 +67,50 @@ def get_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 
 from models.product import Product
 from models.hub import DeliveryHub
-from models.location import ServiceablePincode
+from typing import List, Optional
+from services.delivery_pricing_service import check_serviceability_full
 from schemas.location import ServiceabilityCheckResponse
 
 @router.get("/check-serviceability", response_model=ServiceabilityCheckResponse)
 async def check_serviceability(
     pincode: str, 
     product_id: UUID, 
+    variant_id: Optional[UUID] = None,
     lat: float = None, 
     long: float = None, 
     db: AsyncSession = Depends(get_db)
 ):
-    """Check if a product can be delivered to a location based on Courier Pincodes or Hub Radius"""
-    
-    # Get product and its dealer
-    result = await db.execute(select(Product).where(Product.id == product_id).limit(1))
-    product = result.scalars().first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-        
-    dealer_id = product.dealer_id
-    
-    # 1. Check Courier Serviceability (Pincode Whitelist)
-    # Check if there's a specific entry for this dealer, or a global entry
-    result = await db.execute(
-        select(ServiceablePincode)
-        .where(
-            ServiceablePincode.pincode == pincode,
-            ServiceablePincode.is_active == True,
-            (ServiceablePincode.dealer_id == dealer_id) | ServiceablePincode.dealer_id.is_(None)
-        )
-        .limit(1)
+    """Check if a product can be delivered to a location based on Warehouse, Courier Pincodes, or Hub Radius"""
+    res = await check_serviceability_full(
+        db=db,
+        pincode=pincode,
+        product_id=product_id,
+        variant_id=variant_id,
+        lat=lat,
+        long=long
     )
-    is_courier_serviceable = result.scalars().first() is not None
-    
-    if is_courier_serviceable:
-        return ServiceabilityCheckResponse(
-            is_serviceable=True,
-            delivery_type="courier",
-            message="Delivery available in 3-5 business days.",
-            estimated_days=4
-        )
-        
-    # 2. Check Local Hub Serviceability (Radius)
-    if lat is not None and long is not None:
-        result = await db.execute(
-            select(DeliveryHub)
-            .where(
-                DeliveryHub.dealer_id == dealer_id,
-                DeliveryHub.is_active == True,
-                DeliveryHub.lat_long != None,
-                DeliveryHub.max_delivery_radius != None
-            )
-        )
-        hubs = result.scalars().all()
-        
-        for hub in hubs:
-            try:
-                h_lat, h_lon = map(float, hub.lat_long.split(","))
-                distance = get_distance_km(lat, long, h_lat, h_lon)
-                if distance <= hub.max_delivery_radius:
-                    return ServiceabilityCheckResponse(
-                        is_serviceable=True,
-                        delivery_type="local_hub",
-                        message="Same-day or next-day local delivery available.",
-                        estimated_days=1
-                    )
-            except Exception:
-                continue # Skip invalid lat_long formats
-                
+    if res.reason_code == "PRODUCT_NOT_FOUND":
+        raise HTTPException(status_code=404, detail=res.message)
     return ServiceabilityCheckResponse(
-        is_serviceable=False,
-        message="Sorry, this product cannot be delivered to your location.",
+        is_serviceable=res.is_serviceable,
+        serviceable=res.is_serviceable,
+        delivery_type=res.delivery_type,
+        serviceability_source=res.serviceability_source,
+        message=res.message,
+        estimated_days=res.estimated_days,
+        estimated_delivery_date=res.estimated_delivery_date,
+        pincode=res.pincode,
+        product_id=res.product_id,
+        variant_id=res.variant_id,
+        reason_code=res.reason_code,
+        delivery_fee=res.delivery_fee,
+        warehouse_id=res.warehouse_id,
+        locality=res.locality,
+        district=res.district,
+        city=res.city,
+        state=res.state,
+        is_interstate=getattr(res, 'is_interstate', False),
+        origin_state=getattr(res, 'origin_state', None),
+        destination_state=getattr(res, 'destination_state', None)
     )
+

@@ -2620,6 +2620,19 @@ async def delivery_preview(
 
         item_payable = round(max(0.0, line_subtotal - item_coupon) + item_delivery_fee + fee, 2)
         d_is_serv, d_unserv_reason = dealer_serviceable_map.get(item_prod.dealer_id, (True, None))
+        if target_pincode and d_is_serv:
+            from services.delivery_pricing_service import check_serviceability_full
+            v_serv = await check_serviceability_full(
+                db=db,
+                pincode=target_pincode,
+                dealer_id=item_prod.dealer_id,
+                product_id=parent_pid,
+                variant_id=var_id,
+                quantity=item_qty
+            )
+            if not v_serv.is_serviceable:
+                d_is_serv = False
+                d_unserv_reason = v_serv.message
 
         items_breakdown.append({
             "product_id": str(parent_pid),
@@ -2639,7 +2652,7 @@ async def delivery_preview(
             "unserviceable_reason": d_unserv_reason,
         })
 
-    all_serviceable = all(ds.get("is_serviceable", True) for ds in dealer_shipments)
+    all_serviceable = all(ds.get("is_serviceable", True) for ds in dealer_shipments) and all(it.get("is_serviceable", True) for it in items_breakdown)
 
     return {
         "dealers": breakdown,
