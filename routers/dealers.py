@@ -2349,6 +2349,8 @@ async def delivery_preview(
     variant_id: Optional[UUID] = None,
     quantity: int = 1,
     coupon_code: Optional[str] = None,
+    address_id: Optional[int] = None,
+    pincode: Optional[str] = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -2365,6 +2367,19 @@ async def delivery_preview(
     from services.delivery_pricing_service import calculate_cart_delivery_pricing, DeliveryPricingConfigurationError
 
     dealer_subtotals: dict[Any, float] = {}
+
+    target_pincode = (pincode or "").strip()
+    if not target_pincode and address_id:
+        from models.address import Address as AddressModel
+        addr_q = await db.execute(
+            select(AddressModel).where(
+                AddressModel.id == address_id,
+                AddressModel.customer_id == current_user.id
+            )
+        )
+        found_addr = addr_q.scalar_one_or_none()
+        if found_addr and found_addr.pincode:
+            target_pincode = str(found_addr.pincode).strip()
 
     cart_items = []
     p = None
@@ -2386,14 +2401,18 @@ async def delivery_preview(
         res = await db.execute(
             select(CartItemModel)
             .where(CartItemModel.customer_id == current_user.id)
-            .options(__import__('sqlalchemy.orm', fromlist=['selectinload']).selectinload(CartItemModel.product))
+            .options(
+                __import__('sqlalchemy.orm', fromlist=['selectinload']).selectinload(CartItemModel.product),
+                __import__('sqlalchemy.orm', fromlist=['selectinload']).selectinload(CartItemModel.variant),
+            )
         )
         cart_items = res.scalars().all()
 
         for ci in cart_items:
-            if ci.product and ci.product.dealer_id:
-                d_id = ci.product.dealer_id
-                price = float(ci.product.selling_price if ci.product.selling_price is not None else (ci.product.mrp or ci.product.dealer_price))
+            eff_p = ci.variant if (ci.variant and (ci.variant.selling_price is not None or ci.variant.mrp is not None or ci.variant.dealer_price is not None)) else ci.product
+            if eff_p and eff_p.dealer_id:
+                d_id = eff_p.dealer_id
+                price = float(eff_p.selling_price if eff_p.selling_price is not None else (eff_p.mrp or eff_p.dealer_price))
                 dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + price * ci.quantity
 
     if not dealer_subtotals:
@@ -2402,12 +2421,15 @@ async def delivery_preview(
         threshold_val = float(threshold_cfg.value) if (threshold_cfg and threshold_cfg.is_active and threshold_cfg.value is not None) else 1000.0
         return {
             "dealers": [],
+            "items": [],
             "total_delivery_charge": 0.0,
             "total_platform_fee": 0.0,
             "platform_eligible_subtotal": 0.0,
             "platform_free_delivery_threshold": threshold_val,
             "platform_qualifies_for_free": False,
             "platform_remaining_for_free": threshold_val,
+            "is_serviceable": True,
+            "pincode": target_pincode or None,
         }
 
     total_gross = sum(dealer_subtotals.values())
@@ -2444,6 +2466,17 @@ async def delivery_preview(
     )
     dealers = dealers_res.scalars().all()
 
+    from services.delivery_pricing_service import check_pincode_serviceability
+    dealer_serviceable_map = {}
+    for d in dealers:
+        is_serv = True
+        reason = None
+        if target_pincode:
+            is_serv = await check_pincode_serviceability(db, target_pincode, d.id)
+            if not is_serv:
+                reason = f"Seller does not deliver to PIN code {target_pincode}"
+        dealer_serviceable_map[d.id] = (is_serv, reason)
+
     dealer_shipments = []
     for d in dealers:
         gross = dealer_subtotals.get(d.id, 0.0)
@@ -2452,11 +2485,14 @@ async def delivery_preview(
         else:
             d_disc = round((gross / total_gross) * total_discount_amount, 2) if total_gross > 0 else 0.0
         net = max(0.0, round(gross - d_disc, 2))
+        is_serv, unserv_reason = dealer_serviceable_map.get(d.id, (True, None))
         dealer_shipments.append({
             "dealer": d,
             "subtotal": Decimal(str(net)),
             "gross_subtotal": gross,
             "net_subtotal": net,
+            "is_serviceable": is_serv,
+            "unserviceable_reason": unserv_reason,
         })
 
     try:
@@ -2471,11 +2507,12 @@ async def delivery_preview(
     breakdown = []
     for ds in dealer_shipments:
         d = ds["dealer"]
+        is_serv = ds.get("is_serviceable", True)
         shipment_res = pricing_res.shipments.get(d.id) or pricing_res.shipments.get(str(d.id))
         if not shipment_res:
             continue
         charge = float(shipment_res.delivery_charge)
-        is_free = shipment_res.is_free
+        is_free = shipment_res.is_free if is_serv else False
         threshold = float(shipment_res.free_above)
         remaining = float(shipment_res.remaining_for_free)
 
@@ -2485,10 +2522,11 @@ async def delivery_preview(
             if p.estimated_delivery_days and p.estimated_delivery_days > max_days:
                 max_days = p.estimated_delivery_days
         else:
-            dealer_items = [ci for ci in cart_items if ci.product and ci.product.dealer_id == d.id]
+            dealer_items = [ci for ci in cart_items if (ci.variant or ci.product) and (ci.variant.dealer_id if ci.variant else ci.product.dealer_id) == d.id]
             for ci in dealer_items:
-                if ci.product.estimated_delivery_days and ci.product.estimated_delivery_days > max_days:
-                    max_days = ci.product.estimated_delivery_days
+                eff_p = ci.variant or ci.product
+                if eff_p and eff_p.estimated_delivery_days and eff_p.estimated_delivery_days > max_days:
+                    max_days = eff_p.estimated_delivery_days
 
         est_date = datetime.now() + timedelta(days=max_days)
         formatted_date = est_date.strftime("%d %b %Y")
@@ -2505,40 +2543,118 @@ async def delivery_preview(
             "is_self_logistics": shipment_res.is_self_logistics,
             "estimated_delivery_days": max_days,
             "formatted_delivery_date": formatted_date,
+            "is_serviceable": is_serv,
+            "unserviceable_reason": ds.get("unserviceable_reason"),
         })
 
-    # Calculate platform fee using active marketplace billing slabs
-    total_platform_fee = 0.0
+    # Build per-dealer delivery allocation map
+    dealer_alloc_map: dict[Any, dict] = {}
+    for ds in dealer_shipments:
+        d = ds["dealer"]
+        shipment_res = pricing_res.shipments.get(d.id) or pricing_res.shipments.get(str(d.id))
+        d_charge = Decimal(str(round(float(shipment_res.delivery_charge), 2))) if shipment_res else Decimal("0.00")
+        d_sub = Decimal(str(round(ds["gross_subtotal"], 2)))
+        d_count = 0
+        if product_id and p and p.dealer_id == d.id:
+            d_count = 1
+        elif cart_items:
+            d_count = sum(1 for ci in cart_items if (ci.variant or ci.product) and (ci.variant.dealer_id if ci.variant else ci.product.dealer_id) == d.id)
 
-    preview_items = []
+        dealer_alloc_map[d.id] = {
+            "charge": d_charge,
+            "subtotal": d_sub,
+            "rem_items": d_count,
+            "allocated": Decimal("0.00"),
+        }
+
+    # Calculate platform fee and per-item delivery/marketplace breakdown
+    total_platform_fee = 0.0
+    items_breakdown = []
+
+    preview_item_tuples = []
     if product_id and p:
-        target_prod = v if (variant_id and v) else p
-        preview_items.append((target_prod, max(1, quantity)))
+        target_prod = v if (variant_id and v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None)) else p
+        preview_item_tuples.append((target_prod, max(1, quantity), None, variant_id, p.id))
     elif cart_items:
         for ci in cart_items:
             if ci.product:
-                preview_items.append((ci.product, ci.quantity))
+                eff_p = ci.variant if (ci.variant and (ci.variant.selling_price is not None or ci.variant.mrp is not None or ci.variant.dealer_price is not None)) else ci.product
+                preview_item_tuples.append((eff_p, ci.quantity, ci, ci.variant_id, ci.product_id))
 
-    for item_prod, item_qty in preview_items:
+    for item_prod, item_qty, ci_obj, var_id, parent_pid in preview_item_tuples:
         item_price = float(item_prod.selling_price if item_prod.selling_price is not None else (item_prod.mrp or item_prod.dealer_price))
-        line_subtotal = Decimal(str(round(item_price * item_qty, 2)))
-        mp_slab = match_slab_from_list(active_slabs, "marketplace", line_subtotal)
+        item_mrp = float(item_prod.mrp if item_prod.mrp is not None else item_price)
+        line_subtotal_dec = Decimal(str(round(item_price * item_qty, 2)))
+        line_subtotal = float(line_subtotal_dec)
+
+        # Marketplace fee for this item
+        mp_slab = match_slab_from_list(active_slabs, "marketplace", line_subtotal_dec)
         if mp_slab and mp_slab.customer_percentage:
-            fee = round(float(line_subtotal * Decimal(str(mp_slab.customer_percentage))), 2)
+            fee = round(float(line_subtotal_dec * Decimal(str(mp_slab.customer_percentage))), 2)
         else:
             fee = 0.0
         total_platform_fee += fee
 
+        # Delivery fee allocation for this item
+        d_alloc = dealer_alloc_map.get(item_prod.dealer_id)
+        if d_alloc and d_alloc["charge"] > 0 and d_alloc["subtotal"] > 0:
+            if d_alloc["rem_items"] <= 1:
+                item_del_dec = d_alloc["charge"] - d_alloc["allocated"]
+            else:
+                ratio = line_subtotal_dec / d_alloc["subtotal"]
+                item_del_dec = Decimal(str(round(float(d_alloc["charge"] * ratio), 2)))
+                d_alloc["allocated"] += item_del_dec
+            d_alloc["rem_items"] -= 1
+            item_delivery_fee = max(0.0, float(item_del_dec))
+        else:
+            item_delivery_fee = 0.0
+
+        # Coupon discount allocation
+        if total_gross > 0 and total_discount_amount > 0:
+            if applied_coupon and applied_coupon.dealer_id:
+                item_coupon = round((line_subtotal / total_gross) * total_discount_amount, 2) if applied_coupon.dealer_id == item_prod.dealer_id else 0.0
+            else:
+                item_coupon = round((line_subtotal / total_gross) * total_discount_amount, 2)
+        else:
+            item_coupon = 0.0
+
+        item_payable = round(max(0.0, line_subtotal - item_coupon) + item_delivery_fee + fee, 2)
+        d_is_serv, d_unserv_reason = dealer_serviceable_map.get(item_prod.dealer_id, (True, None))
+
+        items_breakdown.append({
+            "product_id": str(parent_pid),
+            "variant_id": str(var_id) if var_id else None,
+            "cart_item_id": ci_obj.id if ci_obj else None,
+            "dealer_id": item_prod.dealer_id,
+            "product_name": item_prod.name,
+            "quantity": item_qty,
+            "price": item_price,
+            "mrp": item_mrp,
+            "subtotal": line_subtotal,
+            "coupon_discount": item_coupon,
+            "marketplace_fee": fee,
+            "delivery_fee": round(item_delivery_fee, 2),
+            "payable_amount": item_payable,
+            "is_serviceable": d_is_serv,
+            "unserviceable_reason": d_unserv_reason,
+        })
+
+    all_serviceable = all(ds.get("is_serviceable", True) for ds in dealer_shipments)
+
     return {
         "dealers": breakdown,
+        "items": items_breakdown,
         "total_delivery_charge": float(pricing_res.total_delivery_charge),
         "total_platform_fee": round(total_platform_fee, 2),
         "platform_eligible_subtotal": float(pricing_res.platform_eligible_subtotal),
         "platform_free_delivery_threshold": float(pricing_res.platform_free_delivery_threshold),
-        "platform_qualifies_for_free": pricing_res.platform_qualifies_for_free,
+        "platform_qualifies_for_free": pricing_res.platform_qualifies_for_free and all_serviceable,
         "platform_remaining_for_free": float(pricing_res.platform_remaining_for_free),
         "coupon_applied": bool(applied_coupon),
         "coupon_discount": round(total_discount_amount, 2),
+        "is_serviceable": all_serviceable,
+        "pincode": target_pincode if target_pincode else None,
+        "unserviceable_reason": "Some items are not serviceable to the selected PIN code." if not all_serviceable else None,
         "note": "Free delivery applies to all platform shipments when eligible items reach ₹1,000. Discounts applied at checkout affect final eligibility."
     }
 
@@ -2570,9 +2686,11 @@ async def register_as_dealer(
     )
     
     db.add(dealer)
+    await db.flush()
     
-    # Update user role to dealer
+    # Update user role to dealer and link dealer_id
     current_user.role = UserRole.DEALER
+    current_user.dealer_id = dealer.id
     
     await db.commit()
     await db.refresh(dealer)
@@ -2657,6 +2775,15 @@ async def complete_dealer_profile(
     for key, value in data_dict.items():
         # Safeguard: Never overwrite DB with masked values containing '*'
         if value is not None and isinstance(value, str) and '*' in value:
+            continue
+        if key == "ifsc_code":
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            str_val = str(value).strip().upper()
+            import re
+            if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", str_val):
+                raise HTTPException(status_code=400, detail="Invalid IFSC code format (e.g., SBIN0001234)")
+            setattr(dealer, key, str_val)
             continue
         if hasattr(dealer, key):
             setattr(dealer, key, value)

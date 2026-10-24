@@ -137,6 +137,14 @@ class Dealer(DealerBase):
     account_holder_name: Optional[str] = None
     account_number: Optional[str] = None
 
+    @field_validator('ifsc_code', mode='before')
+    @classmethod
+    def decrypt_ifsc(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from core.security import decrypt_field
+        return decrypt_field(str(v))
+
     @field_validator('aadhaar_number', mode='before')
     @classmethod
     def mask_aadhaar(cls, v: Optional[str]) -> Optional[str]:

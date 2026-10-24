@@ -30,6 +30,12 @@ class Customer(CustomerBase):
 class CustomerLoginRequest(BaseModel):
     identifier: str # email or phone
 
+class CustomerRegisterRequest(BaseModel):
+    identifier: str # 10-digit phone
+    full_name: Optional[str] = None
+    password: Optional[str] = None
+    referral_code: Optional[str] = None
+
 class CustomerPasswordLogin(BaseModel):
     identifier: str # email or phone
     password: str
@@ -38,7 +44,8 @@ class CustomerOTPVerify(BaseModel):
     identifier: str
     otp: str
     full_name: Optional[str] = None # Used for registration
-    password: Optional[str] = None # Optional password set during registration
+    password: Optional[str] = None # Password set during registration
+    referral_code: Optional[str] = None
 
 class CustomerForgotPasswordRequest(BaseModel):
     identifier: str # email or phone

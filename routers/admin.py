@@ -40,6 +40,8 @@ class DealerAdminCreate(BaseModel):
     bank_name: Optional[str] = None
     account_number: Optional[str] = None
     ifsc_code: Optional[str] = None
+    ifsc: Optional[str] = None
+    bank_ifsc: Optional[str] = None
     # Documents
     company_photo_url: Optional[str] = None
     gst_certificate_url: Optional[str] = None
@@ -71,6 +73,8 @@ class DealerAdminUpdate(BaseModel):
     bank_name: Optional[str] = None
     account_number: Optional[str] = None
     ifsc_code: Optional[str] = None
+    ifsc: Optional[str] = None
+    bank_ifsc: Optional[str] = None
     is_active: Optional[bool] = None
     # Documents
     company_photo_url: Optional[str] = None
@@ -387,10 +391,56 @@ async def list_all_dealers(
             "cin_number": d.cin_number,
             "cin_certificate_url": d.cin_certificate_url,
             "company_logo_url": d.company_logo_url,
+            "signature_image_url": d.signature_image_url,
+            "is_auction_enabled": d.is_auction_enabled,
             "lat_long": d.lat_long
         }
         for d in dealers
     ]
+
+@router.get("/dealers/{dealer_id}")
+async def get_dealer_by_id(
+    dealer_id: UUID,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get single dealer details for admin editing with sensitive fields handled"""
+    query = select(Dealer).where(Dealer.is_deleted == False).where(Dealer.id == dealer_id).options(
+        selectinload(Dealer.user),
+        selectinload(Dealer.country),
+        selectinload(Dealer.state_rel)
+    )
+    result = await db.execute(query)
+    d = result.scalar_one_or_none()
+    if not d:
+        raise HTTPException(status_code=404, detail="Dealer profile not found")
+
+    return {
+        "id": d.id, "business_name": d.business_name, "business_address": d.business_address,
+        "tax_id": d.gst_number, "user_id": d.user_id,
+        "user_email": d.user.email if d.user else None,
+        "full_name": d.user.full_name if d.user else None,
+        "is_approved": d.is_approved, "profile_status": d.profile_status,
+        "access_status": d.access_status, "created_at": d.created_at,
+        "business_phone": d.business_phone,
+        "city": d.city, "pincode": d.pincode,
+        "country_id": d.country_id, "country_name": d.country.name if d.country else None,
+        "state_id": d.state_id, "state_name": d.state_rel.name if d.state_rel else None,
+        "partner_id": d.partner_id,
+        "pan_number": _mask_pan(d.pan_number), "bank_name": d.bank_name,
+        "account_number": _mask_account(d.account_number), "ifsc_code": _manual_decrypt(d.ifsc_code),
+        "reject_reason": d.reject_reason, "is_active": d.is_active,
+        "company_photo_url": d.company_photo_url, "gst_certificate_url": d.gst_certificate_url,
+        "incorporation_certificate_url": d.incorporation_certificate_url,
+        "pan_photo_url": d.pan_photo_url, "aadhaar_number": _mask_aadhaar(d.aadhaar_number),
+        "aadhaar_photo_url": d.aadhaar_photo_url,
+        "cin_number": d.cin_number,
+        "cin_certificate_url": d.cin_certificate_url,
+        "company_logo_url": d.company_logo_url,
+        "signature_image_url": d.signature_image_url,
+        "is_auction_enabled": d.is_auction_enabled,
+        "lat_long": d.lat_long
+    }
 
 @router.get("/logistics-partners")
 async def list_all_partners(
@@ -961,6 +1011,25 @@ async def create_dealer(
         )
         db.add(db_user)
         await db.flush()
+        # Resolve state_id if not directly provided but state name/code is given
+        resolved_state_id = dealer_in.state_id
+        if not resolved_state_id and dealer_in.state:
+            from models.location import State
+            st_res = await db.execute(
+                select(State.id).where(
+                    (func.lower(State.name) == dealer_in.state.lower()) | 
+                    (func.lower(State.state_code) == dealer_in.state.lower())
+                )
+            )
+            resolved_state_id = st_res.scalar_one_or_none()
+
+        raw_ifsc = dealer_in.ifsc_code or getattr(dealer_in, 'ifsc', None) or getattr(dealer_in, 'bank_ifsc', None)
+        cleaned_ifsc = raw_ifsc.strip().upper() if raw_ifsc and str(raw_ifsc).strip() else None
+        if cleaned_ifsc:
+            import re
+            if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", cleaned_ifsc):
+                raise HTTPException(status_code=400, detail="Invalid IFSC code format (e.g., SBIN0001234)")
+
         db_dealer = Dealer(
             user_id=db_user.id,
             business_name=dealer_in.business_name,
@@ -969,15 +1038,14 @@ async def create_dealer(
             pan_number=dealer_in.pan_number,
             aadhaar_number=dealer_in.aadhaar_number,
             country_id=dealer_in.country_id,
-            state_id=dealer_in.state_id,
+            state_id=resolved_state_id,
             partner_id=dealer_in.partner_id,
             city=dealer_in.city,
-            state=dealer_in.state,
             pincode=dealer_in.pincode,
             lat_long=dealer_in.lat_long,
             bank_name=dealer_in.bank_name,
             account_number=dealer_in.account_number,
-            ifsc_code=dealer_in.ifsc_code,
+            ifsc_code=cleaned_ifsc,
             business_phone=dealer_in.business_phone,
             company_photo_url=dealer_in.company_photo_url,
             gst_certificate_url=dealer_in.gst_certificate_url,
@@ -1004,7 +1072,7 @@ async def create_dealer(
             address=dealer_in.business_address or "Head Office",
             city=dealer_in.city,
             state=dealer_in.state,
-            state_id=dealer_in.state_id,
+            state_id=resolved_state_id,
             country_id=dealer_in.country_id,
             pincode=dealer_in.pincode,
             phone=dealer_in.business_phone,
@@ -1035,6 +1103,10 @@ async def update_dealer_profile(
     dealer = res.scalar_one_or_none()
     if not dealer: raise HTTPException(status_code=404, detail="Dealer profile not found")
     update_data = dealer_in.model_dump(exclude_unset=True)
+    if "ifsc" in update_data and "ifsc_code" not in update_data:
+        update_data["ifsc_code"] = update_data.pop("ifsc")
+    if "bank_ifsc" in update_data and "ifsc_code" not in update_data:
+        update_data["ifsc_code"] = update_data.pop("bank_ifsc")
     print(f"DEBUG: Updating dealer {dealer_id} with data keys: {list(update_data.keys())}")
     
     # Handle user model updates if provided
@@ -1072,8 +1144,24 @@ async def update_dealer_profile(
         else:
             clean_updates[field] = value
 
+    if "state" in update_data:
+        state_val = update_data.pop("state")
+        if not update_data.get("state_id") and state_val:
+            from models.location import State
+            st_res = await db.execute(
+                select(State.id).where(
+                    (func.lower(State.name) == str(state_val).lower()) | 
+                    (func.lower(State.state_code) == str(state_val).lower())
+                )
+            )
+            resolved_st_id = st_res.scalar_one_or_none()
+            if resolved_st_id:
+                clean_updates["state_id"] = resolved_st_id
+
     try:
-        for field, value in clean_updates.items(): setattr(dealer, field, value)
+        for field, value in clean_updates.items():
+            if hasattr(dealer, field):
+                setattr(dealer, field, value)
         await db.commit()
         return {"message": "Dealer profile synchronized successfully"}
     except HTTPException:

@@ -621,13 +621,18 @@ async def create_product(
     db_product = ProductModel(**product_data)
     
     # Automatically assign dealer_id if the user is a dealer
-    if current_user.role == UserRole.DEALER:
-        dealer_res = await db.execute(select(DealerModel).where(DealerModel.user_id == current_user.id))
-        dealer = dealer_res.scalar_one_or_none()
-        if dealer:
-            if not dealer.is_active:
-                raise HTTPException(status_code=403, detail="Your dealer account is currently inactive. Please contact support.")
-            db_product.dealer_id = dealer.id
+    if current_user.role in [UserRole.DEALER, UserRole.DEALER_MANAGER, UserRole.DEALER_INVENTORY, UserRole.DEALER_ORDERS, UserRole.DEALER_FINANCE]:
+        resolved_d_id = current_user.dealer_id
+        if not resolved_d_id:
+            dealer_res = await db.execute(select(DealerModel).where(DealerModel.user_id == current_user.id))
+            dealer = dealer_res.scalar_one_or_none()
+            if dealer:
+                if not dealer.is_active:
+                    raise HTTPException(status_code=403, detail="Your dealer account is currently inactive. Please contact support.")
+                resolved_d_id = dealer.id
+                current_user.dealer_id = dealer.id
+        if resolved_d_id:
+            db_product.dealer_id = resolved_d_id
         else:
             raise HTTPException(status_code=403, detail="You must have a dealer profile to create products.")
     
@@ -690,8 +695,14 @@ async def create_product(
         db_product.mrp = round(db_product.dealer_price + (db_product.tax_price or 0.0), 2)
     if db_product.discount_percentage is not None and db_product.selling_price is None:
         db_product.selling_price = round((db_product.mrp or db_product.dealer_price) * (1.0 - db_product.discount_percentage / 100.0), 2)
-    if db_product.discount_price is None and db_product.mrp is not None and db_product.selling_price is not None:
-        db_product.discount_price = round(db_product.mrp - db_product.selling_price, 2)
+    if db_product.mrp is not None and db_product.selling_price is not None:
+        if db_product.mrp > db_product.selling_price:
+            db_product.discount_price = round(db_product.mrp - db_product.selling_price, 2)
+            if db_product.discount_percentage is None and db_product.mrp > 0:
+                db_product.discount_percentage = int(round((db_product.discount_price / db_product.mrp) * 100))
+        else:
+            db_product.discount_price = None
+            db_product.discount_percentage = None
 
     db.add(db_product)
     await db.flush() # Get product ID without committing
@@ -1243,6 +1254,7 @@ async def get_products(
     category_id: Optional[int] = None,
     subcategory_id: Optional[int] = None,
     dealer_id: Optional[UUID] = None,
+    my_products: Optional[bool] = False,
     hub_id: Optional[int] = None,
     search: Optional[str] = None,
     q: Optional[str] = None,
@@ -1251,15 +1263,25 @@ async def get_products(
     min_discount: Optional[int] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = "asc",
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """Get all products with pagination, search, category, and subcategory filter"""
+    target_dealer_id = dealer_id
+    if (my_products or (not target_dealer_id and my_products is not False)) and current_user and hasattr(current_user, 'role') and current_user.role in [UserRole.DEALER, UserRole.DEALER_MANAGER, UserRole.DEALER_INVENTORY, UserRole.DEALER_ORDERS, UserRole.DEALER_FINANCE]:
+        if my_products:
+            if getattr(current_user, 'dealer_id', None):
+                target_dealer_id = current_user.dealer_id
+            else:
+                d_check = await db.execute(select(DealerModel.id).where(DealerModel.user_id == current_user.id))
+                target_dealer_id = d_check.scalar_one_or_none()
+
     query = select(ProductModel).join(DealerModel).outerjoin(PartnerModel, DealerModel.partner_id == PartnerModel.id).where(
         ProductModel.is_deleted == False
     )
     
     # If no specific dealer is requested, show only active/approved parent products (Public view)
-    if not dealer_id:
+    if not target_dealer_id:
         query = query.where(
             DealerModel.access_status == 'active',
             DealerModel.is_active == True, DealerModel.is_deleted == False,
@@ -1291,10 +1313,10 @@ async def get_products(
             ProductModel.subcategory_id.in_(cat_family)
         ))
     
-    if dealer_id:
+    if target_dealer_id:
         # For a specific dealer, show ALL their products including pending ones
         query = query.where(
-            ProductModel.dealer_id == dealer_id
+            ProductModel.dealer_id == target_dealer_id
         )
         if not include_children:
             query = query.where(ProductModel.parent_product_id.is_(None))

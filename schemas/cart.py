@@ -26,6 +26,7 @@ class CartItem(CartItemBase):
     customer_id: int
     created_at: datetime
     product: Optional[Product] = None
+    variant: Optional[Product] = None
 
     class Config:
         from_attributes = True
@@ -59,6 +60,12 @@ class OrderItem(OrderItemBase):
     hub_id: Optional[int] = None
     hub: Optional[Hub] = None
     hub_arrived_at: Optional[datetime] = None
+    tax_amount: Optional[float] = 0.0
+    platform_fee: Optional[float] = 0.0
+    marketplace_customer_charge: Optional[float] = 0.0
+    logistics_customer_charge: Optional[float] = 0.0
+    delivery_charge: Optional[float] = 0.0
+    delivery_type: Optional[str] = None
 
     class Config:
         from_attributes = True

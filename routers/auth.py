@@ -26,7 +26,7 @@ def is_account_locked(locked_until: Optional[datetime]) -> bool:
         locked_dt = locked_until
     return locked_dt > now
 from schemas.customer import (
-    Customer as CustomerSchema, CustomerLoginRequest, CustomerOTPVerify,
+    Customer as CustomerSchema, CustomerLoginRequest, CustomerRegisterRequest, CustomerOTPVerify,
     CustomerPasswordLogin, CustomerForgotPasswordRequest,
     CustomerForgotPasswordVerify, CustomerResetPassword
 )
@@ -134,6 +134,14 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
     # 4. Clear failed attempts and lock on successful login
     user.failed_login_attempts = 0
     user.locked_until = None
+
+    # Ensure dealer_id is linked on user if user belongs to a dealer
+    if getattr(user, 'dealer_id', None) is None and user.role in [UserRole.DEALER, UserRole.DEALER_MANAGER, UserRole.DEALER_INVENTORY, UserRole.DEALER_ORDERS, UserRole.DEALER_FINANCE]:
+        d_check = await db.execute(select(DealerModel).where(DealerModel.user_id == user.id))
+        dealer_obj = d_check.scalar_one_or_none()
+        if dealer_obj:
+            user.dealer_id = dealer_obj.id
+
     await db.commit()
     await db.refresh(user)
 
@@ -142,39 +150,68 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
 
 @router.post("/customer/register-request")
 @limiter.limit("5/minute")
-async def customer_register_request(request: Request, data: CustomerLoginRequest, db: AsyncSession = Depends(get_db)):
-    """Request OTP for customer registration"""
+async def customer_register_request(request: Request, data: CustomerRegisterRequest, db: AsyncSession = Depends(get_db)):
+    """Request OTP for customer registration with password & referral support"""
+    phone_clean = data.identifier.strip()
+    if not re.match(r'^\d{10}$', phone_clean):
+        raise HTTPException(status_code=400, detail="Mobile number must be exactly 10 digits")
+
     result = await db.execute(
-        select(CustomerUserModel).where(
-            (CustomerUserModel.phone == data.identifier)
-        )
+        select(CustomerUserModel).where(CustomerUserModel.phone == phone_clean)
     )
     customer = result.scalar_one_or_none()
     
     if customer and customer.is_active:
-         raise HTTPException(status_code=400, detail="Customer already registered")
+        raise HTTPException(status_code=400, detail="Customer already registered")
+
+    # Validate full name if provided
+    if data.full_name is not None and len(data.full_name.strip()) <= 2:
+        raise HTTPException(status_code=400, detail="Full name must be more than 2 characters")
+
+    # Validate password if provided
+    if data.password is not None and len(data.password.strip()) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    # Validate referral code if provided
+    if data.referral_code and data.referral_code.strip():
+        from models.referral import CustomerReferralProfile
+        ref_code = data.referral_code.strip().upper()
+        res_ref = await db.execute(
+            select(CustomerReferralProfile).where(CustomerReferralProfile.referral_code == ref_code)
+        )
+        if not res_ref.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Invalid referral code.")
 
     otp = str(random.randint(100000, 999999))
-    
+    now = datetime.now(timezone.utc)
+    otp_expires = now + timedelta(minutes=10)
+
+    pwd_hash = get_password_hash(data.password.strip()) if (data.password and data.password.strip()) else None
+
     if not customer:
-        # Create a pending customer record
         customer = CustomerUserModel(
-            phone=data.identifier,
-            full_name="Pending", # Temporary
+            phone=phone_clean,
+            full_name=data.full_name.strip() if data.full_name else "Pending",
+            password_hash=pwd_hash,
             is_active=False,
             otp_code=otp,
-            otp_attempts=0
+            otp_attempts=0,
+            otp_expires_at=otp_expires
         )
         db.add(customer)
     else:
-        # Update OTP for existing pending record
         customer.otp_code = otp
         customer.otp_attempts = 0
+        customer.otp_expires_at = otp_expires
+        if data.full_name and data.full_name.strip():
+            customer.full_name = data.full_name.strip()
+        if pwd_hash:
+            customer.password_hash = pwd_hash
     
     await db.commit()
 
     from services.notification import SmsService
-    await SmsService.send_otp(data.identifier, otp)
+    await SmsService.send_otp(phone_clean, otp)
 
     if getattr(settings, 'ENVIRONMENT', 'development') != 'production':
         print(f"--- CUSTOMER REG OTP: {otp} ---")
@@ -185,28 +222,39 @@ async def customer_register_request(request: Request, data: CustomerLoginRequest
 
 @router.post("/customer/register-verify", response_model=Token)
 async def customer_register_verify(request: Request, data: CustomerOTPVerify, db: AsyncSession = Depends(get_db)):
-    """Verify OTP and create customer account"""
-    # Re-enforce mandatory fields and validation
-    if not data.full_name or len(data.full_name) <= 2:
-         raise HTTPException(status_code=400, detail="Full name must be more than 2 characters")
-    
-    if not re.match(r'^\d{10}$', data.identifier):
-         raise HTTPException(status_code=400, detail="Mobile number must be exactly 10 digits")
+    """Verify OTP and create/activate customer account with password"""
+    phone_clean = data.identifier.strip()
+    if not re.match(r'^\d{10}$', phone_clean):
+        raise HTTPException(status_code=400, detail="Mobile number must be exactly 10 digits")
 
     result = await db.execute(
-        select(CustomerUserModel).where(
-            (CustomerUserModel.phone == data.identifier)
-        )
+        select(CustomerUserModel).where(CustomerUserModel.phone == phone_clean)
     )
     customer = result.scalar_one_or_none()
-    
+
+    # Re-enforce mandatory full name
+    resolved_name = (data.full_name.strip() if data.full_name else None) or (customer.full_name if (customer and customer.full_name != "Pending") else None)
+    if not resolved_name or len(resolved_name) <= 2:
+        raise HTTPException(status_code=400, detail="Full name must be more than 2 characters")
+
+    # Re-enforce mandatory password (no default password)
+    if data.password and data.password.strip():
+        if len(data.password.strip()) < 6:
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        resolved_password_hash = get_password_hash(data.password.strip())
+    elif customer and customer.password_hash:
+        resolved_password_hash = customer.password_hash
+    else:
+        raise HTTPException(status_code=400, detail="Password is required")
+
     # Check OTP (Allow test codes in non-production)
     is_test_otp = (getattr(settings, 'ENVIRONMENT', 'development') != 'production') and (data.otp in ["123456", "654321"])
     if not customer:
         if is_test_otp:
             customer = CustomerUserModel(
-                phone=data.identifier,
-                full_name=data.full_name,
+                phone=phone_clean,
+                full_name=resolved_name,
+                password_hash=resolved_password_hash,
                 is_active=True,
                 otp_attempts=0
             )
@@ -215,6 +263,16 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
         else:
             raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
     else:
+        now = datetime.now(timezone.utc)
+        if not is_test_otp and customer.otp_expires_at:
+            exp = customer.otp_expires_at if customer.otp_expires_at.tzinfo else customer.otp_expires_at.replace(tzinfo=timezone.utc)
+            if now > exp:
+                customer.otp_code = None
+                customer.otp_attempts = 0
+                customer.otp_expires_at = None
+                await db.commit()
+                raise HTTPException(status_code=400, detail="OTP has expired. Please request a new OTP.")
+
         if not customer.otp_code and not is_test_otp:
             raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
 
@@ -223,21 +281,20 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
             if customer.otp_attempts >= 3:
                 customer.otp_code = None
                 customer.otp_attempts = 0
+                customer.otp_expires_at = None
                 await db.commit()
                 raise HTTPException(status_code=400, detail="Wrong OTP - attempts exceeded. Please request a new OTP.")
             else:
                 await db.commit()
                 raise HTTPException(status_code=400, detail="Invalid OTP code")
     
-    # Complete registration
-    customer.full_name = data.full_name
+    # Complete registration / activation
+    customer.full_name = resolved_name
+    customer.password_hash = resolved_password_hash
     customer.is_active = True
     customer.otp_code = None
     customer.otp_attempts = 0
-    if getattr(data, 'password', None) and data.password.strip():
-        customer.password_hash = get_password_hash(data.password.strip())
-    elif not customer.password_hash:
-        customer.password_hash = get_password_hash("user123")
+    customer.otp_expires_at = None
     
     await db.flush()
     customer_id = int(customer.id)
@@ -251,12 +308,25 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
         ref_check = await db.execute(
             select(CustomerReferralProfile).where(CustomerReferralProfile.customer_id == customer_id)
         )
-        if not ref_check.scalar_one_or_none():
-            new_ref_profile = CustomerReferralProfile(
+        ref_profile = ref_check.scalar_one_or_none()
+        if not ref_profile:
+            ref_profile = CustomerReferralProfile(
                 customer_id=customer_id,
                 referral_code=_generate_referral_code(customer_id)
             )
-            db.add(new_ref_profile)
+            db.add(ref_profile)
+            await db.flush()
+
+        # Apply referral code if passed and not yet referred
+        if data.referral_code and data.referral_code.strip() and not ref_profile.referred_by_id:
+            ref_code_str = data.referral_code.strip().upper()
+            res_referrer = await db.execute(
+                select(CustomerReferralProfile).where(CustomerReferralProfile.referral_code == ref_code_str)
+            )
+            referrer_prof = res_referrer.scalar_one_or_none()
+            if referrer_prof and int(referrer_prof.customer_id) != customer_id:
+                ref_profile.referred_by_id = int(referrer_prof.customer_id)
+
         await get_or_create_wallet(db, customer_id)
     except Exception as e:
         print(f"Warning: Could not auto-generate referral profile on signup: {e}")
@@ -268,7 +338,7 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
         raise HTTPException(status_code=400, detail="Could not complete registration. Phone may be already registered.")
 
     await db.refresh(customer)
-    access_token = create_access_token(data={"sub": data.identifier, "is_customer": True})
+    access_token = create_access_token(data={"sub": customer.phone, "is_customer": True})
     return {
         "access_token": access_token, 
         "token_type": "bearer", 
@@ -279,7 +349,7 @@ async def customer_register_verify(request: Request, data: CustomerOTPVerify, db
             phone=customer.phone,
             dob=customer.dob,
             is_active=customer.is_active,
-            created_at=customer.created_at or datetime.utcnow()
+            created_at=customer.created_at or datetime.now(timezone.utc)
         )
     }
 
@@ -557,8 +627,19 @@ async def customer_reset_password(request: Request, data: CustomerResetPassword,
     return {"message": "Password updated successfully. You can now log in with your new password."}
 
 @router.get("/me")
-async def get_current_user_profile(current_user: Any = Depends(get_current_active_user)):
+async def get_current_user_profile(
+    current_user: Any = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
     """Get currently logged-in user profile"""
+    if hasattr(current_user, 'role') and getattr(current_user, 'dealer_id', None) is None:
+        if current_user.role in [UserRole.DEALER, UserRole.DEALER_MANAGER, UserRole.DEALER_INVENTORY, UserRole.DEALER_ORDERS, UserRole.DEALER_FINANCE]:
+            d_check = await db.execute(select(DealerModel).where(DealerModel.user_id == current_user.id))
+            dealer_obj = d_check.scalar_one_or_none()
+            if dealer_obj:
+                current_user.dealer_id = dealer_obj.id
+                await db.commit()
+                await db.refresh(current_user)
     return current_user
 
 @router.post("/delete-account")

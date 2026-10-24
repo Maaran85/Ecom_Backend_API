@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from core.database import get_db
-from core.permissions import get_current_active_user, require_admin, require_super_admin
+from core.permissions import get_current_active_user, require_admin, require_super_admin, DEALER_ROLES
 from models import User, Product, Review, OrderReturn
 from models.user import UserRole
 from core.permissions import LOGISTICS_ROLES
@@ -710,7 +710,36 @@ async def upload_dealer_company_logo(
     try:
         file_path = await FileUploadService.upload_image(file, "dealer_docs/logo", optimize=True)
         image_url = FileUploadService.get_image_url(file_path)
-        return {"message": "Company logo uploaded", "image_url": image_url}
+        return {"message": "Company logo uploaded", "image_url": image_url, "url": image_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@router.post("/admin/dealers/signature-image")
+async def upload_dealer_signature(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Upload Dealer Signature Image (admin/dealer/partner)"""
+    allowed_roles = [UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.ADMIN_USER] + DEALER_ROLES
+    if current_user.role not in allowed_roles and not str(current_user.role.value).startswith("partner"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to upload dealer documents"
+        )
+    try:
+        file_path = await FileUploadService.upload_image(file, "dealer_docs/signature", optimize=True)
+        image_url = FileUploadService.get_image_url(file_path)
+        return {
+            "message": "Signature uploaded successfully",
+            "image_url": image_url,
+            "url": image_url,
+            "file_path": file_path
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 

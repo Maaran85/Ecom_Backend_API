@@ -214,3 +214,7 @@ class OrderItem(Base):
         if hasattr(self, 'order') and self.order and self.order.order_number:
             return f"{self.order.order_number}"
         return f"ORD-{self.order_id}-{self.id}"
+
+    @property
+    def delivery_charge(self) -> float:
+        return self.logistics_customer_charge or 0.0

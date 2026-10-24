@@ -90,14 +90,23 @@ async def add_to_cart(
         )
 
     # Check if item with SAME product AND same size AND same variant already in cart
+    cart_match_conds = [
+        CartItemModel.customer_id == customer_id, 
+        CartItemModel.product_id == product_id,
+    ]
+    if variant_id is not None:
+        cart_match_conds.append(CartItemModel.variant_id == variant_id)
+    else:
+        cart_match_conds.append(CartItemModel.variant_id.is_(None))
+
+    if item_in.size:
+        cart_match_conds.append(CartItemModel.size == item_in.size)
+    else:
+        cart_match_conds.append((CartItemModel.size.is_(None)) | (CartItemModel.size == ""))
+
     result = await db.execute(
         select(CartItemModel.id, CartItemModel.quantity)
-        .where(
-            CartItemModel.customer_id == customer_id, 
-            CartItemModel.product_id == product_id,
-            CartItemModel.variant_id == variant_id,
-            CartItemModel.size == item_in.size
-        )
+        .where(*cart_match_conds)
     )
     existing = result.first()
 
@@ -137,6 +146,9 @@ async def add_to_cart(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
+            ),
+            joinedload(CartItemModel.variant).options(
+                joinedload(ProductModel.dealer)
             )
         )
     )
@@ -150,6 +162,9 @@ async def add_to_cart(
                     joinedload(ProductModel.dealer),
                     joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
                     selectinload(ProductModel.children).selectinload(ProductModel.children)
+                ),
+                joinedload(CartItemModel.variant).options(
+                    joinedload(ProductModel.dealer)
                 )
             )
             .limit(1)
@@ -172,6 +187,9 @@ async def get_cart(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
+            ),
+            joinedload(CartItemModel.variant).options(
+                joinedload(ProductModel.dealer)
             )
         )
     )
@@ -211,6 +229,9 @@ async def update_cart_item(
                 joinedload(ProductModel.dealer),
                 joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
                 selectinload(ProductModel.children).selectinload(ProductModel.children)
+            ),
+            joinedload(CartItemModel.variant).options(
+                joinedload(ProductModel.dealer)
             )
         )
     )
@@ -329,6 +350,7 @@ async def create_order(
             raise HTTPException(status_code=400, detail="The seller for this product is currently inactive.")
 
         # Check stock
+        target_variant = None
         if order_request.variant_id:
             target_variant = next((v for v in (product.children or []) if v.id == order_request.variant_id), None)
             if not target_variant:
@@ -342,7 +364,18 @@ async def create_order(
             if product.stock < qty:
                 raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
 
-        price = float(product.selling_price if product.selling_price else (product.mrp or product.dealer_price))
+        # Validate delivery address serviceability
+        if shipping_address and shipping_address.pincode:
+            from services.delivery_pricing_service import check_pincode_serviceability
+            is_serv = await check_pincode_serviceability(db, shipping_address.pincode, product.dealer_id)
+            if not is_serv:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Item '{product.name}' cannot be delivered to PIN code {shipping_address.pincode}. Please select a different delivery address."
+                )
+
+        eff_product = target_variant if (target_variant and (target_variant.selling_price is not None or target_variant.mrp is not None or target_variant.dealer_price is not None)) else product
+        price = float(eff_product.selling_price if eff_product.selling_price is not None else (eff_product.mrp or eff_product.dealer_price))
         total_amount = price * qty
         if product.dealer_id:
             dealer_subtotals[product.dealer_id] = total_amount
@@ -405,6 +438,9 @@ async def create_order(
                 joinedload(CartItemModel.product).options(
                     joinedload(ProductModel.dealer).selectinload(DealerModel.state_rel),
                     selectinload(ProductModel.children).selectinload(ProductModel.children)
+                ),
+                joinedload(CartItemModel.variant).options(
+                    joinedload(ProductModel.dealer).selectinload(DealerModel.state_rel)
                 )
             )
         )
@@ -437,8 +473,10 @@ async def create_order(
             if not product:
                 raise HTTPException(status_code=404, detail=f"Product {cart_item.product_id} not found")
 
+            variant = cart_item.variant
             if cart_item.variant_id:
-                variant = next((v for v in (product.children or []) if v.id == cart_item.variant_id), None)
+                if not variant:
+                    variant = next((v for v in (product.children or []) if v.id == cart_item.variant_id), None)
                 if not variant:
                     res = await db.execute(select(ProductModel).where(ProductModel.id == cart_item.variant_id))
                     variant = res.scalar_one_or_none()
@@ -452,13 +490,24 @@ async def create_order(
                 if product.stock < cart_item.quantity:
                     raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
 
-            price = float(product.selling_price if product.selling_price else (product.mrp or product.dealer_price))
+            eff_product = variant if (variant and (variant.selling_price is not None or variant.mrp is not None or variant.dealer_price is not None)) else product
+            price = float(eff_product.selling_price if eff_product.selling_price is not None else (eff_product.mrp or eff_product.dealer_price))
             line_total = price * cart_item.quantity
             total_amount += line_total
 
-            d_id = product.dealer_id
+            d_id = eff_product.dealer_id or product.dealer_id
             if d_id:
                 dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + line_total
+
+            # Validate delivery address serviceability
+            if shipping_address and shipping_address.pincode:
+                from services.delivery_pricing_service import check_pincode_serviceability
+                is_serv = await check_pincode_serviceability(db, shipping_address.pincode, d_id)
+                if not is_serv:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Item '{product.name}' cannot be delivered to PIN code {shipping_address.pincode}. Please select a different delivery address."
+                    )
 
             buyer_state = shipping_address.state_rel.state_code if (shipping_address and shipping_address.state_rel) else None
             seller_state = product.dealer.state_code if product.dealer else None
@@ -563,6 +612,7 @@ async def create_order(
             select(DealerModel).where(DealerModel.id.in_(list(dealer_subtotals.keys())))
         )
         dealers_list = dealers_res.scalars().all()
+        dealers_dict = {d.id: d for d in dealers_list}
 
         # Compute net dealer subtotals after applicable discounts & coupons
         dealer_shipments = []
@@ -799,6 +849,8 @@ async def create_order(
         snap_mkt_cust = round(float(gross_sale_val * Decimal(str(mkt_slab.customer_percentage))), 2) if (mkt_slab and mkt_slab.customer_percentage) else 0.0
         snap_log_dealer = round(float(gross_sale_val * Decimal(str(log_slab.dealer_percentage))), 2) if log_slab else 0.0
         snap_log_cust = item_delivery
+        dealer_obj = dealers_dict.get(item_data["dealer_id"])
+        item_del_type = "own_rider" if (dealer_obj and dealer_obj.is_delivery_self_logistics) else "logistics"
 
         item_result = await db.execute(
             sql_insert(OrderItemModel).values(
@@ -824,6 +876,7 @@ async def create_order(
                 marketing_customer_charge=snap_mkt_cust,
                 logistics_charge_amount=snap_log_dealer,
                 logistics_customer_charge=snap_log_cust,
+                delivery_type=item_del_type,
                 return_window_days=item_data.get("return_window_days"),
                 is_returnable=item_data.get("is_returnable"),
                 is_exchangeable=item_data.get("is_exchangeable"),

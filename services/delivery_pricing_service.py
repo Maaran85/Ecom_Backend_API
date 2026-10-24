@@ -249,9 +249,11 @@ async def calculate_cart_delivery_pricing(
     )
 
     # 1. Separate platform shipments and self-logistics shipments
+    # Free delivery thresholds are applied ONLY to serviceable items.
     platform_shipments = [
         s for s in dealer_shipments
         if not bool(getattr(s["dealer"], "is_delivery_self_logistics", False))
+        and s.get("is_serviceable", True)
     ]
 
     platform_eligible_subtotal = money_2dp(
@@ -271,13 +273,16 @@ async def calculate_cart_delivery_pricing(
         dealer = s["dealer"]
         subtotal = money_2dp(s["subtotal"])
         is_self = bool(getattr(dealer, "is_delivery_self_logistics", False))
+        is_serv = s.get("is_serviceable", True)
         shipment_res = await calculate_shipment_delivery_fee(
             db=db,
             dealer=dealer,
             subtotal=subtotal,
             active_slabs=active_slabs,
-            platform_eligible_subtotal=None if is_self else platform_eligible_subtotal,
+            platform_eligible_subtotal=None if (is_self or not is_serv) else platform_eligible_subtotal,
         )
+        if not is_serv:
+            shipment_res.is_free = False
         shipments_map[dealer.id] = shipment_res
         if str(dealer.id) != dealer.id:
             shipments_map[str(dealer.id)] = shipment_res
@@ -291,3 +296,61 @@ async def calculate_cart_delivery_pricing(
         platform_qualifies_for_free=qualifies_for_free,
         platform_remaining_for_free=remaining_for_free,
     )
+
+
+async def check_pincode_serviceability(
+    db: AsyncSession,
+    pincode: Optional[str],
+    dealer_id: Optional[Any],
+    lat: Optional[float] = None,
+    long: Optional[float] = None
+) -> bool:
+    """
+    Check if a delivery destination pincode is serviceable for a dealer.
+    If no pincode is provided, returns True (unrestricted until address is selected).
+    Rules:
+    1. Active entry exists in ServiceablePincode for dealer_id or global (dealer_id is None).
+    2. Active DeliveryHub exists for this dealer covering the location via radius.
+    """
+    if not pincode or not str(pincode).strip():
+        return True
+
+    clean_pincode = str(pincode).strip()
+    from models.location import ServiceablePincode
+
+    # 1. Courier Whitelist (dealer-specific or global platform entry)
+    result = await db.execute(
+        select(ServiceablePincode)
+        .where(
+            ServiceablePincode.pincode == clean_pincode,
+            ServiceablePincode.is_active == True,
+            (ServiceablePincode.dealer_id == dealer_id) | ServiceablePincode.dealer_id.is_(None)
+        )
+        .limit(1)
+    )
+    if result.scalars().first() is not None:
+        return True
+
+    # 2. Local Hub check (if lat/long available)
+    if lat is not None and long is not None and dealer_id:
+        from models.hub import DeliveryHub
+        hub_res = await db.execute(
+            select(DeliveryHub)
+            .where(
+                DeliveryHub.dealer_id == dealer_id,
+                DeliveryHub.is_active == True,
+                DeliveryHub.lat_long != None,
+                DeliveryHub.max_delivery_radius != None
+            )
+        )
+        for hub in hub_res.scalars().all():
+            try:
+                from utils.distance import get_distance_km
+                h_lat, h_lon = map(float, hub.lat_long.split(","))
+                if get_distance_km(lat, long, h_lat, h_lon) <= hub.max_delivery_radius:
+                    return True
+            except Exception:
+                continue
+
+    return False
+
