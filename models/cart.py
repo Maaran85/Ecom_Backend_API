@@ -149,10 +149,30 @@ class OrderItem(Base):
     # Billing Slab fee snapshots (calculated at checkout for historical immutability)
     marketplace_customer_charge = Column(Float, default=0.0)
     marketplace_dealer_fee      = Column(Float, default=0.0)
-    marketing_fee_amount         = Column(Float, default=0.0)
+    marketplace_dealer_rate     = Column(Float, nullable=True)
+    marketplace_customer_rate   = Column(Float, nullable=True)
+    marketplace_slab_id         = Column(Integer, nullable=True)
+    marketplace_fee_gst_rate    = Column(Float, nullable=True)
+    marketplace_fee_gst_amount  = Column(Float, nullable=True)
+
+    marketing_fee_amount        = Column(Float, default=0.0)
     marketing_customer_charge   = Column(Float, default=0.0)
-    logistics_charge_amount      = Column(Float, default=0.0)
+    marketing_dealer_rate       = Column(Float, nullable=True)
+    marketing_customer_rate     = Column(Float, nullable=True)
+    marketing_slab_id           = Column(Integer, nullable=True)
+    marketing_fee_gst_rate      = Column(Float, nullable=True)
+    marketing_fee_gst_amount    = Column(Float, nullable=True)
+
+    logistics_charge_amount     = Column(Float, default=0.0)
     logistics_customer_charge   = Column(Float, default=0.0)
+    logistics_dealer_rate       = Column(Float, nullable=True)
+    logistics_customer_rate     = Column(Float, nullable=True)
+    logistics_slab_id           = Column(Integer, nullable=True)
+    logistics_fee_gst_rate      = Column(Float, nullable=True)
+    logistics_fee_gst_amount    = Column(Float, nullable=True)
+
+    customer_delivery_gst_rate  = Column(Float, nullable=True)
+    customer_delivery_gst_amount = Column(Float, nullable=True)
     
     # Item-specific tracking
     status = Column(String, default="pending")  # PENDING, PACKAGING, DISPATCHED, DELIVERED, REJECTED, UNDELIVERED

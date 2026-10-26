@@ -2365,8 +2365,11 @@ async def delivery_preview(
     from models.coupon import Coupon as CouponModel, DiscountType
     from services.fee_service import get_all_active_slabs, match_slab_from_list, SettlementFeeError
     from services.delivery_pricing_service import calculate_cart_delivery_pricing, DeliveryPricingConfigurationError
+    from services.tax_service import TaxService
 
     dealer_subtotals: dict[Any, float] = {}
+    dealer_taxable_subtotals: dict[Any, float] = {}
+    item_tax_map: dict[Any, dict] = {}
 
     target_pincode = (pincode or "").strip()
     if not target_pincode and address_id:
@@ -2389,13 +2392,16 @@ async def delivery_preview(
         prod_res = await db.execute(select(ProductModel).where(ProductModel.id == product_id))
         p = prod_res.scalar_one_or_none()
         if p and p.dealer_id:
+            eff_p = p
             price = float(p.selling_price if p.selling_price is not None else (p.mrp or p.dealer_price))
             if variant_id:
                 v_res = await db.execute(select(ProductModel).where(ProductModel.id == variant_id))
                 v = v_res.scalar_one_or_none()
                 if v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None):
+                    eff_p = v
                     price = float(v.selling_price if v.selling_price is not None else (v.mrp or v.dealer_price))
-            dealer_subtotals[p.dealer_id] = price * max(1, quantity)
+            qty_val = max(1, quantity)
+            dealer_subtotals[p.dealer_id] = price * qty_val
     else:
         # Cart mode: preview for cart items
         res = await db.execute(
@@ -2466,25 +2472,65 @@ async def delivery_preview(
     )
     dealers = dealers_res.scalars().all()
 
-    from services.delivery_pricing_service import check_pincode_serviceability
+    # Pre-construct preview item tuples to evaluate authoritative item-level serviceability
+    preview_item_tuples = []
+    if product_id and p:
+        target_prod = v if (variant_id and v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None)) else p
+        preview_item_tuples.append((target_prod, max(1, quantity), None, variant_id, p.id))
+    elif cart_items:
+        for ci in cart_items:
+            if ci.product:
+                eff_p = ci.variant if (ci.variant and (ci.variant.selling_price is not None or ci.variant.mrp is not None or ci.variant.dealer_price is not None)) else ci.product
+                preview_item_tuples.append((eff_p, ci.quantity, ci, ci.variant_id, ci.product_id))
+
+    from services.delivery_pricing_service import check_serviceability_full, check_pincode_serviceability
+    item_serviceability_map = {}
+    if target_pincode:
+        for item_prod, item_qty, ci_obj, var_id, parent_pid in preview_item_tuples:
+            item_key = (parent_pid, var_id, ci_obj.id if ci_obj else None)
+            v_serv = await check_serviceability_full(
+                db=db,
+                pincode=target_pincode,
+                dealer_id=item_prod.dealer_id,
+                product_id=parent_pid,
+                variant_id=var_id,
+                quantity=item_qty
+            )
+            item_serviceability_map[item_key] = v_serv
+
     dealer_serviceable_map = {}
     for d in dealers:
         is_serv = True
         reason = None
         if target_pincode:
-            is_serv = await check_pincode_serviceability(db, target_pincode, d.id)
-            if not is_serv:
-                reason = f"Seller does not deliver to PIN code {target_pincode}"
+            d_item_results = [
+                item_serviceability_map.get((parent_pid, var_id, ci_obj.id if ci_obj else None))
+                for item_prod, item_qty, ci_obj, var_id, parent_pid in preview_item_tuples
+                if str(getattr(item_prod, 'dealer_id', None) or (ci_obj.product.dealer_id if ci_obj and ci_obj.product else None)) == str(d.id)
+            ]
+            if d_item_results:
+                unserv = [r for r in d_item_results if r is not None and not r.is_serviceable]
+                if unserv:
+                    is_serv = False
+                    reason = unserv[0].message
+            else:
+                is_serv = await check_pincode_serviceability(db, target_pincode, d.id)
+                if not is_serv:
+                    reason = f"Seller does not deliver to PIN code {target_pincode}"
         dealer_serviceable_map[d.id] = (is_serv, reason)
+        dealer_serviceable_map[str(d.id)] = (is_serv, reason)
 
     dealer_shipments = []
     for d in dealers:
         gross = dealer_subtotals.get(d.id, 0.0)
+        taxable_gross = dealer_taxable_subtotals.get(d.id, gross)
         if applied_coupon and applied_coupon.dealer_id:
             d_disc = total_discount_amount if applied_coupon.dealer_id == d.id else 0.0
         else:
             d_disc = round((gross / total_gross) * total_discount_amount, 2) if total_gross > 0 else 0.0
         net = max(0.0, round(gross - d_disc, 2))
+        disc_ratio = (taxable_gross / gross) if gross > 0 else 1.0
+        net_taxable = max(0.0, round(taxable_gross - (d_disc * disc_ratio), 2))
         is_serv, unserv_reason = dealer_serviceable_map.get(d.id, (True, None))
         dealer_shipments.append({
             "dealer": d,
@@ -2571,23 +2617,12 @@ async def delivery_preview(
     total_platform_fee = 0.0
     items_breakdown = []
 
-    preview_item_tuples = []
-    if product_id and p:
-        target_prod = v if (variant_id and v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None)) else p
-        preview_item_tuples.append((target_prod, max(1, quantity), None, variant_id, p.id))
-    elif cart_items:
-        for ci in cart_items:
-            if ci.product:
-                eff_p = ci.variant if (ci.variant and (ci.variant.selling_price is not None or ci.variant.mrp is not None or ci.variant.dealer_price is not None)) else ci.product
-                preview_item_tuples.append((eff_p, ci.quantity, ci, ci.variant_id, ci.product_id))
-
     for item_prod, item_qty, ci_obj, var_id, parent_pid in preview_item_tuples:
         item_price = float(item_prod.selling_price if item_prod.selling_price is not None else (item_prod.mrp or item_prod.dealer_price))
         item_mrp = float(item_prod.mrp if item_prod.mrp is not None else item_price)
         line_subtotal_dec = Decimal(str(round(item_price * item_qty, 2)))
         line_subtotal = float(line_subtotal_dec)
 
-        # Marketplace fee for this item
         mp_slab = match_slab_from_list(active_slabs, "marketplace", line_subtotal_dec)
         if mp_slab and mp_slab.customer_percentage:
             fee = round(float(line_subtotal_dec * Decimal(str(mp_slab.customer_percentage))), 2)
@@ -2619,20 +2654,16 @@ async def delivery_preview(
             item_coupon = 0.0
 
         item_payable = round(max(0.0, line_subtotal - item_coupon) + item_delivery_fee + fee, 2)
-        d_is_serv, d_unserv_reason = dealer_serviceable_map.get(item_prod.dealer_id, (True, None))
-        if target_pincode and d_is_serv:
-            from services.delivery_pricing_service import check_serviceability_full
-            v_serv = await check_serviceability_full(
-                db=db,
-                pincode=target_pincode,
-                dealer_id=item_prod.dealer_id,
-                product_id=parent_pid,
-                variant_id=var_id,
-                quantity=item_qty
-            )
-            if not v_serv.is_serviceable:
-                d_is_serv = False
-                d_unserv_reason = v_serv.message
+        item_key = (parent_pid, var_id, ci_obj.id if ci_obj else None)
+        v_serv = item_serviceability_map.get(item_key)
+        if target_pincode and v_serv is not None:
+            item_is_serv = v_serv.is_serviceable
+            item_unserv_reason = v_serv.message if not v_serv.is_serviceable else None
+        elif target_pincode:
+            item_is_serv, item_unserv_reason = dealer_serviceable_map.get(item_prod.dealer_id, (True, None))
+        else:
+            item_is_serv = True
+            item_unserv_reason = None
 
         items_breakdown.append({
             "product_id": str(parent_pid),
@@ -2648,11 +2679,15 @@ async def delivery_preview(
             "marketplace_fee": fee,
             "delivery_fee": round(item_delivery_fee, 2),
             "payable_amount": item_payable,
-            "is_serviceable": d_is_serv,
-            "unserviceable_reason": d_unserv_reason,
+            "is_serviceable": item_is_serv,
+            "unserviceable_reason": item_unserv_reason,
         })
 
-    all_serviceable = all(ds.get("is_serviceable", True) for ds in dealer_shipments) and all(it.get("is_serviceable", True) for it in items_breakdown)
+    all_serviceable = (
+        all(it.get("is_serviceable", True) for it in items_breakdown)
+        if items_breakdown
+        else all(ds.get("is_serviceable", True) for ds in dealer_shipments)
+    )
 
     return {
         "dealers": breakdown,

@@ -13,13 +13,13 @@ class SettlementFeeError(Exception):
     """Raised when required fee configuration is missing/invalid."""
 
 
-def _apply_gst(base: Decimal, is_applicable: bool = True, rate: Decimal = Decimal("0.18")) -> Decimal:
-    """Returns the 18% GST component on top of a base platform service fee (Marketplace, Marketing, Logistics)."""
-    if not is_applicable or rate <= 0:
+def _apply_gst(base: Decimal, is_applicable: bool = True, rate: Optional[Decimal] = None) -> Decimal:
+    """Returns the GST component on top of a base platform service fee using configured rate."""
+    if not is_applicable or rate is None or rate <= Decimal("0.00"):
         return Decimal("0.00")
     # If rate passed as percentage (e.g. 18.0 or 0.18)
-    rate_factor = rate if rate < 1 else rate / Decimal("100")
-    return money(base * rate_factor)
+    rate_factor = rate if rate < Decimal("1.0") else rate / Decimal("100.0")
+    return money_2dp(base * rate_factor)
 
 
 async def get_applicable_slab(db: AsyncSession, category_key: str, net_basic_amount: Decimal) -> Optional[BillingSlab]:
@@ -125,7 +125,8 @@ async def validate_no_overlap(
 def compute_gross_sale(item: OrderItem, order: Order) -> Decimal:
     """
     Line 14 (Dealer Net Selling Price Total):
-    GST-inclusive net selling price for the item = (Unit Price * Qty) - Discount + Product GST.
+    GST-inclusive net selling price for the item = (Unit Price * Qty) - Discount.
+    OrderItem.price is already stored as the inclusive price at checkout.
     """
     item_subtotal = money(item.price) * item.quantity
     discount_amount = money(order.discount_amount)
@@ -134,28 +135,13 @@ def compute_gross_sale(item: OrderItem, order: Order) -> Decimal:
     else:
         discount_share = Decimal("0.00")
     
-    net_basic = money(item_subtotal - discount_share)
-    
-    # Calculate or retrieve Product GST Amount
-    tax_amt = money(
-        getattr(item, 'tax_amount', 0.0) or
-        ((getattr(item, 'cgst_amount', 0.0) or 0.0) +
-         (getattr(item, 'sgst_amount', 0.0) or 0.0) +
-         (getattr(item, 'igst_amount', 0.0) or 0.0))
-    )
-    if tax_amt == 0 and (getattr(item, 'cgst_rate', 0) > 0 or getattr(item, 'igst_rate', 0) > 0):
-        c_rate = getattr(item, 'cgst_rate', 0.0) or 0.0
-        s_rate = getattr(item, 'sgst_rate', 0.0) or 0.0
-        i_rate = getattr(item, 'igst_rate', 0.0) or 0.0
-        tot_rate = i_rate if i_rate > 0 else (c_rate + s_rate)
-        tax_amt = money(net_basic * (Decimal(str(tot_rate)) / Decimal("100")))
-
-    return money_2dp(net_basic + tax_amt)
+    net_inclusive = money(item_subtotal - discount_share)
+    return money_2dp(net_inclusive)
 
 
-def compute_shipping_share(item: OrderItem, order: Order) -> Decimal:
+def compute_shipping_share(item: OrderItem, order: Order, shipping_gst_rate: Optional[Decimal] = None) -> Decimal:
     """
-    Line 7 (Customer Shipment Charge Total incl. 18% GST).
+    Line 7 (Customer Shipment Charge Total incl. configured GST).
     Item's share of customer delivery charge.
     """
     delivery_basic = money(order.delivery_charge)
@@ -168,9 +154,11 @@ def compute_shipping_share(item: OrderItem, order: Order) -> Decimal:
     else:
         ship_basic = delivery_basic
     
-    # Add 18% GST to delivery basic to get Total Customer Shipment Charge
-    ship_gst = money(ship_basic * Decimal("0.18"))
-    return money_2dp(ship_basic + ship_gst)
+    if shipping_gst_rate and shipping_gst_rate > 0:
+        rate_factor = shipping_gst_rate if shipping_gst_rate < Decimal("1.0") else shipping_gst_rate / Decimal("100.0")
+        ship_gst = money(ship_basic * rate_factor)
+        return money_2dp(ship_basic + ship_gst)
+    return money_2dp(ship_basic)
 
 
 async def compute_item_fees(
@@ -183,20 +171,25 @@ async def compute_item_fees(
     Computes the Dealer fee breakdown for one order item following Dealer Excel specification:
     
     Line 14 = Gross Sale Amount (Net Selling Price Total incl. Product GST)
-    Line 15 = Marketing Commission Total (incl. 18% GST)
-    Line 16 = Marketplace Charge Total (incl. 18% GST)
-    Line 7  = Customer Shipment Total (incl. 18% GST, added for Self Logistics)
-    Line 17 = Partner Logistics Charge Total (incl. 18% GST, deducted for Partner Logistics)
+    Line 15 = Marketing Commission Total (incl. configured fee GST)
+    Line 16 = Marketplace Charge Total (incl. configured fee GST)
+    Line 7  = Customer Shipment Total (incl. configured fee GST, added for Self Logistics)
+    Line 17 = Partner Logistics Charge Total (incl. configured fee GST, deducted for Partner Logistics)
     """
-    # Basic net amount before product GST for slab matching
     item_subtotal = money(item.price) * item.quantity
     discount_amount = money(order.discount_amount)
     discount_share = money(item_subtotal / money(order.subtotal) * discount_amount) if (discount_amount > 0 and order.subtotal and money(order.subtotal) > 0) else Decimal("0.00")
     net_basic = money(item_subtotal - discount_share)
 
     # 1. Marketplace Fee (Line 16: Dealer Deduction)
+    marketplace_cfg = await get_fee_config_required(db, "marketplace_fee")
     snap_mp_dealer = getattr(item, 'marketplace_dealer_fee', 0.0) or 0.0
     snap_mp_cust = getattr(item, 'marketplace_customer_charge', 0.0) or 0.0
+    snap_mp_gst_rate = getattr(item, 'marketplace_fee_gst_rate', None)
+    snap_mp_gst_amt = getattr(item, 'marketplace_fee_gst_amount', None)
+
+    cfg_mp_rate = Decimal(str(marketplace_cfg.gst_rate)) if (marketplace_cfg.is_gst_applicable and marketplace_cfg.gst_rate is not None) else Decimal("0.00")
+    eff_mp_gst_rate = Decimal(str(snap_mp_gst_rate)) if snap_mp_gst_rate is not None else cfg_mp_rate
     
     if snap_mp_cust > 0:
         marketplace_customer_charge = money_2dp(snap_mp_cust)
@@ -210,17 +203,18 @@ async def compute_item_fees(
         marketplace_customer_charge = money_2dp(net_basic * marketplace_cust_pct)
 
     if snap_mp_dealer > 0:
-        # Check if snapshot is already GST-inclusive or basic
-        base_mp = money(snap_mp_dealer)
-        gst_mp = _apply_gst(base_mp, True, Decimal("0.18"))
-        marketplace_fee = money_2dp(base_mp + gst_mp)
+        marketplace_base = money(snap_mp_dealer)
+        if snap_mp_gst_amt is not None:
+            marketplace_gst = money(snap_mp_gst_amt)
+        else:
+            marketplace_gst = _apply_gst(marketplace_base, marketplace_cfg.is_gst_applicable, eff_mp_gst_rate)
+        marketplace_fee = money_2dp(marketplace_base + marketplace_gst)
     else:
         is_auction = getattr(order, "is_auction", False) or getattr(order, "order_type", "") == "auction" or getattr(item, "is_auction", False)
         category = "auction_marketplace" if is_auction else "marketplace"
         mp_slab = await get_applicable_slab(db, category, net_basic)
         if mp_slab is None and is_auction:
             mp_slab = await get_applicable_slab(db, "marketplace", net_basic)
-        marketplace_cfg = await get_fee_config(db, "marketplace_fee")
 
         if mp_slab is not None:
             marketplace_dealer_pct = money(mp_slab.dealer_percentage)
@@ -235,25 +229,33 @@ async def compute_item_fees(
 
         marketplace_gst = _apply_gst(
             marketplace_base,
-            bool(marketplace_cfg.is_gst_applicable) if marketplace_cfg else True,
-            money(marketplace_cfg.gst_rate) if (marketplace_cfg and marketplace_cfg.gst_rate) else Decimal("0.18"),
+            bool(marketplace_cfg.is_gst_applicable),
+            eff_mp_gst_rate,
         )
         marketplace_fee = money_2dp(marketplace_base + marketplace_gst)
 
     # 2. Marketing Fee (Line 15: Dealer Deduction)
+    marketing_cfg = await get_fee_config_required(db, "marketing_fee")
     snap_mkt = getattr(item, 'marketing_fee_amount', 0.0) or 0.0
+    snap_mkt_gst_rate = getattr(item, 'marketing_fee_gst_rate', None)
+    snap_mkt_gst_amt = getattr(item, 'marketing_fee_gst_amount', None)
+
+    cfg_mkt_rate = Decimal(str(marketing_cfg.gst_rate)) if (marketing_cfg.is_gst_applicable and marketing_cfg.gst_rate is not None) else Decimal("0.00")
+    eff_mkt_gst_rate = Decimal(str(snap_mkt_gst_rate)) if snap_mkt_gst_rate is not None else cfg_mkt_rate
+
     if snap_mkt > 0:
-        base_mkt = money(snap_mkt)
-        gst_mkt = _apply_gst(base_mkt, True, Decimal("0.18"))
-        marketing_fee = money_2dp(base_mkt + gst_mkt)
+        marketing_base = money(snap_mkt)
+        if snap_mkt_gst_amt is not None:
+            marketing_gst = money(snap_mkt_gst_amt)
+        else:
+            marketing_gst = _apply_gst(marketing_base, marketing_cfg.is_gst_applicable, eff_mkt_gst_rate)
+        marketing_fee = money_2dp(marketing_base + marketing_gst)
     else:
         mkt_slab = await get_applicable_slab(db, "marketing", net_basic)
-        marketing_cfg = await get_fee_config(db, "marketing_fee")
-
         if mkt_slab is not None:
             marketing_pct = money(mkt_slab.dealer_percentage)
             marketing_base = money(net_basic * marketing_pct)
-        elif marketing_cfg is not None:
+        elif marketing_cfg is not None and money(marketing_cfg.value) > 0:
             if marketing_cfg.fee_type.value == "percentage":
                 marketing_base = money(net_basic * money(marketing_cfg.value))
             else:
@@ -263,32 +265,50 @@ async def compute_item_fees(
 
         marketing_gst = _apply_gst(
             marketing_base,
-            bool(marketing_cfg.is_gst_applicable) if marketing_cfg else True,
-            money(marketing_cfg.gst_rate) if (marketing_cfg and marketing_cfg.gst_rate) else Decimal("0.18"),
+            bool(marketing_cfg.is_gst_applicable),
+            eff_mkt_gst_rate,
         )
         marketing_fee = money_2dp(marketing_base + marketing_gst)
 
     # 3. Shipping / Logistics (Line 7 vs Line 17)
     self_logistics = await is_delivery_self_logistics(item)
     if self_logistics:
-        shipping_received = compute_shipping_share(item, order)
+        cust_ship_cfg = await get_fee_config(db, "customer_shipping_gst_rate")
+        snap_del_gst_rate = getattr(item, 'customer_delivery_gst_rate', None)
+        if snap_del_gst_rate is not None:
+            ship_gst_rate = Decimal(str(snap_del_gst_rate))
+        elif cust_ship_cfg:
+            rate_val = cust_ship_cfg.gst_rate if (cust_ship_cfg.gst_rate is not None and cust_ship_cfg.gst_rate > 0) else (cust_ship_cfg.value or 0.0)
+            ship_gst_rate = Decimal(str(rate_val))
+        else:
+            ship_gst_rate = Decimal("0.00")
+        shipping_received = compute_shipping_share(item, order, ship_gst_rate)
         logistics_charge = Decimal("0.00")
         logistics_gst = Decimal("0.00")
+        logistics_base = Decimal("0.00")
     else:
         shipping_received = Decimal("0.00")
+        logistics_cfg = await get_fee_config_required(db, "partner_logistics_fee")
+        snap_log_gst_rate = getattr(item, 'logistics_fee_gst_rate', None)
+        snap_log_gst_amt = getattr(item, 'logistics_fee_gst_amount', None)
+
+        cfg_log_rate = Decimal(str(logistics_cfg.gst_rate)) if (logistics_cfg.is_gst_applicable and logistics_cfg.gst_rate is not None) else Decimal("0.00")
+        eff_log_gst_rate = Decimal(str(snap_log_gst_rate)) if snap_log_gst_rate is not None else cfg_log_rate
+
         snap_log = getattr(item, 'logistics_charge_amount', 0.0) or 0.0
         if snap_log > 0:
-            base_log = money(snap_log)
-            gst_log = _apply_gst(base_log, True, Decimal("0.18"))
-            logistics_charge = money_2dp(base_log + gst_log)
+            logistics_base = money(snap_log)
+            if snap_log_gst_amt is not None:
+                logistics_gst = money(snap_log_gst_amt)
+            else:
+                logistics_gst = _apply_gst(logistics_base, logistics_cfg.is_gst_applicable, eff_log_gst_rate)
+            logistics_charge = money_2dp(logistics_base + logistics_gst)
         else:
             log_slab = await get_applicable_slab(db, "logistics", net_basic)
-            logistics_cfg = await get_fee_config(db, "partner_logistics_fee")
-
             if log_slab is not None:
                 logistics_pct = money(log_slab.dealer_percentage)
                 logistics_base = money(net_basic * logistics_pct)
-            elif logistics_cfg is not None:
+            elif logistics_cfg is not None and money(logistics_cfg.value) > 0:
                 if logistics_cfg.fee_type.value == "percentage":
                     logistics_base = money(net_basic * money(logistics_cfg.value))
                 else:
@@ -298,20 +318,22 @@ async def compute_item_fees(
 
             logistics_gst = _apply_gst(
                 logistics_base,
-                bool(logistics_cfg.is_gst_applicable) if logistics_cfg else True,
-                money(logistics_cfg.gst_rate) if (logistics_cfg and logistics_cfg.gst_rate) else Decimal("0.18"),
+                bool(logistics_cfg.is_gst_applicable),
+                eff_log_gst_rate,
             )
             logistics_charge = money_2dp(logistics_base + logistics_gst)
 
-    gst_on_fees = money_2dp(marketplace_fee - (marketplace_base if 'marketplace_base' in locals() else marketplace_fee/Decimal('1.18')) +
-                         marketing_fee - (marketing_base if 'marketing_base' in locals() else marketing_fee/Decimal('1.18')))
+    gst_on_fees = money_2dp(marketplace_gst + marketing_gst + logistics_gst)
 
     return {
         "gross_sale_amount": money_2dp(gross_sale),
+        "marketplace_base": money_2dp(marketplace_base),
         "marketplace_fee": money_2dp(marketplace_fee),
         "marketplace_customer_charge": money_2dp(marketplace_customer_charge),
+        "marketing_base": money_2dp(marketing_base),
         "marketing_fee": money_2dp(marketing_fee),
         "shipping_received": money_2dp(shipping_received),
+        "logistics_base": money_2dp(logistics_base),
         "logistics_charge": money_2dp(logistics_charge),
         "gst_on_fees": money_2dp(gst_on_fees),
         "delivery_type": getattr(item, 'delivery_type', None),

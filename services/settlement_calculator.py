@@ -95,7 +95,7 @@ async def calculate_settlement(
     for item, order, product, _ in eligible_items:
         gross_sale = compute_gross_sale(item, order)
         fees = await compute_item_fees(db, item, order, gross_sale)
-        line_tds_base = gross_sale + fees["shipping_received"]
+        line_tds_base = gross_sale
         tds_bases.append(line_tds_base)
         lines.append((item, order, gross_sale, fees))
 

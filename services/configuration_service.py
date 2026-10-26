@@ -76,7 +76,7 @@ SEED_FEE_CONFIGS: list[Dict[str, Any]] = [
         "description": "Platform commission per order item. When value = 0, uses the amount collected at checkout (OrderItem.platform_fee).",
         "fee_type": FeeType.FLAT,
         "value": 0.0,
-        "is_gst_applicable": False,
+        "is_gst_applicable": True,
         "gst_rate": 0.18,
     },
     {
@@ -85,7 +85,7 @@ SEED_FEE_CONFIGS: list[Dict[str, Any]] = [
         "description": "Marketing contribution per order item (Excel: 10 + 18% GST).",
         "fee_type": FeeType.FLAT,
         "value": 0.0,
-        "is_gst_applicable": False,
+        "is_gst_applicable": True,
         "gst_rate": 0.18,
     },
     {
@@ -94,7 +94,7 @@ SEED_FEE_CONFIGS: list[Dict[str, Any]] = [
         "description": "Deducted from the dealer payout when an order ships via a partner logistics provider (Excel: 15 + 18% GST).",
         "fee_type": FeeType.FLAT,
         "value": 0.0,
-        "is_gst_applicable": False,
+        "is_gst_applicable": True,
         "gst_rate": 0.18,
     },
     {
@@ -102,9 +102,9 @@ SEED_FEE_CONFIGS: list[Dict[str, Any]] = [
         "name": "Customer Shipping GST Rate",
         "description": "GST applied on top of the customer shipping charge passed to the dealer (Excel: 18% on 18 = 21.24). 0 = none.",
         "fee_type": FeeType.PERCENTAGE,
-        "value": 0.0,
-        "is_gst_applicable": False,
-        "gst_rate": 0.0,
+        "value": 0.18,
+        "is_gst_applicable": True,
+        "gst_rate": 0.18,
     },
     {
         "key": "platform_delivery_fee",

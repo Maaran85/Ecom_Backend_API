@@ -61,6 +61,8 @@ class ShipmentDeliveryResult:
     is_self_logistics: bool
     estimated_delivery_days: int = 7
     formatted_delivery_date: str = ""
+    slab_id: Optional[int] = None
+    applied_rate: Optional[Decimal] = None
 
 
 @dataclass
@@ -197,12 +199,15 @@ async def calculate_shipment_delivery_fee(
         )
 
     slab = matches[0]
+    applied_slab_id: Optional[int] = slab.id
+    applied_rate: Optional[Decimal] = None
 
     # Calculate fee using slab customer_amount or customer_percentage
     if slab.customer_amount is not None:
         charge = money_2dp(Decimal(str(slab.customer_amount)))
     elif slab.customer_percentage is not None:
         pct_dec = Decimal(str(slab.customer_percentage))
+        applied_rate = pct_dec
         pct_factor = pct_dec if pct_dec < Decimal("1.0") else pct_dec / Decimal("100.0")
         charge = money_2dp(subtotal_2dp * pct_factor)
     else:
@@ -228,6 +233,8 @@ async def calculate_shipment_delivery_fee(
         free_above=threshold,
         remaining_for_free=remaining,
         is_self_logistics=False,
+        slab_id=applied_slab_id,
+        applied_rate=applied_rate,
     )
 
 
@@ -964,7 +971,7 @@ async def check_serviceability_full(
 async def check_pincode_serviceability(
     db: AsyncSession,
     pincode: Optional[str],
-    dealer_id: Optional[Any],
+    dealer_id: Optional[Any] = None,
     lat: Optional[float] = None,
     long: Optional[float] = None,
     product_id: Optional[Any] = None,
@@ -973,12 +980,26 @@ async def check_pincode_serviceability(
 ) -> bool:
     """
     Check if a delivery destination pincode is serviceable for a dealer/item.
-    Maintains backward compatibility while checking carrier coverage and local hubs.
+    Maintains backward compatibility while checking carrier coverage, warehouse direct (Rule A), and local hubs.
     """
     if not pincode or not str(pincode).strip():
         return True
 
     clean_pincode = str(pincode).strip()
+
+    # If product context is provided, delegate to authoritative check_serviceability_full
+    if product_id:
+        res = await check_serviceability_full(
+            db=db,
+            pincode=clean_pincode,
+            dealer_id=dealer_id,
+            product_id=product_id,
+            variant_id=variant_id,
+            quantity=quantity,
+            lat=lat,
+            long=long
+        )
+        return res.is_serviceable
 
     # 1. Courier check via configured CarrierServiceabilityAdapter
     carrier_cov = await get_carrier_adapter().check_carrier_coverage(
@@ -989,7 +1010,21 @@ async def check_pincode_serviceability(
     if carrier_cov and carrier_cov.is_covered:
         return True
 
-    # 2. Local Hub check (if lat/long available)
+    # 2. Warehouse Direct PIN match check (Rule A)
+    if dealer_id:
+        from models.hub import DeliveryHub
+        wh_res = await db.execute(
+            select(DeliveryHub).where(
+                DeliveryHub.dealer_id == dealer_id,
+                DeliveryHub.is_active == True,
+                DeliveryHub.pincode == clean_pincode
+            ).limit(1)
+        )
+        wh = wh_res.scalars().first() if hasattr(wh_res, 'scalars') else None
+        if wh is not None and getattr(wh, "pincode", None) == clean_pincode:
+            return True
+
+    # 3. Local Hub check (if lat/long available)
     if lat is not None and long is not None and dealer_id:
         from models.hub import DeliveryHub
         hub_res = await db.execute(
@@ -1001,11 +1036,18 @@ async def check_pincode_serviceability(
                 DeliveryHub.max_delivery_radius != None
             )
         )
-        for hub in hub_res.scalars().all():
+        hubs = hub_res.scalars().all() if hasattr(hub_res, 'scalars') else []
+        for hub in hubs:
             try:
-                h_lat, h_lon = map(float, hub.lat_long.split(","))
-                if get_distance_km(lat, long, h_lat, h_lon) <= hub.max_delivery_radius:
-                    return True
+                lat_long_str = getattr(hub, 'lat_long', None)
+                max_rad = getattr(hub, 'max_delivery_radius', None)
+                if not lat_long_str or max_rad is None or max_rad <= 0:
+                    continue
+                parts = [p.strip() for p in str(lat_long_str).split(",")]
+                if len(parts) == 2:
+                    h_lat, h_lon = float(parts[0]), float(parts[1])
+                    if get_distance_km(lat, long, h_lat, h_lon) <= max_rad:
+                        return True
             except Exception:
                 continue
 

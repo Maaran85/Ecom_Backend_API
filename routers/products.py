@@ -37,6 +37,7 @@ from models.customer_user import CustomerUser
 from services.file_upload import FileUploadService as UploadService
 from services.recommendation import RecommendationService
 from services.fee_service import get_applicable_slab
+from services.configuration_service import get_fee_config
 from models.user import User
 
 router = APIRouter()
@@ -1977,10 +1978,17 @@ async def estimate_product_payout(
     discount_tax = round(mrp_tax - selling_tax, 2)
     discount_total = round(mrp_total - selling_total, 2)
 
-    # Fee Deductions based on active BillingSlabs
+    # Fee Deductions based on active BillingSlabs and FeeConfigurations
     net_basic_dec = Decimal(str(selling_base))
     missing_slab_categories = []
-    PLATFORM_FEE_GST_RATE = 18.0  # 18% GST on platform service fees under SAC 998314
+
+    marketplace_cfg = await get_fee_config(db, "marketplace_fee")
+    marketing_cfg = await get_fee_config(db, "marketing_fee")
+    logistics_cfg = await get_fee_config(db, "partner_logistics_fee")
+
+    mp_tax_rate = float(marketplace_cfg.gst_rate * 100.0) if (marketplace_cfg and marketplace_cfg.gst_rate is not None and (marketplace_cfg.is_gst_applicable or marketplace_cfg.gst_rate > 0)) else 0.0
+    mkt_tax_rate = float(marketing_cfg.gst_rate * 100.0) if (marketing_cfg and marketing_cfg.gst_rate is not None and (marketing_cfg.is_gst_applicable or marketing_cfg.gst_rate > 0)) else 0.0
+    log_tax_rate = float(logistics_cfg.gst_rate * 100.0) if (logistics_cfg and logistics_cfg.gst_rate is not None and (logistics_cfg.is_gst_applicable or logistics_cfg.gst_rate > 0)) else 0.0
     
     # 1. Marketplace Fee
     mp_slab = await get_applicable_slab(db, "marketplace", net_basic_dec)
@@ -1988,7 +1996,7 @@ async def estimate_product_payout(
     if mp_slab_found:
         mp_pct = float(mp_slab.dealer_percentage)
         mp_base = round(selling_base * mp_pct, 2)
-        mp_tax = round(mp_base * (PLATFORM_FEE_GST_RATE / 100.0), 2)
+        mp_tax = round(mp_base * (mp_tax_rate / 100.0), 2)
         mp_total = round(mp_base + mp_tax, 2)
     else:
         mp_pct = None
@@ -2003,7 +2011,7 @@ async def estimate_product_payout(
     if mkt_slab_found:
         mkt_pct = float(mkt_slab.dealer_percentage)
         mkt_base = round(selling_base * mkt_pct, 2)
-        mkt_tax = round(mkt_base * (PLATFORM_FEE_GST_RATE / 100.0), 2)
+        mkt_tax = round(mkt_base * (mkt_tax_rate / 100.0), 2)
         mkt_total = round(mkt_base + mkt_tax, 2)
     else:
         mkt_pct = None
@@ -2019,7 +2027,7 @@ async def estimate_product_payout(
         if log_slab_found:
             log_pct = float(log_slab.dealer_percentage)
             log_base = round(selling_base * log_pct, 2)
-            log_tax = round(log_base * (PLATFORM_FEE_GST_RATE / 100.0), 2)
+            log_tax = round(log_base * (log_tax_rate / 100.0), 2)
             log_total = round(log_base + log_tax, 2)
         else:
             log_pct = None
@@ -2040,7 +2048,7 @@ async def estimate_product_payout(
             category_key="marketplace",
             percentage=round(mp_pct * 100.0, 2) if mp_pct is not None else None,
             base_amount=mp_base,
-            tax_rate=PLATFORM_FEE_GST_RATE,
+            tax_rate=mp_tax_rate,
             tax_amount=mp_tax,
             total_amount=mp_total,
             slab_applied=mp_slab_found
@@ -2050,7 +2058,7 @@ async def estimate_product_payout(
             category_key="marketing",
             percentage=round(mkt_pct * 100.0, 2) if mkt_pct is not None else None,
             base_amount=mkt_base,
-            tax_rate=PLATFORM_FEE_GST_RATE,
+            tax_rate=mkt_tax_rate,
             tax_amount=mkt_tax,
             total_amount=mkt_total,
             slab_applied=mkt_slab_found
@@ -2060,7 +2068,7 @@ async def estimate_product_payout(
             category_key="logistics",
             percentage=round(log_pct * 100.0, 2) if log_pct is not None else None,
             base_amount=log_base,
-            tax_rate=PLATFORM_FEE_GST_RATE,
+            tax_rate=log_tax_rate,
             tax_amount=log_tax,
             total_amount=log_total,
             slab_applied=log_slab_found

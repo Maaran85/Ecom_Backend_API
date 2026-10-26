@@ -70,8 +70,8 @@ class TaxService:
         base_price: float,
         qty: int,
         product_id: int,
-        buyer_state: str,
-        seller_state: str,
+        buyer_state: Optional[str] = None,
+        seller_state: Optional[str] = None,
         is_inclusive: bool = True,
         product: Optional[Product] = None,
         tax_category: Optional[TaxCategory] = None

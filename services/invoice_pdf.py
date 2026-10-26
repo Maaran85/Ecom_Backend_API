@@ -361,6 +361,26 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
 
     is_inter_state_order = getattr(order, 'is_inter_state', False) if order else False
 
+    # Detect pricing model: tax-inclusive (standard Multikart production) vs tax-exclusive (legacy)
+    order_total = round_curr(getattr(order, 'total_amount', 0.0) or 0.0)
+    order_subtotal = round_curr(getattr(order, 'subtotal', 0.0) or 0.0)
+    order_discount = round_curr(getattr(order, 'discount_amount', 0.0) or 0.0)
+    order_deliv = round_curr(getattr(order, 'delivery_charge', 0.0) or 0.0)
+    order_plat = round_curr(getattr(order, 'platform_fee_amount', 0.0) or 0.0)
+    order_tax = round_curr(getattr(order, 'tax_amount', 0.0) or 0.0)
+
+    if order_subtotal <= 0.0 and order_items:
+        order_subtotal = round_curr(sum((getattr(it, 'price', 0.0) or 0.0) * (getattr(it, 'quantity', 1) or 1) for it in order_items))
+    if order_tax <= 0.0 and order_items:
+        order_tax = round_curr(sum(getattr(it, 'tax_amount', 0.0) or 0.0 for it in order_items))
+
+    is_tax_inclusive = True
+    if order_total > 0.0:
+        incl_candidate = round_curr(max(0.0, order_subtotal - order_discount) + order_deliv + order_plat)
+        excl_candidate = round_curr(max(0.0, order_subtotal - order_discount) + order_tax + order_deliv + order_plat)
+        if abs(order_total - excl_candidate) < 0.05 and abs(order_total - incl_candidate) >= 0.05:
+            is_tax_inclusive = False
+
     # SECTION 1: PRODUCT
     story.append(Paragraph("<b>1. PRODUCT</b>", style_section_title))
     story.append(Spacer(1, 4))
@@ -386,43 +406,78 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
             desc_html += f"<br/><font color='#333333'><b>HSN:</b> {hsn}</font>"
 
         item_qty = getattr(item, 'quantity', 1) or 1
-        unit_price_excl = round_curr(getattr(item, 'price', 0.0) or 0.0)
+        raw_price = round_curr(getattr(item, 'price', 0.0) or 0.0)
+        item_gross_line = round_curr(raw_price * item_qty)
+
         item_discount = round_curr(getattr(item, 'discount_amount', 0.0) or 0.0)
+        if item_discount <= 0.0 and order_discount > 0.0 and order_subtotal > 0.0:
+            item_discount = round_curr(order_discount * (item_gross_line / order_subtotal))
 
-        gross_net = unit_price_excl * item_qty
-        net_amt = round_curr(max(0.0, gross_net - item_discount))
+        item_charge = round_curr(max(0.0, item_gross_line - item_discount))
 
-        cgst_rate = getattr(item, 'cgst_rate', 0.0) or 0.0
-        sgst_rate = getattr(item, 'sgst_rate', 0.0) or 0.0
-        igst_rate = getattr(item, 'igst_rate', 0.0) or 0.0
+        cgst_rate = getattr(item, 'cgst_rate', None)
+        sgst_rate = getattr(item, 'sgst_rate', None)
+        igst_rate = getattr(item, 'igst_rate', None)
 
-        if (is_inter_state_order and (igst_rate > 0 or getattr(item, 'igst_amount', 0) > 0)) or igst_rate > 0:
-            display_rate = igst_rate if igst_rate > 0 else (cgst_rate + sgst_rate if (cgst_rate + sgst_rate) > 0 else 18.0)
-            igst_amt = calc_gst_pct(net_amt, display_rate)
+        if (is_inter_state_order and ((igst_rate is not None and igst_rate > 0) or getattr(item, 'igst_amount', 0) > 0)) or (igst_rate is not None and igst_rate > 0):
+            is_item_inter_state = True
+            display_rate = igst_rate if (igst_rate is not None and igst_rate > 0) else ((cgst_rate or 0.0) + (sgst_rate or 0.0))
+        else:
+            is_item_inter_state = False
+            display_rate = ((cgst_rate or 0.0) + (sgst_rate or 0.0)) if ((cgst_rate or 0.0) + (sgst_rate or 0.0)) > 0 else (igst_rate or 0.0)
+
+        if display_rate <= 0.0:
+            prod = getattr(item, 'product', None)
+            if prod and getattr(prod, 'tax_perc', None) is not None:
+                display_rate = float(prod.tax_perc)
+
+        if is_tax_inclusive:
+            item_total = item_charge
+            persisted_tax = round_curr(getattr(item, 'tax_amount', 0.0) or 0.0)
+            if item_discount <= 0.0 and 0.0 < persisted_tax < item_total:
+                item_tax_amt = persisted_tax
+                net_amt = round_curr(item_total - item_tax_amt)
+            elif display_rate > 0.0:
+                net_amt = round_curr(item_total / (1.0 + display_rate / 100.0))
+                item_tax_amt = round_curr(item_total - net_amt)
+            else:
+                net_amt = item_total
+                item_tax_amt = 0.0
+            unit_display_price = round_curr(net_amt / item_qty) if item_qty > 0 else net_amt
+        else:
+            net_amt = item_charge
+            item_tax_amt = calc_gst_pct(net_amt, display_rate) if display_rate > 0.0 else 0.0
+            item_total = round_curr(net_amt + item_tax_amt)
+            unit_display_price = raw_price
+
+        if is_item_inter_state:
+            igst_amt = item_tax_amt
             cgst_amt = 0.0
             sgst_amt = 0.0
-            item_tax_amt = igst_amt
-            tax_rate_html = f"{display_rate:.0f}%"
+            tax_rate_html = f"{display_rate:g}%" if display_rate > 0 else "0%"
             tax_type_html = "IGST"
             tax_amt_html = f"₹{igst_amt:.2f}"
         else:
-            c_rate = cgst_rate if cgst_rate > 0 else 9.0
-            s_rate = sgst_rate if sgst_rate > 0 else 9.0
-            cgst_amt = calc_gst_pct(net_amt, c_rate)
-            sgst_amt = calc_gst_pct(net_amt, s_rate)
-            igst_amt = 0.0
-            item_tax_amt = round_curr(cgst_amt + sgst_amt)
-            tax_rate_html = f"{c_rate:.0f}%<br/>{s_rate:.0f}%"
-            tax_type_html = "CGST<br/>SGST"
-            tax_amt_html = f"₹{cgst_amt:.2f}<br/>₹{sgst_amt:.2f}"
-
-        item_total = round_curr(net_amt + item_tax_amt)
+            c_rate = (cgst_rate if (cgst_rate is not None and cgst_rate > 0) else display_rate / 2.0)
+            s_rate = (sgst_rate if (sgst_rate is not None and sgst_rate > 0) else display_rate - c_rate)
+            if display_rate > 0.0:
+                cgst_amt = round_curr(item_tax_amt / 2.0)
+                sgst_amt = round_curr(item_tax_amt - cgst_amt)
+                tax_rate_html = f"{c_rate:g}%<br/>{s_rate:g}%"
+                tax_type_html = "CGST<br/>SGST"
+                tax_amt_html = f"₹{cgst_amt:.2f}<br/>₹{sgst_amt:.2f}"
+            else:
+                cgst_amt = 0.0
+                sgst_amt = 0.0
+                tax_rate_html = "0%"
+                tax_type_html = "CGST<br/>SGST"
+                tax_amt_html = "₹0.00<br/>₹0.00"
 
         prod_table_data.append([
             Paragraph(str(idx + 1), style_td_center),
             Paragraph(prod_id_str, style_td_center),
             Paragraph(desc_html, style_td),
-            Paragraph(f"₹{unit_price_excl:.2f}", style_td_right),
+            Paragraph(f"₹{unit_display_price:.2f}", style_td_right),
             Paragraph(str(item_qty), style_td_center),
             Paragraph(f"₹{item_discount:.2f}", style_td_right),
             Paragraph(f"₹{net_amt:.2f}", style_td_right),
@@ -472,23 +527,35 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
 
     mkt_sac_code = marketplace_sac or "998314"
     mkt_desc_html = f"<b>Marketplace Platform Services</b><br/><font color='#333333'><b>SAC:</b> {mkt_sac_code}</font>"
-    mkt_net_amt = round_curr(mkt_cust_charge)
+
+    mkt_fee_gst_rate_val = None
+    if order_items:
+        mkt_fee_gst_rate_val = next((getattr(it, 'marketplace_fee_gst_rate', None) for it in order_items if getattr(it, 'marketplace_fee_gst_rate', None) is not None), None)
+    mkt_rate_factor = float(mkt_fee_gst_rate_val) if mkt_fee_gst_rate_val is not None else 0.18
+    mkt_rate_pct = mkt_rate_factor * 100.0 if mkt_rate_factor < 1.0 else mkt_rate_factor
+
+    if mkt_rate_pct > 0 and mkt_cust_charge > 0:
+        mkt_net_amt = round_curr(mkt_cust_charge / (1.0 + mkt_rate_pct / 100.0))
+        mkt_tax_amt = round_curr(mkt_cust_charge - mkt_net_amt)
+        mkt_total_amt = round_curr(mkt_cust_charge)
+    else:
+        mkt_net_amt = round_curr(mkt_cust_charge)
+        mkt_tax_amt = 0.0
+        mkt_total_amt = round_curr(mkt_cust_charge)
 
     if is_inter_state_order:
-        mkt_igst_amt = calc_gst_pct(mkt_net_amt, 18.0)
-        mkt_tax_amt = mkt_igst_amt
-        mkt_rate_html = "18%"
+        mkt_igst_amt = mkt_tax_amt
+        mkt_rate_html = f"{mkt_rate_pct:g}%"
         mkt_type_html = "IGST"
         mkt_tax_amt_html = f"₹{mkt_igst_amt:.2f}"
     else:
-        mkt_cgst_amt = calc_gst_pct(mkt_net_amt, 9.0)
-        mkt_sgst_amt = calc_gst_pct(mkt_net_amt, 9.0)
-        mkt_tax_amt = round_curr(mkt_cgst_amt + mkt_sgst_amt)
-        mkt_rate_html = "9%<br/>9%"
+        half_rate = mkt_rate_pct / 2.0
+        mkt_cgst_amt = round_curr(mkt_tax_amt / 2.0)
+        mkt_sgst_amt = round_curr(mkt_tax_amt - mkt_cgst_amt)
+        mkt_rate_html = f"{half_rate:g}%<br/>{half_rate:g}%"
         mkt_type_html = "CGST<br/>SGST"
         mkt_tax_amt_html = f"₹{mkt_cgst_amt:.2f}<br/>₹{mkt_sgst_amt:.2f}"
 
-    mkt_total_amt = round_curr(mkt_net_amt + mkt_tax_amt)
     mkt_table_data.append([
         Paragraph("1", style_td_center),
         Paragraph(display_prod_id, style_td_center),
@@ -538,23 +605,40 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
 
     ship_sac_code = logistics_sac or "996812"
     ship_desc_html = f"<b>Logistics & Shipping Services</b><br/><font color='#333333'><b>SAC:</b> {ship_sac_code}</font>"
-    ship_net_amt = round_curr(ship_cust_charge)
+
+    ship_fee_gst_rate_val = None
+    if order_items:
+        ship_fee_gst_rate_val = next(
+            (getattr(it, 'customer_delivery_gst_rate', None) or getattr(it, 'logistics_fee_gst_rate', None)
+             for it in order_items
+             if getattr(it, 'customer_delivery_gst_rate', None) is not None or getattr(it, 'logistics_fee_gst_rate', None) is not None),
+            None
+        )
+    ship_rate_factor = float(ship_fee_gst_rate_val) if ship_fee_gst_rate_val is not None else 0.18
+    ship_rate_pct = ship_rate_factor * 100.0 if ship_rate_factor < 1.0 else ship_rate_factor
+
+    if ship_rate_pct > 0 and ship_cust_charge > 0:
+        ship_net_amt = round_curr(ship_cust_charge / (1.0 + ship_rate_pct / 100.0))
+        ship_tax_amt = round_curr(ship_cust_charge - ship_net_amt)
+        ship_total_amt = round_curr(ship_cust_charge)
+    else:
+        ship_net_amt = round_curr(ship_cust_charge)
+        ship_tax_amt = 0.0
+        ship_total_amt = round_curr(ship_cust_charge)
 
     if is_inter_state_order:
-        ship_igst_amt = calc_gst_pct(ship_net_amt, 18.0)
-        ship_tax_amt = ship_igst_amt
-        ship_rate_html = "18%"
+        ship_igst_amt = ship_tax_amt
+        ship_rate_html = f"{ship_rate_pct:g}%"
         ship_type_html = "IGST"
         ship_tax_amt_html = f"₹{ship_igst_amt:.2f}"
     else:
-        ship_cgst_amt = calc_gst_pct(ship_net_amt, 9.0)
-        ship_sgst_amt = calc_gst_pct(ship_net_amt, 9.0)
-        ship_tax_amt = round_curr(ship_cgst_amt + ship_sgst_amt)
-        ship_rate_html = "9%<br/>9%"
+        half_rate = ship_rate_pct / 2.0
+        ship_cgst_amt = round_curr(ship_tax_amt / 2.0)
+        ship_sgst_amt = round_curr(ship_tax_amt - ship_cgst_amt)
+        ship_rate_html = f"{half_rate:g}%<br/>{half_rate:g}%"
         ship_type_html = "CGST<br/>SGST"
         ship_tax_amt_html = f"₹{ship_cgst_amt:.2f}<br/>₹{ship_sgst_amt:.2f}"
 
-    ship_total_amt = round_curr(ship_net_amt + ship_tax_amt)
     ship_table_data.append([
         Paragraph("1", style_td_center),
         Paragraph(display_prod_id, style_td_center),
@@ -604,21 +688,34 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
         mktg_sac_code = marketing_sac or "998314"
         mktg_desc_html = f"<b>Marketing Platform Services</b><br/><font color='#333333'><b>SAC:</b> {mktg_sac_code}</font>"
 
+        mktg_fee_gst_rate_val = None
+        if order_items:
+            mktg_fee_gst_rate_val = next((getattr(it, 'marketing_fee_gst_rate', None) for it in order_items if getattr(it, 'marketing_fee_gst_rate', None) is not None), None)
+        mktg_rate_factor = float(mktg_fee_gst_rate_val) if mktg_fee_gst_rate_val is not None else 0.18
+        mktg_rate_pct = mktg_rate_factor * 100.0 if mktg_rate_factor < 1.0 else mktg_rate_factor
+
+        if mktg_rate_pct > 0 and mktg_net_amt > 0:
+            mktg_total_amt = round_curr(mktg_net_amt)
+            mktg_base_amt = round_curr(mktg_net_amt / (1.0 + mktg_rate_pct / 100.0))
+            mktg_tax_amt = round_curr(mktg_net_amt - mktg_base_amt)
+            mktg_net_amt = mktg_base_amt
+        else:
+            mktg_tax_amt = 0.0
+            mktg_total_amt = round_curr(mktg_net_amt)
+
         if is_inter_state_order:
-            mktg_igst_amt = calc_gst_pct(mktg_net_amt, 18.0)
-            mktg_tax_amt = mktg_igst_amt
-            mktg_rate_html = "18%"
+            mktg_igst_amt = mktg_tax_amt
+            mktg_rate_html = f"{mktg_rate_pct:g}%"
             mktg_type_html = "IGST"
             mktg_tax_amt_html = f"₹{mktg_igst_amt:.2f}"
         else:
-            mktg_cgst_amt = calc_gst_pct(mktg_net_amt, 9.0)
-            mktg_sgst_amt = calc_gst_pct(mktg_net_amt, 9.0)
-            mktg_tax_amt = round_curr(mktg_cgst_amt + mktg_sgst_amt)
-            mktg_rate_html = "9%<br/>9%"
+            half_rate = mktg_rate_pct / 2.0
+            mktg_cgst_amt = round_curr(mktg_tax_amt / 2.0)
+            mktg_sgst_amt = round_curr(mktg_tax_amt - mktg_cgst_amt)
+            mktg_rate_html = f"{half_rate:g}%<br/>{half_rate:g}%"
             mktg_type_html = "CGST<br/>SGST"
             mktg_tax_amt_html = f"₹{mktg_cgst_amt:.2f}<br/>₹{mktg_sgst_amt:.2f}"
 
-        mktg_total_amt = round_curr(mktg_net_amt + mktg_tax_amt)
         mktg_table_data.append([
             Paragraph("1", style_td_center),
             Paragraph(display_prod_id, style_td_center),
@@ -657,7 +754,7 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
 
     grand_net = round_curr(total_prod_net + mkt_net_amt + ship_net_amt + mktg_net_amt)
     grand_tax = round_curr(total_prod_tax + mkt_tax_amt + ship_tax_amt + mktg_tax_amt)
-    grand_total = round_curr(grand_net + grand_tax)
+    grand_total = round_curr(total_prod_gross + mkt_total_amt + ship_total_amt + mktg_total_amt)
 
     first_prod_label = order_items[0].product.name[:25] if order_items and getattr(order_items[0], 'product', None) else "Items"
     summary_bullets = [
@@ -1369,9 +1466,6 @@ def generate_dealer_fee_invoice_pdf(
     mp_basic = sum((getattr(it, 'marketplace_dealer_fee', 0.0) or 0.0) for it in items)
     if mp_basic <= 0:
         mp_basic = float(getattr(order, 'platform_fee_amount', 0.0) or 0.0)
-    if mp_basic <= 0:
-        mp_basic = 5.00  # standard baseline
-
     mp_basic = round_curr(mp_basic)
 
     # 2. Shipping Services Fee
@@ -1385,9 +1479,6 @@ def generate_dealer_fee_invoice_pdf(
 
     if log_basic <= 0 and is_partner_logistics:
         log_basic = float(getattr(order, 'delivery_charge', 0.0) or 0.0)
-    if log_basic <= 0 and is_partner_logistics:
-        log_basic = 10.00  # standard baseline
-
     log_basic = round_curr(log_basic)
 
     # 11-column widths (sum = 547pt for A4)
@@ -1440,12 +1531,17 @@ def generate_dealer_fee_invoice_pdf(
     story.append(Paragraph("<b>1. MARKETPLACE FEES</b>", style_table_title))
     story.append(Spacer(1, 3))
 
+    mp_fee_rate_val = None
+    if items:
+        mp_fee_rate_val = next((getattr(it, 'marketplace_fee_gst_rate', None) for it in items if getattr(it, 'marketplace_fee_gst_rate', None) is not None), None)
+    mp_rate_factor = float(mp_fee_rate_val) if mp_fee_rate_val is not None else 0.18
+    mp_rate_pct = mp_rate_factor * 100.0 if mp_rate_factor < 1.0 else mp_rate_factor
+
     t1_data = [_make_table_header()]
     mp_desc = f"<b>Marketplace Platform Services</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>Order Ref: #{order_num} • SAC: {marketplace_sac}</font>"
 
     if is_inter_state:
-        # 18% IGST
-        mp_tax = round_curr(mp_basic * 0.18)
+        mp_tax = round_curr(mp_basic * (mp_rate_pct / 100.0))
         mp_total = round_curr(mp_basic + mp_tax)
         t1_data.append([
             Paragraph("1", style_td_center),
@@ -1455,15 +1551,15 @@ def generate_dealer_fee_invoice_pdf(
             Paragraph("1", style_td_center),
             Paragraph("0", style_td_center),
             Paragraph(f"₹{mp_basic:.2f}", style_td_right),
-            Paragraph("18%", style_td_center),
+            Paragraph(f"{mp_rate_pct:g}%", style_td_center),
             Paragraph("IGST", style_td_center),
             Paragraph(f"₹{mp_tax:.2f}", style_td_right),
             Paragraph(f"₹{mp_total:.2f}", style_td_right)
         ])
     else:
-        # 9% CGST + 9% SGST
-        mp_cgst = round_curr(mp_basic * 0.09)
-        mp_sgst = round_curr(mp_basic * 0.09)
+        half_rate_mp = mp_rate_pct / 2.0
+        mp_cgst = round_curr(mp_basic * (half_rate_mp / 100.0))
+        mp_sgst = round_curr(mp_basic * (half_rate_mp / 100.0))
         mp_tax = round_curr(mp_cgst + mp_sgst)
         mp_total = round_curr(mp_basic + mp_tax)
 
@@ -1475,14 +1571,14 @@ def generate_dealer_fee_invoice_pdf(
             Paragraph("1", style_td_center),
             Paragraph("0", style_td_center),
             Paragraph(f"₹{mp_basic:.2f}", style_td_right),
-            Paragraph("9%", style_td_center),
+            Paragraph(f"{half_rate_mp:g}%", style_td_center),
             Paragraph("Cgst", style_td_center),
             Paragraph(f"₹{mp_cgst:.2f}", style_td_right),
             Paragraph(f"₹{mp_total:.2f}", style_td_right)
         ])
         t1_data.append([
             "", "", "", "", "", "", "",
-            Paragraph("9%", style_td_center),
+            Paragraph(f"{half_rate_mp:g}%", style_td_center),
             Paragraph("Sgst", style_td_center),
             Paragraph(f"₹{mp_sgst:.2f}", style_td_right),
             ""
@@ -1500,7 +1596,7 @@ def generate_dealer_fee_invoice_pdf(
     t1 = Table(t1_data, colWidths=col_widths)
     t1_style = [
         ('BOX', (0, 0), (-1, -1), 0.75, colors.HexColor('#1E1B4B')),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+        ('INNERGRID', (0, 0), (-1, -2), 0.5, colors.HexColor('#E2E8F0')),
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#EEF2FF')),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('TOPPADDING', (0, 0), (-1, -1), 3),
@@ -1516,12 +1612,18 @@ def generate_dealer_fee_invoice_pdf(
     story.append(Paragraph("<b>2. SHIPPING SERVICES</b>", style_table_title))
     story.append(Spacer(1, 3))
 
+    log_fee_rate_val = None
+    if items:
+        log_fee_rate_val = next((getattr(it, 'logistics_fee_gst_rate', None) for it in items if getattr(it, 'logistics_fee_gst_rate', None) is not None), None)
+    log_rate_factor = float(log_fee_rate_val) if log_fee_rate_val is not None else 0.18
+    log_rate_pct = log_rate_factor * 100.0 if log_rate_factor < 1.0 else log_rate_factor
+
     t2_data = [_make_table_header()]
     log_desc = f"<b>Logistics & Shipping Services</b><br/><font size='7' color='#555'>Product: {display_prod_name}<br/>Order Ref: #{order_num} • SAC: {logistics_sac}</font>"
 
     if log_basic > 0:
         if is_inter_state:
-            log_tax = round_curr(log_basic * 0.18)
+            log_tax = round_curr(log_basic * (log_rate_pct / 100.0))
             log_total = round_curr(log_basic + log_tax)
             t2_data.append([
                 Paragraph("2", style_td_center),
@@ -1531,14 +1633,15 @@ def generate_dealer_fee_invoice_pdf(
                 Paragraph("1", style_td_center),
                 Paragraph("0", style_td_center),
                 Paragraph(f"₹{log_basic:.2f}", style_td_right),
-                Paragraph("18%", style_td_center),
+                Paragraph(f"{log_rate_pct:g}%", style_td_center),
                 Paragraph("IGST", style_td_center),
                 Paragraph(f"₹{log_tax:.2f}", style_td_right),
                 Paragraph(f"₹{log_total:.2f}", style_td_right)
             ])
         else:
-            log_cgst = round_curr(log_basic * 0.09)
-            log_sgst = round_curr(log_basic * 0.09)
+            half_rate_log = log_rate_pct / 2.0
+            log_cgst = round_curr(log_basic * (half_rate_log / 100.0))
+            log_sgst = round_curr(log_basic * (half_rate_log / 100.0))
             log_tax = round_curr(log_cgst + log_sgst)
             log_total = round_curr(log_basic + log_tax)
             t2_data.append([
@@ -1549,14 +1652,14 @@ def generate_dealer_fee_invoice_pdf(
                 Paragraph("1", style_td_center),
                 Paragraph("0", style_td_center),
                 Paragraph(f"₹{log_basic:.2f}", style_td_right),
-                Paragraph("9%", style_td_center),
+                Paragraph(f"{half_rate_log:g}%", style_td_center),
                 Paragraph("Cgst", style_td_center),
                 Paragraph(f"₹{log_cgst:.2f}", style_td_right),
                 Paragraph(f"₹{log_total:.2f}", style_td_right)
             ])
             t2_data.append([
                 "", "", "", "", "", "", "",
-                Paragraph("9%", style_td_center),
+                Paragraph(f"{half_rate_log:g}%", style_td_center),
                 Paragraph("Sgst", style_td_center),
                 Paragraph(f"₹{log_sgst:.2f}", style_td_right),
                 ""
