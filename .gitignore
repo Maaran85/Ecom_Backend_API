@@ -19,3 +19,6 @@ htmlcov/
 plan/
 scratch/
 tests/
+uploads/
+scripts
+

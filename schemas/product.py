@@ -130,7 +130,8 @@ class ProductBase(BaseModel):
 
 
 class ChildProductCreate(BaseModel):
-    sku: str
+    id: Optional[UUID] = None
+    sku: Optional[str] = None
     dealer_price: Optional[float] = None
     selling_price: Optional[float] = None
     mrp: Optional[float] = None

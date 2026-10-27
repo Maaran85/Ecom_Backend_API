@@ -63,6 +63,7 @@ class ShipmentDeliveryResult:
     formatted_delivery_date: str = ""
     slab_id: Optional[int] = None
     applied_rate: Optional[Decimal] = None
+    gst_type: Optional[str] = None
 
 
 @dataclass
@@ -235,6 +236,7 @@ async def calculate_shipment_delivery_fee(
         is_self_logistics=False,
         slab_id=applied_slab_id,
         applied_rate=applied_rate,
+        gst_type=slab.gst_type if slab else None,
     )
 
 

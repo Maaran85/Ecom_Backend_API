@@ -213,6 +213,14 @@ async def get_cart(
         )
     )
     items = result.scalars().all()
+    cart_prods = []
+    for it in items:
+        if it.product:
+            cart_prods.append(it.product)
+        if it.variant:
+            cart_prods.append(it.variant)
+    if cart_prods:
+        await TaxService.apply_dynamic_product_pricing(db, cart_prods)
     return items
 
 @router.patch("/cart/{item_id}", response_model=CartItem, tags=["cart"])
@@ -295,13 +303,27 @@ async def create_order(
     dealer_subtotals: dict[int, float] = {}
 
     from decimal import Decimal
-    from services.fee_service import get_all_active_slabs, match_slab_from_list
+    from services.fee_service import get_all_active_slabs, match_slab_from_list, resolve_slab_gst_rate, get_all_active_tax_categories
     from services.configuration_service import get_fee_config_required, get_fee_config
     active_slabs = await get_all_active_slabs(db)
+    active_tax_cats = await get_all_active_tax_categories(db)
     marketplace_cfg = await get_fee_config_required(db, "marketplace_fee")
     marketing_cfg = await get_fee_config_required(db, "marketing_fee")
     logistics_cfg = await get_fee_config_required(db, "partner_logistics_fee")
     cust_ship_cfg = await get_fee_config(db, "customer_shipping_gst_rate")
+
+    raw_mp_rate = float(marketplace_cfg.gst_rate if (marketplace_cfg and marketplace_cfg.is_gst_applicable and marketplace_cfg.gst_rate is not None) else 0.0)
+    mp_rate_factor = Decimal(str(round(raw_mp_rate if raw_mp_rate < 1.0 else raw_mp_rate / 100.0, 4))) if raw_mp_rate > 0 else Decimal("0.00")
+    mp_display_rate = raw_mp_rate if raw_mp_rate >= 1.0 else round(raw_mp_rate * 100.0, 2)
+
+    if cust_ship_cfg and cust_ship_cfg.is_gst_applicable and (cust_ship_cfg.gst_rate is not None or cust_ship_cfg.value is not None):
+        raw_del_rate = float(cust_ship_cfg.gst_rate if cust_ship_cfg.gst_rate is not None else cust_ship_cfg.value or 0.0)
+    elif logistics_cfg and logistics_cfg.is_gst_applicable and logistics_cfg.gst_rate is not None:
+        raw_del_rate = float(logistics_cfg.gst_rate)
+    else:
+        raw_del_rate = 0.0
+    del_rate_factor = Decimal(str(round(raw_del_rate if raw_del_rate < 1.0 else raw_del_rate / 100.0, 4))) if raw_del_rate > 0 else Decimal("0.00")
+    del_display_rate = raw_del_rate if raw_del_rate >= 1.0 else round(raw_del_rate * 100.0, 2)
 
     # Fetch buyer state_id from shipping address with strict customer ownership verification
     shipping_address_state_id = None
@@ -409,6 +431,11 @@ async def create_order(
                     detail=f"Item '{product.name}' cannot be delivered to PIN code {shipping_address.pincode}. {serv_res.message}"
                 )
 
+        prods_now = [product]
+        if target_variant:
+            prods_now.append(target_variant)
+        await TaxService.apply_dynamic_product_pricing(db, prods_now)
+
         eff_product = target_variant if (target_variant and (target_variant.selling_price is not None or target_variant.mrp is not None or target_variant.dealer_price is not None)) else product
         price = float(eff_product.selling_price if eff_product.selling_price is not None else (eff_product.mrp or eff_product.dealer_price))
         total_amount = price * qty
@@ -431,9 +458,20 @@ async def create_order(
         taxable_base = Decimal(str(tax_res.get("taxable_amount", round(price * qty, 2))))
         mp_slab_item = match_slab_from_list(active_slabs, "marketplace", taxable_base)
         if mp_slab_item and mp_slab_item.customer_percentage:
-            platform_fee = round(float(taxable_base * Decimal(str(mp_slab_item.customer_percentage))), 2)
+            item_mp_disp_rate, item_mp_factor, item_mp_app = resolve_slab_gst_rate(
+                mp_slab_item.gst_type,
+                "marketplace",
+                marketplace_cfg,
+                tax_categories=active_tax_cats
+            )
+            mp_base_dec = money_2dp(taxable_base * Decimal(str(mp_slab_item.customer_percentage)))
+            mp_gst_dec = money_2dp(mp_base_dec * item_mp_factor) if item_mp_app else Decimal("0.00")
+            platform_fee_total_dec = money_2dp(mp_base_dec + mp_gst_dec)
         else:
-            platform_fee = 0.0
+            item_mp_disp_rate = 0.0
+            mp_base_dec = Decimal("0.00")
+            mp_gst_dec = Decimal("0.00")
+            platform_fee_total_dec = Decimal("0.00")
 
         order_items_data.append({
             "product_id": product.id,
@@ -446,7 +484,10 @@ async def create_order(
             "variant_attributes": None,
             "dealer_id": product.dealer_id,
             "tax_data": tax_res,
-            "platform_fee": platform_fee,
+            "platform_fee": float(platform_fee_total_dec),
+            "platform_fee_base": float(mp_base_dec),
+            "platform_fee_gst": float(mp_gst_dec),
+            "platform_fee_gst_rate": float(item_mp_disp_rate),
             "referral_commission_rate": product.referral_commission_rate,
             "return_window_days": getattr(product, "return_window_days", None),
             "is_returnable": getattr(product, "is_returnable", True),
@@ -501,6 +542,13 @@ async def create_order(
         if tax_category_ids:
             tc_res = await db.execute(select(TaxCategoryModel).where(TaxCategoryModel.id.in_(tax_category_ids)))
             tax_categories_by_id = {tc.id: tc for tc in tc_res.scalars().all()}
+
+        cart_prods_to_price = []
+        for ci in cart_items:
+            if ci.product: cart_prods_to_price.append(ci.product)
+            if ci.variant: cart_prods_to_price.append(ci.variant)
+        if cart_prods_to_price:
+            await TaxService.apply_dynamic_product_pricing(db, cart_prods_to_price)
 
         for cart_item in cart_items:
             product = cart_item.product
@@ -573,9 +621,19 @@ async def create_order(
             taxable_base = Decimal(str(tax_res.get("taxable_amount", round(price * cart_item.quantity, 2))))
             mp_slab_item = match_slab_from_list(active_slabs, "marketplace", taxable_base)
             if mp_slab_item and mp_slab_item.customer_percentage:
-                platform_fee = round(float(taxable_base * Decimal(str(mp_slab_item.customer_percentage))), 2)
+                item_mp_disp_rate, item_mp_factor, item_mp_app = resolve_slab_gst_rate(
+                    mp_slab_item.gst_type,
+                    "marketplace",
+                    marketplace_cfg
+                )
+                mp_base_dec = money_2dp(taxable_base * Decimal(str(mp_slab_item.customer_percentage)))
+                mp_gst_dec = money_2dp(mp_base_dec * item_mp_factor) if item_mp_app else Decimal("0.00")
+                platform_fee_total_dec = money_2dp(mp_base_dec + mp_gst_dec)
             else:
-                platform_fee = 0.0
+                item_mp_disp_rate = 0.0
+                mp_base_dec = Decimal("0.00")
+                mp_gst_dec = Decimal("0.00")
+                platform_fee_total_dec = Decimal("0.00")
 
             order_items_data.append({
                 "product_id": cart_item.product_id,
@@ -588,7 +646,10 @@ async def create_order(
                 "variant_attributes": cart_item.variant_attributes,
                 "dealer_id": d_id,
                 "tax_data": tax_res,
-                "platform_fee": platform_fee,
+                "platform_fee": float(platform_fee_total_dec),
+                "platform_fee_base": float(mp_base_dec),
+                "platform_fee_gst": float(mp_gst_dec),
+                "platform_fee_gst_rate": float(item_mp_disp_rate),
                 "referral_commission_rate": product.referral_commission_rate,
                 "return_window_days": getattr(product, "return_window_days", None),
                 "is_returnable": getattr(product, "is_returnable", True),
@@ -696,16 +757,36 @@ async def create_order(
             shipment_res = cart_delivery_res.shipments.get(dealer_obj.id) or cart_delivery_res.shipments.get(str(dealer_obj.id))
             if not shipment_res:
                 continue
-            fee = float(shipment_res.delivery_charge)
+            base_del_dec = Decimal(str(round(float(shipment_res.delivery_charge), 2)))
+            is_f = shipment_res.is_free or (base_del_dec <= Decimal("0.00"))
+            
+            ship_disp_rate, ship_rate_factor, ship_app = resolve_slab_gst_rate(
+                getattr(shipment_res, "gst_type", None),
+                "logistics",
+                cust_ship_cfg or logistics_cfg,
+                tax_categories=active_tax_cats
+            )
+
+            if is_f or not ship_app:
+                del_gst_dec = Decimal("0.00")
+                total_del_dec = Decimal("0.00")
+            else:
+                del_gst_dec = money_2dp(base_del_dec * ship_rate_factor)
+                total_del_dec = money_2dp(base_del_dec + del_gst_dec)
+
             dealer_fees_map[dealer_obj.id] = {
-                "fee": fee,
+                "fee": total_del_dec,
+                "base_fee": base_del_dec,
+                "gst_fee": del_gst_dec,
+                "gst_rate": ship_disp_rate,
                 "total_dealer_subtotal": ds["gross_subtotal"],
-                "allocated": Decimal("0.00"),
+                "allocated_total": Decimal("0.00"),
+                "allocated_base": Decimal("0.00"),
                 "remaining_items_count": sum(1 for it in order_items_data if it["dealer_id"] == dealer_obj.id),
                 "slab_id": shipment_res.slab_id,
                 "applied_rate": float(shipment_res.applied_rate) if shipment_res.applied_rate is not None else None,
             }
-            total_delivery_charge += fee
+            total_delivery_charge += float(total_del_dec)
 
     # Check total available stock across hubs in a single batched query
     if stock_updates:
@@ -797,21 +878,33 @@ async def create_order(
             item_wallet_discount = round((item_subtotal / total_amount) * total_wallet_discount, 2)
             
         item_delivery = 0.0
+        item_delivery_base = 0.0
+        item_delivery_gst = 0.0
         dealer_info = dealer_fees_map.get(item_data["dealer_id"])
-        if dealer_info and dealer_info.get("fee", 0.0) > 0 and dealer_info.get("total_dealer_subtotal", 0.0) > 0:
-            shipment_fee = Decimal(str(dealer_info["fee"]))
+        if dealer_info and dealer_info.get("fee", Decimal("0.00")) > Decimal("0.00") and dealer_info.get("total_dealer_subtotal", 0.0) > 0:
+            shipment_fee_total = dealer_info["fee"]
+            shipment_fee_base = dealer_info["base_fee"]
             dealer_sub = Decimal(str(dealer_info["total_dealer_subtotal"]))
             rem_items = dealer_info.get("remaining_items_count", 1)
-            allocated = dealer_info.get("allocated", Decimal("0.00"))
+            alloc_total = dealer_info.get("allocated_total", Decimal("0.00"))
+            alloc_base = dealer_info.get("allocated_base", Decimal("0.00"))
 
             if rem_items <= 1:
-                item_delivery_dec = money_2dp(shipment_fee - allocated)
+                item_del_total_dec = money_2dp(shipment_fee_total - alloc_total)
+                item_del_base_dec = money_2dp(shipment_fee_base - alloc_base)
             else:
-                item_delivery_dec = money_2dp(shipment_fee * (Decimal(str(item_subtotal)) / dealer_sub))
-                allocated += item_delivery_dec
-                dealer_info["allocated"] = allocated
+                ratio = Decimal(str(item_subtotal)) / dealer_sub
+                item_del_total_dec = money_2dp(shipment_fee_total * ratio)
+                item_del_base_dec = money_2dp(shipment_fee_base * ratio)
+                alloc_total += item_del_total_dec
+                alloc_base += item_del_base_dec
+                dealer_info["allocated_total"] = alloc_total
+                dealer_info["allocated_base"] = alloc_base
             dealer_info["remaining_items_count"] = rem_items - 1
-            item_delivery = float(item_delivery_dec)
+            item_del_gst_dec = item_del_total_dec - item_del_base_dec
+            item_delivery = float(item_del_total_dec)
+            item_delivery_base = float(item_del_base_dec)
+            item_delivery_gst = float(item_del_gst_dec)
             
         total_item_discount = round(item_discount + item_wallet_discount, 2)
         final_item_total = round(max(0.0, item_subtotal - total_item_discount) + item_delivery + item_data["platform_fee"], 2)
@@ -868,36 +961,34 @@ async def create_order(
         mkt_slab = match_slab_from_list(active_slabs, "marketing", net_taxable_val)
         log_slab = match_slab_from_list(active_slabs, "logistics", net_taxable_val)
 
-        mp_gst_rate = float(marketplace_cfg.gst_rate) if (marketplace_cfg and marketplace_cfg.is_gst_applicable and marketplace_cfg.gst_rate is not None) else 0.0
-        mkt_gst_rate = float(marketing_cfg.gst_rate) if (marketing_cfg and marketing_cfg.is_gst_applicable and marketing_cfg.gst_rate is not None) else 0.0
-        log_gst_rate = float(logistics_cfg.gst_rate) if (logistics_cfg and logistics_cfg.is_gst_applicable and logistics_cfg.gst_rate is not None) else 0.0
-        cust_del_gst_rate = float(cust_ship_cfg.gst_rate or cust_ship_cfg.value or 0.0) if (cust_ship_cfg and cust_ship_cfg.is_gst_applicable) else 0.0
+        eff_mp_disp_rate, eff_mp_factor, _ = resolve_slab_gst_rate(mp_slab.gst_type if mp_slab else None, "marketplace", marketplace_cfg, tax_categories=active_tax_cats)
+        eff_mkt_disp_rate, eff_mkt_factor, _ = resolve_slab_gst_rate(mkt_slab.gst_type if mkt_slab else None, "marketing", marketing_cfg, tax_categories=active_tax_cats)
+        eff_log_disp_rate, eff_log_factor, _ = resolve_slab_gst_rate(log_slab.gst_type if log_slab else None, "logistics", logistics_cfg, tax_categories=active_tax_cats)
 
         mp_dealer_rate = float(mp_slab.dealer_percentage) if (mp_slab and mp_slab.dealer_percentage is not None) else 0.0
         snap_mp_dealer = round(float(net_taxable_val * Decimal(str(mp_dealer_rate))), 2)
-        snap_mp_gst_amount = round(snap_mp_dealer * mp_gst_rate, 2)
+        snap_mp_gst_amount = round(float(Decimal(str(snap_mp_dealer)) * eff_mp_factor), 2)
 
         mkt_dealer_rate = float(mkt_slab.dealer_percentage) if (mkt_slab and mkt_slab.dealer_percentage is not None) else 0.0
         snap_mkt_dealer = round(float(net_taxable_val * Decimal(str(mkt_dealer_rate))), 2)
-        snap_mkt_gst_amount = round(snap_mkt_dealer * mkt_gst_rate, 2)
+        snap_mkt_gst_amount = round(float(Decimal(str(snap_mkt_dealer)) * eff_mkt_factor), 2)
 
         log_dealer_rate = float(log_slab.dealer_percentage) if (log_slab and log_slab.dealer_percentage is not None) else 0.0
         snap_log_dealer = round(float(net_taxable_val * Decimal(str(log_dealer_rate))), 2)
-        snap_log_gst_amount = round(snap_log_dealer * log_gst_rate, 2)
+        snap_log_gst_amount = round(float(Decimal(str(snap_log_dealer)) * eff_log_factor), 2)
 
-        snap_mp_cust = item_data["platform_fee"]
+        snap_mp_cust_base = item_data["platform_fee_base"]
+        snap_mp_cust_total = item_data["platform_fee"]
+        snap_mp_cust_gst = item_data["platform_fee_gst"]
+        snap_mp_gst_rate = item_data["platform_fee_gst_rate"]
+
         mp_cust_rate = float(mp_slab.customer_percentage) if (mp_slab and mp_slab.customer_percentage is not None) else None
         snap_mkt_cust = round(float(net_taxable_val * Decimal(str(mkt_slab.customer_percentage))), 2) if (mkt_slab and mkt_slab.customer_percentage) else 0.0
         mkt_cust_rate = float(mkt_slab.customer_percentage) if (mkt_slab and mkt_slab.customer_percentage is not None) else None
-        snap_log_cust = item_delivery
+        snap_log_cust = item_delivery_base
+        snap_log_cust_gst = item_delivery_gst
         log_cust_rate = dealer_info.get("applied_rate") if dealer_info else (float(log_slab.customer_percentage) if (log_slab and log_slab.customer_percentage is not None) else None)
         log_cust_slab_id = dealer_info.get("slab_id") if dealer_info else (log_slab.id if log_slab else None)
-
-        if cust_del_gst_rate > 0 and snap_log_cust > 0:
-            del_base = round(snap_log_cust / (1.0 + cust_del_gst_rate), 2)
-            del_gst = round(snap_log_cust - del_base, 2)
-        else:
-            del_gst = 0.0
 
         dealer_obj = dealers_dict.get(item_data["dealer_id"])
         item_del_type = "own_rider" if (dealer_obj and dealer_obj.is_delivery_self_logistics) else "logistics"
@@ -919,30 +1010,30 @@ async def create_order(
                 cgst_amount=tax_data["cgst_amount"],
                 sgst_amount=tax_data["sgst_amount"],
                 igst_amount=tax_data["igst_amount"],
-                platform_fee=item_data["platform_fee"],
-                marketplace_customer_charge=snap_mp_cust,
+                platform_fee=snap_mp_cust_total,
+                marketplace_customer_charge=snap_mp_cust_base,
                 marketplace_dealer_fee=snap_mp_dealer,
                 marketplace_dealer_rate=mp_dealer_rate if mp_slab else None,
                 marketplace_customer_rate=mp_cust_rate,
                 marketplace_slab_id=mp_slab.id if mp_slab else None,
-                marketplace_fee_gst_rate=mp_gst_rate,
+                marketplace_fee_gst_rate=snap_mp_gst_rate,
                 marketplace_fee_gst_amount=snap_mp_gst_amount,
                 marketing_fee_amount=snap_mkt_dealer,
                 marketing_customer_charge=snap_mkt_cust,
                 marketing_dealer_rate=mkt_dealer_rate if mkt_slab else None,
                 marketing_customer_rate=mkt_cust_rate,
                 marketing_slab_id=mkt_slab.id if mkt_slab else None,
-                marketing_fee_gst_rate=mkt_gst_rate,
+                marketing_fee_gst_rate=eff_mkt_disp_rate,
                 marketing_fee_gst_amount=snap_mkt_gst_amount,
                 logistics_charge_amount=snap_log_dealer,
                 logistics_customer_charge=snap_log_cust,
                 logistics_dealer_rate=log_dealer_rate if log_slab else None,
                 logistics_customer_rate=log_cust_rate,
                 logistics_slab_id=log_cust_slab_id,
-                logistics_fee_gst_rate=log_gst_rate,
+                logistics_fee_gst_rate=eff_log_disp_rate,
                 logistics_fee_gst_amount=snap_log_gst_amount,
-                customer_delivery_gst_rate=cust_del_gst_rate,
-                customer_delivery_gst_amount=del_gst,
+                customer_delivery_gst_rate=dealer_info.get("gst_rate", eff_log_disp_rate) if dealer_info else eff_log_disp_rate,
+                customer_delivery_gst_amount=snap_log_cust_gst,
                 delivery_type=item_del_type,
                 return_window_days=item_data.get("return_window_days"),
                 is_returnable=item_data.get("is_returnable"),

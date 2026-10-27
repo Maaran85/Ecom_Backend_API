@@ -22,6 +22,8 @@ from schemas.flash_sale import FlashSaleCreate, FlashSale as FlashSaleSchema
 from schemas.logistics import LogisticsPartner as LogisticsPartnerSchema
 from models.logistics_partner import LogisticsPartner
 from models.dealer_logistics import dealer_logistics_mapping
+from services.tax_service import TaxService
+from core.money import money_2dp
 
 router = APIRouter()
 
@@ -2363,7 +2365,7 @@ async def delivery_preview(
     from models.cart import CartItem as CartItemModel
     from models.product import Product as ProductModel
     from models.coupon import Coupon as CouponModel, DiscountType
-    from services.fee_service import get_all_active_slabs, match_slab_from_list, SettlementFeeError
+    from services.fee_service import get_all_active_slabs, match_slab_from_list, SettlementFeeError, resolve_slab_gst_rate, get_all_active_tax_categories
     from services.delivery_pricing_service import calculate_cart_delivery_pricing, DeliveryPricingConfigurationError
     from services.tax_service import TaxService
 
@@ -2392,16 +2394,22 @@ async def delivery_preview(
         prod_res = await db.execute(select(ProductModel).where(ProductModel.id == product_id))
         p = prod_res.scalar_one_or_none()
         if p and p.dealer_id:
-            eff_p = p
-            price = float(p.selling_price if p.selling_price is not None else (p.mrp or p.dealer_price))
+            from services.tax_service import TaxService
+            to_price = [p]
+            v = None
             if variant_id:
                 v_res = await db.execute(select(ProductModel).where(ProductModel.id == variant_id))
                 v = v_res.scalar_one_or_none()
-                if v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None):
-                    eff_p = v
-                    price = float(v.selling_price if v.selling_price is not None else (v.mrp or v.dealer_price))
+                if v:
+                    to_price.append(v)
+            await TaxService.apply_dynamic_product_pricing(db, to_price)
+            eff_p = v if (variant_id and v and (v.selling_price is not None or v.mrp is not None or v.dealer_price is not None)) else p
+            price = float(eff_p.selling_price if eff_p.selling_price is not None else (eff_p.mrp or eff_p.dealer_price))
             qty_val = max(1, quantity)
             dealer_subtotals[p.dealer_id] = price * qty_val
+            t_perc = float(getattr(eff_p, "tax_perc", 0.0) or getattr(p, "tax_perc", 0.0) or 0.0)
+            taxable_price = round(price / (1.0 + (t_perc / 100.0)), 2) if t_perc > 0 else price
+            dealer_taxable_subtotals[p.dealer_id] = taxable_price * qty_val
     else:
         # Cart mode: preview for cart items
         res = await db.execute(
@@ -2414,12 +2422,23 @@ async def delivery_preview(
         )
         cart_items = res.scalars().all()
 
+        ci_prods = []
+        for ci in cart_items:
+            if ci.product: ci_prods.append(ci.product)
+            if ci.variant: ci_prods.append(ci.variant)
+        if ci_prods:
+            from services.tax_service import TaxService
+            await TaxService.apply_dynamic_product_pricing(db, ci_prods)
+
         for ci in cart_items:
             eff_p = ci.variant if (ci.variant and (ci.variant.selling_price is not None or ci.variant.mrp is not None or ci.variant.dealer_price is not None)) else ci.product
             if eff_p and eff_p.dealer_id:
                 d_id = eff_p.dealer_id
                 price = float(eff_p.selling_price if eff_p.selling_price is not None else (eff_p.mrp or eff_p.dealer_price))
                 dealer_subtotals[d_id] = dealer_subtotals.get(d_id, 0.0) + price * ci.quantity
+                t_perc = float(getattr(eff_p, "tax_perc", 0.0) or (getattr(ci.product, "tax_perc", 0.0) if ci.product else 0.0) or 0.0)
+                taxable_price = round(price / (1.0 + (t_perc / 100.0)), 2) if t_perc > 0 else price
+                dealer_taxable_subtotals[d_id] = dealer_taxable_subtotals.get(d_id, 0.0) + taxable_price * ci.quantity
 
     if not dealer_subtotals:
         from services.configuration_service import get_fee_config
@@ -2465,6 +2484,24 @@ async def delivery_preview(
             applied_coupon = c_obj
 
     active_slabs = await get_all_active_slabs(db)
+    active_tax_cats = await get_all_active_tax_categories(db)
+    from services.configuration_service import get_fee_config
+    marketplace_cfg = await get_fee_config(db, "marketplace_fee")
+    cust_ship_cfg = await get_fee_config(db, "customer_shipping_gst_rate")
+    partner_log_cfg = await get_fee_config(db, "partner_logistics_fee")
+
+    raw_mp_rate = float(marketplace_cfg.gst_rate if (marketplace_cfg and marketplace_cfg.is_gst_applicable and marketplace_cfg.gst_rate is not None) else 0.0)
+    mp_rate_factor = Decimal(str(round(raw_mp_rate if raw_mp_rate < 1.0 else raw_mp_rate / 100.0, 4))) if raw_mp_rate > 0 else Decimal("0.00")
+    mp_display_rate = raw_mp_rate if raw_mp_rate >= 1.0 else round(raw_mp_rate * 100.0, 2)
+
+    if cust_ship_cfg and cust_ship_cfg.is_gst_applicable and (cust_ship_cfg.gst_rate is not None or cust_ship_cfg.value is not None):
+        raw_del_rate = float(cust_ship_cfg.gst_rate if cust_ship_cfg.gst_rate is not None else cust_ship_cfg.value or 0.0)
+    elif partner_log_cfg and partner_log_cfg.is_gst_applicable and partner_log_cfg.gst_rate is not None:
+        raw_del_rate = float(partner_log_cfg.gst_rate)
+    else:
+        raw_del_rate = 0.0
+    del_rate_factor = Decimal(str(round(raw_del_rate if raw_del_rate < 1.0 else raw_del_rate / 100.0, 4))) if raw_del_rate > 0 else Decimal("0.00")
+    del_display_rate = raw_del_rate if raw_del_rate >= 1.0 else round(raw_del_rate * 100.0, 2)
 
     # Fetch dealer delivery settings
     dealers_res = await db.execute(
@@ -2534,7 +2571,7 @@ async def delivery_preview(
         is_serv, unserv_reason = dealer_serviceable_map.get(d.id, (True, None))
         dealer_shipments.append({
             "dealer": d,
-            "subtotal": Decimal(str(net)),
+            "subtotal": Decimal(str(net_taxable)),
             "gross_subtotal": gross,
             "net_subtotal": net,
             "is_serviceable": is_serv,
@@ -2557,8 +2594,27 @@ async def delivery_preview(
         shipment_res = pricing_res.shipments.get(d.id) or pricing_res.shipments.get(str(d.id))
         if not shipment_res:
             continue
-        charge = float(shipment_res.delivery_charge)
-        is_free = shipment_res.is_free if is_serv else False
+        base_charge_dec = Decimal(str(round(float(shipment_res.delivery_charge), 2)))
+        is_free = (shipment_res.is_free if is_serv else False) or (base_charge_dec <= Decimal("0.00"))
+        
+        # Authoritative resolution of logistics fee GST rate from matched slab
+        ship_disp_rate, ship_rate_factor, ship_applicable = resolve_slab_gst_rate(
+            getattr(shipment_res, "gst_type", None),
+            "logistics",
+            cust_ship_cfg or partner_log_cfg,
+            tax_categories=active_tax_cats
+        )
+
+        if is_free or not ship_applicable:
+            del_gst_dec = Decimal("0.00")
+            charge_dec = Decimal("0.00")
+        else:
+            del_gst_dec = money_2dp(base_charge_dec * ship_rate_factor)
+            charge_dec = money_2dp(base_charge_dec + del_gst_dec)
+
+        charge = float(charge_dec)
+        base_charge = float(base_charge_dec)
+        del_gst = float(del_gst_dec)
         threshold = float(shipment_res.free_above)
         remaining = float(shipment_res.remaining_for_free)
 
@@ -2583,6 +2639,9 @@ async def delivery_preview(
             "items_subtotal": round(ds["gross_subtotal"], 2),
             "net_subtotal": round(ds["net_subtotal"], 2),
             "delivery_charge": round(charge, 2),
+            "delivery_base": round(base_charge, 2),
+            "delivery_gst": round(del_gst, 2),
+            "delivery_gst_rate": round(ship_disp_rate, 2),
             "is_free": is_free,
             "free_above": threshold,
             "remaining_for_free": round(remaining, 2),
@@ -2598,7 +2657,23 @@ async def delivery_preview(
     for ds in dealer_shipments:
         d = ds["dealer"]
         shipment_res = pricing_res.shipments.get(d.id) or pricing_res.shipments.get(str(d.id))
-        d_charge = Decimal(str(round(float(shipment_res.delivery_charge), 2))) if shipment_res else Decimal("0.00")
+        d_base = Decimal(str(round(float(shipment_res.delivery_charge), 2))) if shipment_res else Decimal("0.00")
+        is_f = (shipment_res.is_free if ds.get("is_serviceable", True) else False) or (d_base <= Decimal("0.00"))
+        
+        ship_disp_rate, ship_rate_factor, ship_applicable = resolve_slab_gst_rate(
+            getattr(shipment_res, "gst_type", None) if shipment_res else None,
+            "logistics",
+            cust_ship_cfg or partner_log_cfg,
+            tax_categories=active_tax_cats
+        )
+
+        if is_f or not shipment_res or not ship_applicable:
+            d_gst = Decimal("0.00")
+            d_charge = Decimal("0.00")
+        else:
+            d_gst = money_2dp(d_base * ship_rate_factor)
+            d_charge = money_2dp(d_base + d_gst)
+
         d_sub = Decimal(str(round(ds["gross_subtotal"], 2)))
         d_count = 0
         if product_id and p and p.dealer_id == d.id:
@@ -2608,13 +2683,19 @@ async def delivery_preview(
 
         dealer_alloc_map[d.id] = {
             "charge": d_charge,
+            "base_charge": d_base,
+            "gst_charge": d_gst,
+            "gst_rate": ship_disp_rate,
             "subtotal": d_sub,
             "rem_items": d_count,
-            "allocated": Decimal("0.00"),
+            "allocated_total": Decimal("0.00"),
+            "allocated_base": Decimal("0.00"),
         }
 
     # Calculate platform fee and per-item delivery/marketplace breakdown
-    total_platform_fee = 0.0
+    total_platform_fee_base = Decimal("0.00")
+    total_platform_fee_gst = Decimal("0.00")
+    total_platform_fee = Decimal("0.00")
     items_breakdown = []
 
     for item_prod, item_qty, ci_obj, var_id, parent_pid in preview_item_tuples:
@@ -2623,26 +2704,55 @@ async def delivery_preview(
         line_subtotal_dec = Decimal(str(round(item_price * item_qty, 2)))
         line_subtotal = float(line_subtotal_dec)
 
-        mp_slab = match_slab_from_list(active_slabs, "marketplace", line_subtotal_dec)
-        if mp_slab and mp_slab.customer_percentage:
-            fee = round(float(line_subtotal_dec * Decimal(str(mp_slab.customer_percentage))), 2)
+        t_perc = float(getattr(item_prod, "tax_perc", 0.0) or 0.0)
+        if t_perc > 0:
+            rate_factor = Decimal(str(t_perc)) / Decimal("100.0")
+            line_taxable_dec = money_2dp(line_subtotal_dec / (Decimal("1.0") + rate_factor))
         else:
-            fee = 0.0
-        total_platform_fee += fee
+            line_taxable_dec = line_subtotal_dec
+
+        mp_slab = match_slab_from_list(active_slabs, "marketplace", line_taxable_dec)
+        if mp_slab and mp_slab.customer_percentage:
+            item_mp_disp_rate, item_mp_rate_factor, item_mp_applicable = resolve_slab_gst_rate(
+                mp_slab.gst_type,
+                "marketplace",
+                marketplace_cfg,
+                tax_categories=active_tax_cats
+            )
+            fee_base = money_2dp(line_taxable_dec * Decimal(str(mp_slab.customer_percentage)))
+            fee_gst = money_2dp(fee_base * item_mp_rate_factor) if item_mp_applicable else Decimal("0.00")
+            fee_total = money_2dp(fee_base + fee_gst)
+        else:
+            item_mp_disp_rate = 0.0
+            fee_base = Decimal("0.00")
+            fee_gst = Decimal("0.00")
+            fee_total = Decimal("0.00")
+
+        total_platform_fee_base += fee_base
+        total_platform_fee_gst += fee_gst
+        total_platform_fee += fee_total
 
         # Delivery fee allocation for this item
         d_alloc = dealer_alloc_map.get(item_prod.dealer_id)
         if d_alloc and d_alloc["charge"] > 0 and d_alloc["subtotal"] > 0:
             if d_alloc["rem_items"] <= 1:
-                item_del_dec = d_alloc["charge"] - d_alloc["allocated"]
+                item_del_total_dec = d_alloc["charge"] - d_alloc["allocated_total"]
+                item_del_base_dec = d_alloc["base_charge"] - d_alloc["allocated_base"]
             else:
                 ratio = line_subtotal_dec / d_alloc["subtotal"]
-                item_del_dec = Decimal(str(round(float(d_alloc["charge"] * ratio), 2)))
-                d_alloc["allocated"] += item_del_dec
+                item_del_total_dec = money_2dp(d_alloc["charge"] * ratio)
+                item_del_base_dec = money_2dp(d_alloc["base_charge"] * ratio)
+                d_alloc["allocated_total"] += item_del_total_dec
+                d_alloc["allocated_base"] += item_del_base_dec
             d_alloc["rem_items"] -= 1
-            item_delivery_fee = max(0.0, float(item_del_dec))
+            item_del_gst_dec = item_del_total_dec - item_del_base_dec
+            item_delivery_fee = max(0.0, float(item_del_total_dec))
+            item_delivery_base = max(0.0, float(item_del_base_dec))
+            item_delivery_gst = max(0.0, float(item_del_gst_dec))
         else:
             item_delivery_fee = 0.0
+            item_delivery_base = 0.0
+            item_delivery_gst = 0.0
 
         # Coupon discount allocation
         if total_gross > 0 and total_discount_amount > 0:
@@ -2653,7 +2763,7 @@ async def delivery_preview(
         else:
             item_coupon = 0.0
 
-        item_payable = round(max(0.0, line_subtotal - item_coupon) + item_delivery_fee + fee, 2)
+        item_payable = round(float(max(Decimal("0.00"), line_subtotal_dec - Decimal(str(item_coupon))) + Decimal(str(item_delivery_fee)) + fee_total), 2)
         item_key = (parent_pid, var_id, ci_obj.id if ci_obj else None)
         v_serv = item_serviceability_map.get(item_key)
         if target_pincode and v_serv is not None:
@@ -2676,8 +2786,14 @@ async def delivery_preview(
             "mrp": item_mrp,
             "subtotal": line_subtotal,
             "coupon_discount": item_coupon,
-            "marketplace_fee": fee,
+            "marketplace_fee": float(fee_total),
+            "marketplace_fee_base": float(fee_base),
+            "marketplace_fee_gst": float(fee_gst),
+            "marketplace_fee_gst_rate": round(item_mp_disp_rate, 2),
             "delivery_fee": round(item_delivery_fee, 2),
+            "delivery_fee_base": round(item_delivery_base, 2),
+            "delivery_fee_gst": round(item_delivery_gst, 2),
+            "delivery_fee_gst_rate": round(float(d_alloc.get("gst_rate", del_display_rate)) if d_alloc else del_display_rate, 2),
             "payable_amount": item_payable,
             "is_serviceable": item_is_serv,
             "unserviceable_reason": item_unserv_reason,
@@ -2689,11 +2805,21 @@ async def delivery_preview(
         else all(ds.get("is_serviceable", True) for ds in dealer_shipments)
     )
 
+    tot_deliv_total = sum(d["charge"] for d in dealer_alloc_map.values())
+    tot_deliv_base = sum(d["base_charge"] for d in dealer_alloc_map.values())
+    tot_deliv_gst = sum(d["gst_charge"] for d in dealer_alloc_map.values())
+
     return {
         "dealers": breakdown,
         "items": items_breakdown,
-        "total_delivery_charge": float(pricing_res.total_delivery_charge),
-        "total_platform_fee": round(total_platform_fee, 2),
+        "total_delivery_charge": float(tot_deliv_total),
+        "total_delivery_base": float(tot_deliv_base),
+        "total_delivery_gst": float(tot_deliv_gst),
+        "delivery_gst_rate": round(float(breakdown[0]["delivery_gst_rate"]) if breakdown else del_display_rate, 2),
+        "total_platform_fee": float(total_platform_fee),
+        "total_platform_fee_base": float(total_platform_fee_base),
+        "total_platform_fee_gst": float(total_platform_fee_gst),
+        "platform_fee_gst_rate": round(float(items_breakdown[0]["marketplace_fee_gst_rate"]) if items_breakdown else mp_display_rate, 2),
         "platform_eligible_subtotal": float(pricing_res.platform_eligible_subtotal),
         "platform_free_delivery_threshold": float(pricing_res.platform_free_delivery_threshold),
         "platform_qualifies_for_free": pricing_res.platform_qualifies_for_free and all_serviceable,

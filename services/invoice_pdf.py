@@ -520,13 +520,6 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     story.append(Paragraph("<b>2. MARKETPLACE FEES</b>", style_section_title))
     story.append(Spacer(1, 4))
     mkt_table_data = [make_table_header()]
-    mkt_cust_charge = sum(getattr(item, 'marketplace_customer_charge', 0.0) or 0.0 for item in order_items) if order_items else 0.0
-    if not mkt_cust_charge:
-        plat_fee = getattr(order, 'platform_fee_amount', 0.0) or 0.0
-        mkt_cust_charge = plat_fee if plat_fee > 0 else 0.0
-
-    mkt_sac_code = marketplace_sac or "998314"
-    mkt_desc_html = f"<b>Marketplace Platform Services</b><br/><font color='#333333'><b>SAC:</b> {mkt_sac_code}</font>"
 
     mkt_fee_gst_rate_val = None
     if order_items:
@@ -534,14 +527,38 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     mkt_rate_factor = float(mkt_fee_gst_rate_val) if mkt_fee_gst_rate_val is not None else 0.18
     mkt_rate_pct = mkt_rate_factor * 100.0 if mkt_rate_factor < 1.0 else mkt_rate_factor
 
-    if mkt_rate_pct > 0 and mkt_cust_charge > 0:
-        mkt_net_amt = round_curr(mkt_cust_charge / (1.0 + mkt_rate_pct / 100.0))
-        mkt_tax_amt = round_curr(mkt_cust_charge - mkt_net_amt)
-        mkt_total_amt = round_curr(mkt_cust_charge)
+    saved_mkt_base = round_curr(sum(getattr(item, 'marketplace_customer_charge', 0.0) or 0.0 for item in order_items)) if order_items else 0.0
+    saved_mkt_total = round_curr(sum(getattr(item, 'platform_fee', 0.0) or 0.0 for item in order_items)) if order_items else 0.0
+    order_plat_fee = round_curr(getattr(order, 'platform_fee_amount', 0.0) or 0.0)
+    eff_mkt_total = saved_mkt_total if saved_mkt_total > 0 else order_plat_fee
+
+    if saved_mkt_total > 0 and saved_mkt_base > 0 and saved_mkt_total > saved_mkt_base:
+        mkt_net_amt = saved_mkt_base
+        mkt_total_amt = saved_mkt_total
+        mkt_tax_amt = round_curr(mkt_total_amt - mkt_net_amt)
+    elif eff_mkt_total > 0:
+        mkt_total_amt = eff_mkt_total
+        if mkt_rate_pct > 0:
+            mkt_net_amt = round_curr(mkt_total_amt / (1.0 + mkt_rate_pct / 100.0))
+            mkt_tax_amt = round_curr(mkt_total_amt - mkt_net_amt)
+        else:
+            mkt_net_amt = mkt_total_amt
+            mkt_tax_amt = 0.0
+    elif saved_mkt_base > 0:
+        mkt_total_amt = saved_mkt_base
+        if mkt_rate_pct > 0:
+            mkt_net_amt = round_curr(mkt_total_amt / (1.0 + mkt_rate_pct / 100.0))
+            mkt_tax_amt = round_curr(mkt_total_amt - mkt_net_amt)
+        else:
+            mkt_net_amt = mkt_total_amt
+            mkt_tax_amt = 0.0
     else:
-        mkt_net_amt = round_curr(mkt_cust_charge)
+        mkt_net_amt = 0.0
         mkt_tax_amt = 0.0
-        mkt_total_amt = round_curr(mkt_cust_charge)
+        mkt_total_amt = 0.0
+
+    mkt_sac_code = marketplace_sac or "998314"
+    mkt_desc_html = f"<b>Marketplace Platform Services</b><br/><font color='#333333'><b>SAC:</b> {mkt_sac_code}</font>"
 
     if is_inter_state_order:
         mkt_igst_amt = mkt_tax_amt
@@ -596,12 +613,6 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     story.append(Paragraph("<b>3. SHIPPING SERVICES</b>", style_section_title))
     story.append(Spacer(1, 4))
     ship_table_data = [make_table_header()]
-    if getattr(order, 'delivery_charge', None) is not None:
-        ship_cust_charge = float(order.delivery_charge or 0.0)
-    elif order_items:
-        ship_cust_charge = float(sum(getattr(item, 'logistics_customer_charge', 0.0) or 0.0 for item in order_items))
-    else:
-        ship_cust_charge = 0.0
 
     ship_sac_code = logistics_sac or "996812"
     ship_desc_html = f"<b>Logistics & Shipping Services</b><br/><font color='#333333'><b>SAC:</b> {ship_sac_code}</font>"
@@ -617,14 +628,34 @@ def generate_invoice_pdf(invoice, dealer, order, order_items, billing_address, s
     ship_rate_factor = float(ship_fee_gst_rate_val) if ship_fee_gst_rate_val is not None else 0.18
     ship_rate_pct = ship_rate_factor * 100.0 if ship_rate_factor < 1.0 else ship_rate_factor
 
-    if ship_rate_pct > 0 and ship_cust_charge > 0:
-        ship_net_amt = round_curr(ship_cust_charge / (1.0 + ship_rate_pct / 100.0))
-        ship_tax_amt = round_curr(ship_cust_charge - ship_net_amt)
-        ship_total_amt = round_curr(ship_cust_charge)
+    saved_ship_base = round_curr(sum(getattr(item, 'logistics_customer_charge', 0.0) or 0.0 for item in order_items)) if order_items else 0.0
+    saved_ship_tax = round_curr(sum(getattr(item, 'customer_delivery_gst_amount', 0.0) or 0.0 for item in order_items)) if order_items else 0.0
+    order_ship_total = round_curr(float(getattr(order, 'delivery_charge', 0.0) or 0.0))
+
+    if saved_ship_base > 0 and saved_ship_tax > 0:
+        ship_net_amt = saved_ship_base
+        ship_tax_amt = saved_ship_tax
+        ship_total_amt = round_curr(saved_ship_base + saved_ship_tax)
+    elif order_ship_total > 0:
+        ship_total_amt = order_ship_total
+        if ship_rate_pct > 0:
+            ship_net_amt = round_curr(ship_total_amt / (1.0 + ship_rate_pct / 100.0))
+            ship_tax_amt = round_curr(ship_total_amt - ship_net_amt)
+        else:
+            ship_net_amt = ship_total_amt
+            ship_tax_amt = 0.0
+    elif saved_ship_base > 0:
+        ship_total_amt = saved_ship_base
+        if ship_rate_pct > 0:
+            ship_net_amt = round_curr(ship_total_amt / (1.0 + ship_rate_pct / 100.0))
+            ship_tax_amt = round_curr(ship_total_amt - ship_net_amt)
+        else:
+            ship_net_amt = ship_total_amt
+            ship_tax_amt = 0.0
     else:
-        ship_net_amt = round_curr(ship_cust_charge)
+        ship_net_amt = 0.0
         ship_tax_amt = 0.0
-        ship_total_amt = round_curr(ship_cust_charge)
+        ship_total_amt = 0.0
 
     if is_inter_state_order:
         ship_igst_amt = ship_tax_amt

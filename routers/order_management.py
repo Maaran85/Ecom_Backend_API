@@ -452,12 +452,21 @@ async def approve_return(
         if approval_data.refund_amount:
             refund_amount = approval_data.refund_amount
         elif order_return.order_item_id:
-            # Try to use item-level price
+            # Use original order's saved item price and allocate discounts proportionally
             item_res = await db.execute(
                 select(OrderItem).where(OrderItem.id == order_return.order_item_id)
             )
             item = item_res.scalar_one_or_none()
-            refund_amount = round(item.price * item.quantity, 2) if item else order.total_amount
+            if item:
+                item_gross = round(item.price * item.quantity, 2)
+                if order.subtotal and order.subtotal > 0 and order.discount_amount and order.discount_amount > 0:
+                    disc_share = round((item_gross / order.subtotal) * order.discount_amount, 2)
+                    item_net = round(max(0.0, item_gross - disc_share), 2)
+                    refund_amount = min(item_net, order.total_amount)
+                else:
+                    refund_amount = min(item_gross, order.total_amount)
+            else:
+                refund_amount = order.total_amount
         else:
             refund_amount = order.total_amount
         

@@ -233,3 +233,92 @@ class TaxService:
         if last_error:
             raise last_error
 
+    @staticmethod
+    async def apply_dynamic_product_pricing(
+        db: AsyncSession,
+        products,
+        tax_categories_cache: Optional[dict] = None
+    ):
+        """
+        Dynamically calculates product GST, MRP (inclusive), selling price, and discount amount
+        from the current applicable TaxCategory/TaxRule configuration at view/preview time.
+        Does NOT persist calculated values to database rows, ensuring historical immutability
+        and allowing subsequent configuration changes to reflect immediately.
+        Uses set_committed_value so SQLAlchemy Unit-of-Work does NOT mark records as dirty.
+        """
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        if products is None:
+            return None
+
+        is_single = not isinstance(products, (list, tuple, set))
+        prod_list = [products] if is_single else list(products)
+        if not prod_list:
+            return products
+
+        tax_map = tax_categories_cache
+        if tax_map is None:
+            tc_res = await db.execute(select(TaxCategory).where(TaxCategory.is_active == True))
+            tax_map = {}
+            for tc in tc_res.scalars().all():
+                rate = tc.igst_rate if (tc.igst_rate is not None and tc.igst_rate > 0) else ((tc.cgst_rate or 0.0) + (tc.sgst_rate or 0.0))
+                tax_map[tc.id] = float(rate)
+
+        for p in prod_list:
+            if not p:
+                continue
+            base = float(p.dealer_price) if getattr(p, "dealer_price", None) is not None else 0.0
+
+            # Resolve dynamic tax rate from current configuration
+            t_rate = 0.0
+            if getattr(p, "tax_category_id", None) in tax_map:
+                t_rate = tax_map[p.tax_category_id]
+            elif getattr(p, "tax_rule_id", None):
+                rule = await TaxService.get_applicable_tax_rule(db, p.id, product=p)
+                if rule and rule.tax_category_id in tax_map:
+                    t_rate = tax_map[rule.tax_category_id]
+            elif getattr(p, "tax_perc", None) is not None:
+                t_rate = float(p.tax_perc)
+
+            t_price = round(base * (t_rate / 100.0), 2)
+            mrp_val = round(base + t_price, 2)
+            disc_pct = float(p.discount_percentage) if getattr(p, "discount_percentage", None) is not None else 0.0
+            if disc_pct > 0:
+                sp_val = round(mrp_val * (1.0 - (disc_pct / 100.0)), 2)
+                disc_amt = round(mrp_val - sp_val, 2)
+            else:
+                sp_val = mrp_val
+                disc_amt = 0.0
+
+            set_committed_value(p, "tax_perc", t_rate)
+            set_committed_value(p, "tax_price", t_price)
+            set_committed_value(p, "mrp", mrp_val)
+            set_committed_value(p, "selling_price", sp_val)
+            set_committed_value(p, "discount_price", disc_amt)
+
+            # Apply recursively to child variants only if already loaded in instance dict (avoids async MissingGreenlet)
+            children = p.__dict__.get("children")
+            if children and isinstance(children, list):
+                for c in children:
+                    c_base = float(c.dealer_price) if getattr(c, "dealer_price", None) is not None else base
+                    c_tax_cat = c.tax_category_id if getattr(c, "tax_category_id", None) is not None else getattr(p, "tax_category_id", None)
+                    c_tax_rate = tax_map.get(c_tax_cat, t_rate)
+                    c_tax_amt = round(c_base * (c_tax_rate / 100.0), 2)
+                    c_mrp = round(c_base + c_tax_amt, 2)
+                    c_disc = float(c.discount_percentage) if getattr(c, "discount_percentage", None) is not None else disc_pct
+                    if c_disc > 0:
+                        c_sp = round(c_mrp * (1.0 - (c_disc / 100.0)), 2)
+                        c_disc_amt = round(c_mrp - c_sp, 2)
+                    else:
+                        c_sp = c_mrp
+                        c_disc_amt = 0.0
+
+                    set_committed_value(c, "tax_perc", c_tax_rate)
+                    set_committed_value(c, "tax_price", c_tax_amt)
+                    set_committed_value(c, "mrp", c_mrp)
+                    set_committed_value(c, "selling_price", c_sp)
+                    set_committed_value(c, "discount_price", c_disc_amt)
+
+        return products
+
+

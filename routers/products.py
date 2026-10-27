@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+import uuid
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +29,7 @@ from models.dealer import Dealer as DealerModel
 from models.partner import Partner as PartnerModel
 from models.inventory import ProductInventory as ProductInventoryModel
 from schemas.search_history import SearchHistory
-from models.cart import OrderItem as OrderItemModel
+from models.cart import OrderItem as OrderItemModel, CartItem as CartItemModel
 from core.permissions import (
     require_admin, get_current_active_user, 
     get_current_user_optional, require_dealer_or_admin
@@ -36,8 +37,9 @@ from core.permissions import (
 from models.customer_user import CustomerUser
 from services.file_upload import FileUploadService as UploadService
 from services.recommendation import RecommendationService
-from services.fee_service import get_applicable_slab
+from services.fee_service import get_applicable_slab, resolve_slab_gst_rate, get_all_active_tax_categories
 from services.configuration_service import get_fee_config
+from services.tax_service import TaxService
 from models.user import User
 
 router = APIRouter()
@@ -947,10 +949,39 @@ async def update_product(
                 status_code=400,
                 detail="Cannot create variants because the category does not have any variant keys defined."
             )
-        # Delete existing children and insert new ones
-        await db.execute(ProductModel.__table__.delete().where(ProductModel.parent_product_id == db_product.id))
-        
+        # Load existing children of this product
+        existing_children_res = await db.execute(
+            select(ProductModel).where(ProductModel.parent_product_id == db_product.id)
+        )
+        existing_children = list(existing_children_res.scalars().all())
+
+        children_by_id = {str(c.id): c for c in existing_children}
+        children_by_sku = {c.sku: c for c in existing_children if c.sku}
+        retained_child_ids = set()
+
         for v_data in variants_data:
+            # Match existing child variant
+            matched_child = None
+            v_id_raw = v_data.get("id")
+            v_id = str(v_id_raw) if v_id_raw else None
+            v_sku = v_data.get("sku") or None
+            child_attrs = v_data.get("attributes", {})
+
+            if v_id and v_id in children_by_id:
+                matched_child = children_by_id[v_id]
+            elif v_sku and v_sku in children_by_sku:
+                matched_child = children_by_sku[v_sku]
+            elif len(existing_children) == 1 and len(variants_data) == 1 and not retained_child_ids:
+                matched_child = existing_children[0]
+            else:
+                for c in existing_children:
+                    if c.id not in retained_child_ids and (c.attributes or {}) == child_attrs:
+                        matched_child = c
+                        break
+
+            if matched_child:
+                retained_child_ids.add(matched_child.id)
+
             # 1. Child dealer price (base price excl tax)
             child_price = v_data.get("dealer_price")
             if child_price is None:
@@ -1006,40 +1037,82 @@ async def update_product(
                 child_discount_price = round(float(child_discount_price), 2)
                 
             parent_attrs = db_product.attributes or {}
-            child_attrs = v_data.get("attributes", {})
             merged_attrs = {**parent_attrs, **child_attrs}
             
-            if v_data.get("sku") == "":
-                v_data["sku"] = None
-                
-            db_child = ProductModel(
-                name=db_product.name,
-                description=db_product.description,
-                sku=v_data.get("sku"),
-                dealer_price=child_price,
-                selling_price=child_selling_price,
-                mrp=child_mrp,
-                tax_perc=child_tax_perc,
-                tax_price=child_tax_price,
-                discount_price=child_discount_price,
-                discount_percentage=child_discount_pct,
-                category_id=db_product.category_id,
-                subcategory_id=db_product.subcategory_id,
-                brand_id=db_product.brand_id,
-                dealer_id=db_product.dealer_id,
-                is_approved=db_product.is_approved,
-                is_returnable=db_product.is_returnable,
-                return_window_days=db_product.return_window_days,
-                is_exchangeable=db_product.is_exchangeable,
-                return_policy_note=db_product.return_policy_note,
-                estimated_delivery_days=db_product.estimated_delivery_days,
-                hsn_code=db_product.hsn_code,
-                tax_category_id=db_product.tax_category_id,
-                parent_product_id=db_product.id,
-                images=v_data.get("images") or db_product.images,
-                attributes=merged_attrs
-            )
-            db.add(db_child)
+            sku_val = v_data.get("sku") or None
+            if sku_val == "":
+                sku_val = None
+
+            if matched_child:
+                matched_child.name = db_product.name
+                matched_child.description = db_product.description
+                if sku_val:
+                    matched_child.sku = sku_val
+                matched_child.dealer_price = child_price
+                matched_child.selling_price = child_selling_price
+                matched_child.mrp = child_mrp
+                matched_child.tax_perc = child_tax_perc
+                matched_child.tax_price = child_tax_price
+                matched_child.discount_price = child_discount_price
+                matched_child.discount_percentage = child_discount_pct
+                matched_child.category_id = db_product.category_id
+                matched_child.subcategory_id = db_product.subcategory_id
+                matched_child.brand_id = db_product.brand_id
+                matched_child.dealer_id = db_product.dealer_id
+                matched_child.is_approved = db_product.is_approved
+                matched_child.is_returnable = db_product.is_returnable
+                matched_child.return_window_days = db_product.return_window_days
+                matched_child.is_exchangeable = db_product.is_exchangeable
+                matched_child.return_policy_note = db_product.return_policy_note
+                matched_child.estimated_delivery_days = db_product.estimated_delivery_days
+                matched_child.hsn_code = db_product.hsn_code
+                matched_child.tax_category_id = db_product.tax_category_id
+                matched_child.images = v_data.get("images") or db_product.images
+                matched_child.attributes = merged_attrs
+                matched_child.is_deleted = False
+            else:
+                db_child = ProductModel(
+                    name=db_product.name,
+                    description=db_product.description,
+                    sku=sku_val,
+                    dealer_price=child_price,
+                    selling_price=child_selling_price,
+                    mrp=child_mrp,
+                    tax_perc=child_tax_perc,
+                    tax_price=child_tax_price,
+                    discount_price=child_discount_price,
+                    discount_percentage=child_discount_pct,
+                    category_id=db_product.category_id,
+                    subcategory_id=db_product.subcategory_id,
+                    brand_id=db_product.brand_id,
+                    dealer_id=db_product.dealer_id,
+                    is_approved=db_product.is_approved,
+                    is_returnable=db_product.is_returnable,
+                    return_window_days=db_product.return_window_days,
+                    is_exchangeable=db_product.is_exchangeable,
+                    return_policy_note=db_product.return_policy_note,
+                    estimated_delivery_days=db_product.estimated_delivery_days,
+                    hsn_code=db_product.hsn_code,
+                    tax_category_id=db_product.tax_category_id,
+                    parent_product_id=db_product.id,
+                    images=v_data.get("images") or db_product.images,
+                    attributes=merged_attrs
+                )
+                db.add(db_child)
+
+        # Handle removed variants (orphans) safely
+        for orphan in existing_children:
+            if orphan.id not in retained_child_ids:
+                from sqlalchemy import delete
+                await db.execute(delete(CartItemModel).where(CartItemModel.variant_id == orphan.id))
+                try:
+                    async with db.begin_nested():
+                        await db.delete(orphan)
+                        await db.flush()
+                except Exception:
+                    orphan.is_deleted = True
+                    if orphan.sku:
+                        orphan.sku = f"{orphan.sku}_del_{uuid.uuid4().hex[:8]}"
 
     await db.commit()
     await db.refresh(db_product)
@@ -1051,13 +1124,15 @@ async def update_product(
         .options(
             joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
             joinedload(ProductModel.dealer),
-        joinedload(ProductModel.brand),
+            joinedload(ProductModel.brand),
             selectinload(ProductModel.children).joinedload(ProductModel.category).selectinload(CategoryModel.attributes),
-        selectinload(ProductModel.children).selectinload(ProductModel.children),
-        selectinload(ProductModel.children).joinedload(ProductModel.brand)
+            selectinload(ProductModel.children).selectinload(ProductModel.children),
+            selectinload(ProductModel.children).joinedload(ProductModel.brand)
         )
     )
-    return result.scalar_one()
+    res_product = result.scalar_one()
+    await TaxService.apply_dynamic_product_pricing(db, res_product)
+    return res_product
 
 @router.delete("/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["products"])
 async def delete_product(
@@ -1402,6 +1477,7 @@ async def get_products(
         for p in products:
             p.hub_stock = inv_map.get(p.id, 0)
             
+    await TaxService.apply_dynamic_product_pricing(db, products)
     return products
 
 @router.get("/products/search/history", response_model=List[SearchHistory], tags=["products"])
@@ -1659,6 +1735,7 @@ async def search_products(
     
     result = await db.execute(query)
     products = result.scalars().unique().all()
+    await TaxService.apply_dynamic_product_pricing(db, products)
     return products
 
 @router.get("/products/autocomplete", tags=["products"])
@@ -1985,20 +2062,25 @@ async def estimate_product_payout(
     marketplace_cfg = await get_fee_config(db, "marketplace_fee")
     marketing_cfg = await get_fee_config(db, "marketing_fee")
     logistics_cfg = await get_fee_config(db, "partner_logistics_fee")
-
-    mp_tax_rate = float(marketplace_cfg.gst_rate * 100.0) if (marketplace_cfg and marketplace_cfg.gst_rate is not None and (marketplace_cfg.is_gst_applicable or marketplace_cfg.gst_rate > 0)) else 0.0
-    mkt_tax_rate = float(marketing_cfg.gst_rate * 100.0) if (marketing_cfg and marketing_cfg.gst_rate is not None and (marketing_cfg.is_gst_applicable or marketing_cfg.gst_rate > 0)) else 0.0
-    log_tax_rate = float(logistics_cfg.gst_rate * 100.0) if (logistics_cfg and logistics_cfg.gst_rate is not None and (logistics_cfg.is_gst_applicable or logistics_cfg.gst_rate > 0)) else 0.0
+    active_tax_cats = await get_all_active_tax_categories(db)
     
     # 1. Marketplace Fee
     mp_slab = await get_applicable_slab(db, "marketplace", net_basic_dec)
     mp_slab_found = mp_slab is not None and mp_slab.dealer_percentage is not None
     if mp_slab_found:
+        mp_disp_rate, mp_factor, mp_is_app = resolve_slab_gst_rate(
+            mp_slab.gst_type if mp_slab else None,
+            "marketplace",
+            marketplace_cfg,
+            tax_categories=active_tax_cats
+        )
+        mp_tax_rate = float(mp_disp_rate) if mp_is_app else 0.0
         mp_pct = float(mp_slab.dealer_percentage)
         mp_base = round(selling_base * mp_pct, 2)
-        mp_tax = round(mp_base * (mp_tax_rate / 100.0), 2)
+        mp_tax = round(float(Decimal(str(mp_base)) * mp_factor), 2) if mp_is_app else 0.0
         mp_total = round(mp_base + mp_tax, 2)
     else:
+        mp_tax_rate = 0.0
         mp_pct = None
         mp_base = 0.0
         mp_tax = 0.0
@@ -2009,11 +2091,19 @@ async def estimate_product_payout(
     mkt_slab = await get_applicable_slab(db, "marketing", net_basic_dec)
     mkt_slab_found = mkt_slab is not None and mkt_slab.dealer_percentage is not None
     if mkt_slab_found:
+        mkt_disp_rate, mkt_factor, mkt_is_app = resolve_slab_gst_rate(
+            mkt_slab.gst_type if mkt_slab else None,
+            "marketing",
+            marketing_cfg,
+            tax_categories=active_tax_cats
+        )
+        mkt_tax_rate = float(mkt_disp_rate) if mkt_is_app else 0.0
         mkt_pct = float(mkt_slab.dealer_percentage)
         mkt_base = round(selling_base * mkt_pct, 2)
-        mkt_tax = round(mkt_base * (mkt_tax_rate / 100.0), 2)
+        mkt_tax = round(float(Decimal(str(mkt_base)) * mkt_factor), 2) if mkt_is_app else 0.0
         mkt_total = round(mkt_base + mkt_tax, 2)
     else:
+        mkt_tax_rate = 0.0
         mkt_pct = None
         mkt_base = 0.0
         mkt_tax = 0.0
@@ -2025,11 +2115,19 @@ async def estimate_product_payout(
         log_slab = await get_applicable_slab(db, "logistics", net_basic_dec)
         log_slab_found = log_slab is not None and log_slab.dealer_percentage is not None
         if log_slab_found:
+            log_disp_rate, log_factor, log_is_app = resolve_slab_gst_rate(
+                log_slab.gst_type if log_slab else None,
+                "logistics",
+                logistics_cfg,
+                tax_categories=active_tax_cats
+            )
+            log_tax_rate = float(log_disp_rate) if log_is_app else 0.0
             log_pct = float(log_slab.dealer_percentage)
             log_base = round(selling_base * log_pct, 2)
-            log_tax = round(log_base * (log_tax_rate / 100.0), 2)
+            log_tax = round(float(Decimal(str(log_base)) * log_factor), 2) if log_is_app else 0.0
             log_total = round(log_base + log_tax, 2)
         else:
+            log_tax_rate = 0.0
             log_pct = None
             log_base = 0.0
             log_tax = 0.0
@@ -2038,6 +2136,7 @@ async def estimate_product_payout(
     else:
         log_slab_found = True
         log_pct = 0.0
+        log_tax_rate = 0.0
         log_base = 0.0
         log_tax = 0.0
         log_total = 0.0
@@ -2168,6 +2267,7 @@ async def get_product(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found or currently unavailable")
         
+    await TaxService.apply_dynamic_product_pricing(db, product)
     return product
 
 @router.get("/products/{product_id}/payout-estimate", response_model=ProductPayoutEstimationResponse, tags=["products"])
@@ -2183,6 +2283,7 @@ async def get_product_payout_estimate(
     if not product or product.is_deleted:
         raise HTTPException(status_code=404, detail="Product not found")
         
+    await TaxService.apply_dynamic_product_pricing(db, product)
     req = ProductPayoutEstimationRequest(
         dealer_price=product.dealer_price,
         tax_perc=product.tax_perc or 12.0,
