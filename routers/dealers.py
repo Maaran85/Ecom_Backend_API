@@ -2306,6 +2306,7 @@ async def process_dealer_refund(
 class DeliverySettingsPayload(BaseModel):
     delivery_charge: float = 0.0        # flat fee per order from this dealer
     free_delivery_above: float = 0.0    # 0 = always free; >0 = waived when cart >= this
+    estimated_delivery_days: Optional[int] = None
 
 @router.get("/me/delivery-settings")
 async def get_delivery_settings(
@@ -2319,6 +2320,7 @@ async def get_delivery_settings(
     return {
         "delivery_charge": dealer.delivery_charge or 0.0,
         "free_delivery_above": dealer.free_delivery_above or 0.0,
+        "estimated_delivery_days": dealer.estimated_delivery_days if dealer.estimated_delivery_days is not None else 7,
     }
 
 @router.put("/me/delivery-settings")
@@ -2330,15 +2332,20 @@ async def update_delivery_settings(
     """Dealer: Update their delivery charge settings"""
     if payload.delivery_charge < 0 or payload.free_delivery_above < 0:
         raise HTTPException(status_code=400, detail="Charges cannot be negative")
+    if payload.estimated_delivery_days is not None and payload.estimated_delivery_days < 0:
+        raise HTTPException(status_code=400, detail="Delivery period cannot be negative")
     dealer = await get_current_dealer(current_user, db)
     if not dealer:
         raise HTTPException(status_code=404, detail="Dealer profile not found")
     dealer.delivery_charge = payload.delivery_charge
     dealer.free_delivery_above = payload.free_delivery_above
+    if payload.estimated_delivery_days is not None:
+        dealer.estimated_delivery_days = payload.estimated_delivery_days
     await db.commit()
     return {
         "delivery_charge": dealer.delivery_charge,
         "free_delivery_above": dealer.free_delivery_above,
+        "estimated_delivery_days": dealer.estimated_delivery_days,
         "message": "Delivery settings updated successfully"
     }
 
@@ -4181,6 +4188,26 @@ async def update_dealer(
         dealer.business_address = dealer_data.business_address
     if dealer_data.gst_number is not None:
         dealer.gst_number = dealer_data.gst_number
+    if dealer_data.delivery_charge is not None:
+        if dealer_data.delivery_charge < 0:
+            raise HTTPException(status_code=400, detail="Delivery charge cannot be negative")
+        dealer.delivery_charge = dealer_data.delivery_charge
+    if dealer_data.free_delivery_above is not None:
+        if dealer_data.free_delivery_above < 0:
+            raise HTTPException(status_code=400, detail="Free delivery threshold cannot be negative")
+        dealer.free_delivery_above = dealer_data.free_delivery_above
+    if dealer_data.estimated_delivery_days is not None:
+        if dealer_data.estimated_delivery_days < 0:
+            raise HTTPException(status_code=400, detail="Estimated delivery days cannot be negative")
+        dealer.estimated_delivery_days = dealer_data.estimated_delivery_days
+    if dealer_data.organization_type is not None:
+        dealer.organization_type = dealer_data.organization_type
+    if dealer_data.partner_id is not None:
+        dealer.partner_id = dealer_data.partner_id
+    if dealer_data.state_id is not None:
+        dealer.state_id = dealer_data.state_id
+    if dealer_data.signature_image_url is not None:
+        dealer.signature_image_url = dealer_data.signature_image_url
     
     await db.commit()
     await db.refresh(dealer)

@@ -167,6 +167,7 @@ class ProductUpdate(BaseModel):
     return_window_days: Optional[int] = None
     is_exchangeable: Optional[bool] = None
     return_policy_note: Optional[str] = None
+    estimated_delivery_days: Optional[int] = None
     hsn_code: Optional[str] = None
     tax_category_id: Optional[int] = None
     parent_product_id: Optional[UUID] = None
